@@ -1,4 +1,4 @@
-# OpenWX &#xF8CF; SDR - Streamlined Radiosonde Decoder Framework
+# OpenWXSDR - Streamlined Radiosonde Decoder Framework
 
 A lightweight, efficient radiosonde decoder framework for Raspberry Pi, designed to work with RTL-SDR and KA9Q radio receivers. Uses the excellent rs1729/RS decoder suite.
 
@@ -16,9 +16,12 @@ A lightweight, efficient radiosonde decoder framework for Raspberry Pi, designed
 
 ## Hardware Requirements
 
-- Raspberry Pi 4 (8GB recommended)
+- Raspberry Pi 4 /5 / 400 / 500 (8GB recommended) or Intel x86_64 client
+- Debian 13 or Rasbian OS - 64 Bit
 - RTL-SDR dongle or KA9Q-compatible SDR
 - Antenna tuned for 400-406 MHz
+- Selective 400 MHz LNA
+- SAW filter recommended
 
 ## Installation
 
