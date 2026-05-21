@@ -81,8 +81,8 @@ Access the web UI at `http://raspberry-pi-ip:5000`
 
 Key configuration options in `config.yaml`:
 
-- **sdr.type**: Choose 'rtlsdr' or 'ka9q'
-- **receivers.max_concurrent**: Number of parallel decoders (2-8 recommended)
+- **sdr.type**: Choose 'rtlsdr', 'airspy', 'flux242' or 'ka9q'
+- **receivers.max_concurrent**: Number of parallel decoders (1-8 recommended)
 - **detection.freq_ranges**: Frequency ranges to scan
 - **output.udp**: Configure OpenWX server destination
 
@@ -122,7 +122,7 @@ Data sent to OpenWX server:
 {
   "software_name": "OpenWXSDR",
   "software_version": "1.0.45",
-  "uploader_callsign": "YOUR_CALL",
+  "uploader_callsign": "<your-call>",
   "time_received": "2026-04-30T12:34:56.789Z",
   "type": "RS41",
   "frame": 12345,
@@ -155,6 +155,85 @@ Data sent to OpenWX server:
 | iMet | imet54mod | InterMet iMet-54        |
 | LMS6 | lms6mod   | Lockheed Martin LMS6    |
 | MRZ  | mrzmod    | Meteo-Radiy MRZ         |
+
+
+## Local WebUI on your device 
+
+The local web UI is available at `http://yourdevice-ip:5000`
+
+<img width="1405" height="903" alt="Screenshot 2026-05-19 171001" src="https://github.com/user-attachments/assets/272c99c1-7b79-4a65-9f65-273289bae137" />
+
+
+For each configured receiver the frequency spectrum is available:
+
+<img width="1361" height="824" alt="Screenshot 2026-05-18 132137" src="https://github.com/user-attachments/assets/157818ec-ce90-4e98-ba48-08f29d6dd2c5" />
+
+
+## Telemetry data upload to external OpenWX.de
+
+If enabled in config.yaml your device will upload radiosonde telemetry and sensor ptu to OpenWX.de `http://map.openwx.de`:
+
+Upload to OpenWX.de is preferable via MQTT configurable. Generate your API-key in your OpenWX-Account and configure your credentials in config.yaml.
+
+```
+  # MQTT upload to OpenWX.de broker
+  mqtt:
+    enabled: true
+    server: '<server-ip>'                   # MQTT broker hostname or IP
+    port: 1883                              # MQTT broker port (1883 = plain, 8883 = TLS)
+    username: '<username>'                  # MQTT username (leave empty if not required)
+    password: '<password>'                  # MQTT password (leave empty if not required)
+    topic_prefix: 'OPENWXSDR/<your-call>/'  # MQTT topic prefix (e.g. OPENWXSDR/<callsign>/<serial>)
+    client_id: '<your-call>-15'             # MQTT client ID
+    keepalive: 60                           # MQTT keepalive in seconds
+    connect_timeout: 10                     # Wait this many seconds for initial CONNACK
+    tls_enabled: true                       # Set false for username/password brokers on plain TCP (usually port 1883)
+    tls_insecure: true                      # Accept brokers by IP/self-signed cert without CA validation
+    tls_ca_certs: ''                        # Optional CA bundle path for strict TLS validation
+    transport: 'tcp'                        # MQTT transport
+```
+
+
+<img width="1529" height="879" alt="grafik" src="https://github.com/user-attachments/assets/44f5b697-20b4-4619-8ef0-88396e06eaf9" />
+
+
+
+## Telemetry data upload to external sondehub.org
+
+If enabled in config.yaml your device will upload radiosonde telemetry and sensor ptu to sondehub.org:
+
+```
+# ============================================================
+# SondeHub Upload
+# ============================================================
+sondehub:
+  enabled: true
+  queue_mode: false                                        # false = direct upload mode, true = queued batch upload mode
+  queue_batch_max: 50                                      # Max telemetry objects uploaded per queued request (10-fast 50-robust)
+  queue_max_size: 1000                                     # Max queued  objects before oldest/new drops may occur (200-fast 1000-robust)
+  upload_url: 'https://api.v2.sondehub.org/sondes/telemetry'
+  listeners_url: 'https://api.v2.sondehub.org/listeners'   # Listener metadata endpoint
+  station_id: '<your-call>->ssid>'                         # Station ID (use callsign/SSID style)
+  uploader_callsign: '<your-call>'                         # Receiver callsign shown in SondeHub
+  uploader_antenna: '1/4 wave UHF vertical'                # Receiver antenna
+  uploader_radio: 'Airspy Mini + rs1729'                   # Optional receiver hardware/radio description
+  contact_email: '<mail>@domain.com'                       # Optional contact email for listener metadata
+  uploader_lat: 52.00                                      # Must match station.lat above
+  uploader_lon: 10.00                                      # Must match station.lon above
+  uploader_alt: 100                                        # Must match station.alt above
+  upload_rate_s: 10                                        # Upload interval in seconds (1-5 for queue mode -10 recommended for single tracking)
+  listener_upload_interval_s: 900                          # Listener metadata upload interval in seconds (reduced from 900 for testing)
+```
+
+
+<img width="1376" height="943" alt="Screenshot 2026-05-19 152207" src="https://github.com/user-attachments/assets/1be3ef61-1a51-4f64-9e72-7c77dae0eca6" />
+
+
+
+Grafana dashboard from Sondehub will show your receiver in the statistics including RSSI/SNR:
+
+<img width="1630" height="1043" alt="Screenshot 2026-05-19 192420" src="https://github.com/user-attachments/assets/0cc6ad23-002a-4a99-8fbe-3bdd864ab81e" />
+
 
 ## License
 
