@@ -1,4 +1,4 @@
-# OpenWXSDR - Streamlined Radiosonde Decoder Framework
+# OpenWX &#xF8CF; SDR - Streamlined Radiosonde Decoder Framework
 
 A lightweight, efficient radiosonde decoder framework for Raspberry Pi, designed to work with RTL-SDR and KA9Q radio receivers. Uses the excellent rs1729/RS decoder suite.
 
@@ -155,7 +155,7 @@ Data sent to OpenWX server:
 
 ## License
 
-MIT License - See LICENSE file
+GNU GPL2 License - See LICENSE file
 
 ## Credits
 
