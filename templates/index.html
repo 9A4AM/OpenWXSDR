@@ -1,0 +1,3393 @@
+<!DOCTYPE html>
+<html lang="en">
+<!--
+========================================================================================================
+   All content of this private site copyright (C) 2026 by Meinhard F. Guenther, DL2MF http://dl2mf.de
+ ------------------------------------------------------------------------------------------------------
+     All rights reserved - No commercial use of this work is allowed - Free for amateur radio use
+ ------------------------------------------------------------------------------------------------------ 
+                Copyright (C) 2019-2026 by Meinhard F. Guenther, DL2MF - OpenWX.de
+========================================================================================================
+You can redistribute and/or modify it under the terms of the GNU
+General Public License as published by the Free Software Foundation,
+either version 2 of the License, or (at your option) any later version.
+
+GNU/GPL license gives you the freedom:
+* to use this software for both commercial and non-commercial purposes
+* to share, copy, distribute and install this software and charge for it if you wish.
+
+Under the following conditions:
+* You must attribute the work to the original author
+
+This software is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+See http://www.gnu.org/licenses/gpl-2.0.html.
+-->
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenWXSDR - Radiosonde Tracker</title>
+    
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    
+    <!-- Bootstrap Icons -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+    <!-- Chart.js for spectrum plot -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: sans-serif;
+            background: linear-gradient(to bottom, #ffffff, #e0e0e0);
+            background-color: #e0e0e0;
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            border-top: 5px solid #3f84dd;
+        }
+        
+        .navbar {
+            background: #222222 !important;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            padding: 12px 20px;
+        }
+        
+        .navbar-brand {
+            font-size: 24px;
+            font-weight: 700;
+            color: #333 !important;
+        }
+        
+        .openwx-open {
+            color: #4DA6FF;
+            font-weight: bold;
+        }
+        
+        .openwx-wx {
+            color: #F0F0F0;
+            font-weight: bold;
+        }
+        
+        .openwx-sdr {
+            color: #4DA6FF;
+            font-weight: bold;
+        }
+        
+        .openwx-de {
+            color: #4DA6FF;
+            font-weight: normal;
+        }
+        
+        .navbar-text {
+            font-size: 14px;
+            color: #666 !important;
+        }
+        
+        .main-container {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+        
+        #map {
+            flex: 1;
+            height: 100%;
+        }
+        
+        .sidebar {
+            width: 400px;
+            background: white;
+            overflow-y: auto;
+            border-left: 1px solid #dee2e6;
+            box-shadow: -2px 0 8px rgba(0,0,0,0.05);
+        }
+        
+        .section-header {
+            background: #f8f9fa;
+            padding: 12px 20px;
+            border-bottom: 1px solid #dee2e6;
+            font-weight: 600;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #495057;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            padding: 20px;
+        }
+        
+        .stat-card {
+            text-align: center;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border: 1px solid #e9ecef;
+        }
+        
+        .stat-value {
+            font-size: 32px;
+            font-weight: 700;
+            color: #3f84dd;
+            line-height: 1;
+        }
+        
+        .stat-value.small-font {
+            font-size: 16px;
+            line-height: 1.2;
+        }
+        
+        .stat-value.two-line {
+            font-size: 20px;
+            line-height: 1.3;
+        }
+        
+        .stat-label {
+            font-size: 12px;
+            color: #6c757d;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-top: 8px;
+        }
+        
+        .sonde-list {
+            padding: 10px 20px 20px;
+        }
+        
+        .sonde-card {
+            background: white;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 10px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .sonde-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            border-color: #3f84dd;
+        }
+        
+        .sonde-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        
+        .sonde-serial {
+            font-weight: 600;
+            font-size: 16px;
+            color: #212529;
+        }
+        
+        .sonde-type {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            color: white;
+        }
+        
+        .sonde-data {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 6px 8px;
+            font-size: 13px;
+        }
+        
+        .data-item {
+            color: #6c757d;
+        }
+        
+        .data-value {
+            font-weight: 600;
+            color: #212529;
+        }
+        
+        .no-sondes {
+            text-align: center;
+            padding: 40px 20px;
+            color: #6c757d;
+        }
+        
+        .no-sondes i {
+            font-size: 48px;
+            margin-bottom: 15px;
+            opacity: 0.3;
+        }
+        
+        .health-status {
+            padding: 15px 20px;
+        }
+        
+        .health-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid #f8f9fa;
+        }
+        
+        .health-item:last-child {
+            border-bottom: none;
+        }
+
+        .config-upload-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.55rem;
+        }
+
+        .config-upload-toggle .form-check-input {
+            width: 3em;
+            height: 1.5em;
+            margin-top: 0;
+            float: none;
+        }
+
+        .menu-btn-green {
+            color: #9ef59c !important;
+            border-color: #9ef59c !important;
+        }
+
+        .menu-btn-green:hover,
+        .menu-btn-green:focus {
+            color: #122212 !important;
+            background-color: #9ef59c !important;
+            border-color: #9ef59c !important;
+        }
+
+        .about-btn-orange {
+            color: #ffcc88 !important;
+            border-color: #ffcc88 !important;
+        }
+
+        .about-btn-orange:hover,
+        .about-btn-orange:focus {
+            color: #2b1a00 !important;
+            background-color: #ffcc88 !important;
+            border-color: #ffcc88 !important;
+        }
+
+        .stats-reset-btn {
+            border: 1px solid #6c757d;
+            color: #6c757d;
+            background: transparent;
+            width: 28px;
+            height: 28px;
+            border-radius: 999px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+        }
+
+        .stats-reset-btn:hover,
+        .stats-reset-btn:focus {
+            color: #ffffff;
+            background: #6c757d;
+            border-color: #6c757d;
+        }
+
+        .spectrum-meta,
+        .spectrum-meta span,
+        .spectrum-meta small {
+            color: #8ecbff !important;
+        }
+        
+        .health-label {
+            font-size: 13px;
+            color: #495057;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .health-value {
+            font-size: 13px;
+            font-weight: 600;
+        }
+        
+        .status-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        
+        .status-healthy {
+            background: #28a745;
+        }
+        
+        .status-warning {
+            background: #ffc107;
+        }
+        
+        .status-error {
+            background: #dc3545;
+        }
+        
+        .json-viewer {
+            padding: 15px 20px;
+        }
+        
+        .json-output {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            padding: 15px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        .custom-popup {
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        
+        .popup-header {
+            font-weight: 600;
+            font-size: 14px;
+            margin-bottom: 8px;
+            color: #212529;
+        }
+        
+        .popup-data {
+            font-size: 13px;
+            color: #495057;
+        }
+        
+        .popup-data > div {
+            margin-bottom: 4px;
+        }
+        
+        @media (max-width: 992px) {
+            .sidebar {
+                width: 100%;
+                max-width: 350px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation Bar -->
+    <nav class="navbar navbar-dark">
+        <div class="container-fluid">
+            <span class="navbar-brand mb-0">
+                <span class="openwx-open">Open</span><span class="openwx-wx">WX</span> <span class="openwx-sdr"><i class="bi bi-radar"></i></span> <span class="openwx-open">SDR</span>
+            </span>
+            <div class="d-flex align-items-center gap-3">
+                <div class="dropdown">
+                    <button class="btn btn-sm btn-outline-secondary dropdown-toggle menu-btn-green" type="button" id="menuDropdown" data-bs-toggle="dropdown" aria-expanded="false">
+                        <i class="bi bi-gear"></i> Menu
+                    </button>
+                    <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="menuDropdown">
+                        <li><a class="dropdown-item" id="enterFrequencyMenuItem" href="#" onclick="showEnterFrequencyModal(); return false;"><i class="bi bi-broadcast"></i> Enter Frequency</a></li>
+                        <li id="fixedChannelsMenuItem"><a class="dropdown-item" href="#" onclick="showFixedChannelsModal(); return false;"><i class="bi bi-list-check"></i> Fixed Channels</a></li>
+                        <li><a class="dropdown-item" href="#" onclick="showScanningModal(); return false;"><i class="bi bi-radar"></i> Start Scanning</a></li>
+                        <li><a class="dropdown-item" href="#" onclick="showSpectrumModal(); return false;"><i class="bi bi-bar-chart-line"></i> Show Spectrum</a></li>
+
+                    </ul>
+                </div>
+                <div class="dropdown">
+                    <button class="btn btn-sm btn-outline-info dropdown-toggle" type="button" id="systemDropdown" data-bs-toggle="dropdown" aria-expanded="false">
+                        <i class="bi bi-gear-wide-connected"></i> System
+                    </button>
+                    <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="systemDropdown">
+                        <li><a class="dropdown-item" href="#" onclick="showConfigurationModal(); return false;"><i class="bi bi-sliders"></i> Configuration</a></li>
+                        <li><a class="dropdown-item" href="#" onclick="showDecoderSettingsModal(); return false;"><i class="bi bi-usb-plug"></i> Receiver</a></li>
+                        <li><a class="dropdown-item" href="#" onclick="showLogfilesModal(); return false;"><i class="bi bi-file-text"></i> Logfile</a></li>                        
+                        <li><a class="dropdown-item" href="#" onclick="showServiceStatusModal(); return false;"><i class="bi bi-hdd-network"></i> Service</a></li>
+                    </ul>
+                </div>
+                <button class="btn btn-sm btn-outline-secondary about-btn-orange" onclick="showAboutModal(); return false;">
+                    <i class="bi bi-info-circle"></i> About
+                </button>
+                <span class="navbar-text" style="color: rgba(255,255,255,0.45); margin-left: 40px; font-size: 0.85rem;">
+                    {{ callsign }} &ndash; v{{ version }}
+                </span>
+            </div>
+        </div>
+    </nav>
+    
+    <!-- Main Container -->
+    <div class="main-container">
+        <!-- Map -->
+        <div id="map"></div>
+        
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <!-- Statistics Section -->
+            <div class="section-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-graph-up"></i> System Statistics</span>
+                <button
+                    id="resetSystemStatsBtn"
+                    class="stats-reset-btn"
+                    type="button"
+                    title="Reset active sondes, total frames and inactive frequencies"
+                    aria-label="Reset statistics"
+                    onclick="resetSystemStatistics(); return false;"
+                >
+                    <i class="bi bi-arrow-counterclockwise"></i>
+                </button>
+            </div>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-value" id="activeSondesCount">0</div>
+                    <div class="stat-label">Active Sondes</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="totalFrames">0</div>
+                    <div class="stat-label">Total Frames</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value small-font" id="activeFrequencies">-</div>
+                    <div class="stat-label">Frequencies</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value two-line" id="systemResources">-<br>-</div>
+                    <div class="stat-label">CPU / Memory</div>
+                </div>
+            </div>
+            
+            <!-- Active Sondes Section -->
+            <div class="section-header">
+                <i class="bi bi-broadcast"></i> Active Radiosondes
+            </div>
+            <div class="sonde-list" id="sondesList">
+                <div class="no-sondes">
+                    <i class="bi bi-search"></i>
+                    <p>No active radiosondes detected</p>
+                    <small>Scanning frequencies...</small>
+                </div>
+            </div>
+            
+            <!-- Health Check Section -->
+            <div class="section-header">
+                <i class="bi bi-heart-pulse"></i> System Health
+            </div>
+            <div class="health-status">
+                <div class="health-item">
+                    <span class="health-label">
+                        <span class="status-indicator" id="statusDecoder"></span>
+                        Decoder Manager
+                    </span>
+                    <span class="health-value" id="healthDecoder">Checking...</span>
+</div>
+                <div class="health-item">
+                    <span class="health-label">
+                        <span class="status-indicator" id="statusFrames"></span>
+                        Last Frame
+                    </span>
+                    <span class="health-value" id="healthFrames">Never</span>
+                </div>
+                <div class="health-item">
+                    <span class="health-label">
+                        <i class="bi bi-cpu"></i>
+                        Active Decoders
+                    </span>
+                    <span class="health-value" id="healthActiveDecoders">0</span>
+                </div>
+                <div class="health-item">
+                    <span class="health-label">
+                        <span class="status-indicator" id="statusMqtt"></span>
+                        MQTT
+                    </span>
+                    <span class="health-value" id="healthMqtt">Checking...</span>
+                </div>
+                <div class="health-item">
+                    <span class="health-label">
+                        <span class="status-indicator" id="statusSondehub"></span>
+                        SondeHub Upload
+                    </span>
+                    <span class="health-value" id="healthSondehub">Checking...</span>
+                </div>
+            </div>
+            
+            <!-- SDR Devices Table -->
+            <div class="section-header" style="margin-top: 15px;">
+                <i class="bi bi-router"></i> SDR Devices
+            </div>
+            <div id="devicesTable" style="overflow-x: auto;">
+                <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
+                    <thead>
+                        <tr style="background: rgba(255,255,255,0.05);">
+                            <th style="padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);"></th>
+                            <th style="padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);">Device</th>
+                            <th style="padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);">Status</th>
+                            <th style="padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);">Frequency</th>
+                            <th style="padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);">Sonde Type</th>
+                        </tr>
+                    </thead>
+                    <tbody id="devicesTableBody">
+                        <tr>
+                            <td colspan="5" style="padding: 15px; text-align: center; color: rgba(255,255,255,0.5);">Loading devices...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <script>
+        // Sonde type colors - OpenWX.de blue theme
+        const sondeColors = {
+            'RS41': '#3f84dd',
+            'RS92': '#4DA6FF',
+            'DFM': '#4facfe',
+            'M10': '#43e97b',
+            'M20': '#fa709a',
+            'iMet': '#feca57',
+            'LMS6': '#ff6b6b',
+            'MRZ': '#4ecdc4'
+        };
+        
+        // Initialize map
+        const map = L.map('map').setView([{{ default_lat }}, {{ default_lon }}], {{ default_zoom }});
+        
+        // Define base layers
+        const osmLayer = L.tileLayer('{{ tile_server }}', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+            maxZoom: 19
+        });
+        
+        const topoLayer = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://opentopomap.org">OpenTopoMap</a>',
+            maxZoom: 17
+        });
+        
+        const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            attribution: '&copy; <a href="https://www.esri.com">Esri</a>',
+            maxZoom: 19
+        });
+        
+        // Add OSM as default layer
+        osmLayer.addTo(map);
+        
+        // Create layer control (positioned bottom-left)
+        const baseLayers = {
+            'OpenStreetMap': osmLayer,
+            'OpenTopoMap': topoLayer,
+            'Satellite': satelliteLayer
+        };
+        
+        L.control.layers(baseLayers, null, {position: 'bottomleft'}).addTo(map);
+        
+        // Storage for markers and paths
+        const sondeMarkers = {};
+        const sondePaths = {};
+        let latestDebugData = [];
+        let currentSdrType = 'rtlsdr';  // Track current SDR type (rtlsdr, flux242, ka9q)
+        let fixedChannelsEnabled = false;
+        let activeSondeSerials = [];  // Track active sonde serials for logfile highlighting
+        
+        // Update data from API
+        async function updateData() {
+            try {
+                const response = await fetch('/api/sondes');
+                const data = await response.json();
+                
+                // Update statistics
+                document.getElementById('activeSondesCount').textContent = data.count || 0;
+                // Format frame count with proper number display (no 1000 limit)
+                const frameCount = data.total_frames || 0;
+                document.getElementById('totalFrames').textContent = frameCount.toLocaleString();
+                
+                // Update frequencies - extract from sondes data
+                if (data.sondes && data.sondes.length > 0) {
+                    // Get unique frequencies from active sondes
+                    const frequencies = [...new Set(data.sondes.map(s => s.frequency).filter(f => f))];
+                    if (frequencies.length > 0) {
+                        const freqStr = frequencies.map(f => f.toFixed(3) + ' MHz').join(', ');
+                        document.getElementById('activeFrequencies').textContent = freqStr;
+                    } else {
+                        document.getElementById('activeFrequencies').textContent = '-';
+                    }
+                } else {
+                    document.getElementById('activeFrequencies').textContent = '-';
+                }
+                
+                // Store active sonde serials for logfile highlighting
+                activeSondeSerials = (data.sondes || []).map(s => s.serial);
+                
+                // Update sondes list
+                updateSondesList(data.sondes || []);
+                
+                // Update map
+                updateMap(data.sondes || []);
+                
+                // Update system resources
+                await updateSystemResources();
+                
+            } catch (error) {
+                console.error('Error fetching data:', error);
+            }
+        }
+        
+        // Update system resources (CPU/Memory)
+        async function updateSystemResources() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                
+                if (data.cpu_percent !== undefined && data.memory_percent !== undefined) {
+                    const cpuStr = data.cpu_percent.toFixed(0) + '%';
+                    const memStr = data.memory_percent.toFixed(0) + '%';
+                    document.getElementById('systemResources').innerHTML = `CPU: ${cpuStr}<br>RAM: ${memStr}`;
+                } else {
+                    document.getElementById('systemResources').innerHTML = '-<br>-';
+                }
+            } catch (error) {
+                console.error('Error fetching system resources:', error);
+                document.getElementById('systemResources').textContent = '-';
+            }
+        }
+        
+        // Update health status
+        async function updateHealth() {
+            try {
+                const response = await fetch('/api/health');
+                const health = await response.json();
+                
+                // Decoder status
+                const decoderStatus = health.decoder_manager?.status || 'unknown';
+                document.getElementById('healthDecoder').textContent = decoderStatus;
+                document.getElementById('statusDecoder').className = 'status-indicator ' + 
+                    (decoderStatus === 'running' ? 'status-healthy' : 'status-error');
+                
+                // Active decoders
+                const activeDecoders = health.decoder_manager?.active_decoders || 0;
+                document.getElementById('healthActiveDecoders').textContent = activeDecoders;
+                
+                // Last frame
+                const lastFrame = health.last_frame_time || 'Never';
+                const lastFrameDate = lastFrame !== 'Never' ? new Date(lastFrame) : null;
+                const timeDiff = lastFrameDate ? (Date.now() - lastFrameDate.getTime()) / 1000 : null;
+                
+                if (timeDiff !== null) {
+                    if (timeDiff < 60) {
+                        document.getElementById('healthFrames').textContent = `${Math.floor(timeDiff)}s ago`;
+                        document.getElementById('statusFrames').className = 'status-indicator status-healthy';
+                    } else if (timeDiff < 300) {
+                        document.getElementById('healthFrames').textContent = `${Math.floor(timeDiff / 60)}m ago`;
+                        document.getElementById('statusFrames').className = 'status-indicator status-warning';
+                    } else {
+                        document.getElementById('healthFrames').textContent = 'Stale';
+                        document.getElementById('statusFrames').className = 'status-indicator status-error';
+                    }
+                } else {
+                    document.getElementById('healthFrames').textContent = 'Never';
+                    document.getElementById('statusFrames').className = 'status-indicator status-error';
+                }
+
+                // MQTT status
+                const mqttStatus = health.mqtt?.status || 'unknown';
+                document.getElementById('healthMqtt').textContent = mqttStatus;
+                document.getElementById('statusMqtt').className = 'status-indicator ' +
+                    (mqttStatus === 'connected' ? 'status-healthy' :
+                     mqttStatus === 'disabled' || mqttStatus === 'not_configured' ? 'status-warning' :
+                     'status-error');
+
+                // SondeHub status
+                const sondehubStatus = health.sondehub?.status || 'unknown';
+                document.getElementById('healthSondehub').textContent = sondehubStatus;
+                document.getElementById('statusSondehub').className = 'status-indicator ' +
+                    (sondehubStatus === 'active' ? 'status-healthy' :
+                     sondehubStatus === 'waiting' || sondehubStatus === 'disabled' || sondehubStatus === 'not_configured' ? 'status-warning' :
+                     'status-error');
+                
+                // Update devices table
+                await updateDevices();
+                
+            } catch (error) {
+                console.error('Error fetching health:', error);
+            }
+        }
+        
+        async function updateDevices() {
+            try {
+                const response = await fetch('/api/devices');
+                const data = await response.json();
+                const devices = data.devices || [];
+                
+                const tbody = document.getElementById('devicesTableBody');
+                
+                if (devices.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan=\"5\" style=\"padding: 15px; text-align: center; color: rgba(255,255,255,0.5);\">No devices configured</td></tr>';
+                    return;
+                }
+                
+                tbody.innerHTML = devices.map(device => {
+                    // Status indicator and color
+                    let statusClass = 'status-error';
+                    let statusText = device.status || 'unknown';
+                    
+                    if (device.status === 'scanning') {
+                        statusClass = 'status-healthy';
+                        statusText = 'Scanning';
+                    } else if (device.status === 'decoding') {
+                        statusClass = 'status-healthy';
+                        statusText = 'Decoding';
+                    } else if (device.status === 'idle') {
+                        statusClass = 'status-warning';
+                        statusText = 'Idle';
+                    } else if (device.status === 'disconnected') {
+                        statusClass = 'status-error';
+                        statusText = 'Disconnected';
+                    }
+                    
+                    // Frequency display - use freq_label when available (shows scan range)
+                    const freqText = device.freq_label ? device.freq_label
+                                   : device.frequency  ? `${device.frequency.toFixed(3)} MHz`
+                                   : '—';
+                    
+                    // Sonde type display
+                    const sondeText = device.sonde_type || '—';
+                    
+                    return `
+                        <tr style=\"border-bottom: 1px solid rgba(255,255,255,0.05);\">
+                            <td style=\"padding: 8px; text-align: center;\">
+                                <span class=\"status-indicator ${statusClass}\"></span>
+                            </td>
+                            <td style=\"padding: 8px;\"><b>${device.serial}</b></td>
+                            <td style=\"padding: 8px;\">${statusText}</td>
+                            <td style=\"padding: 8px; font-family: monospace;\">${freqText}</td>
+                            <td style=\"padding: 8px;\">${sondeText}</td>
+                        </tr>
+                    `;
+                }).join('');
+                
+            } catch (error) {
+                console.error('Error fetching devices:', error);
+                document.getElementById('devicesTableBody').innerHTML = 
+                    '<tr><td colspan=\"5\" style=\"padding: 15px; text-align: center; color: rgba(255,0,0,0.7);\">Error loading devices</td></tr>';
+            }
+        }
+        
+        // Update sondes list
+        function updateSondesList(sondes) {
+            const sondesList = document.getElementById('sondesList');
+            
+            if (sondes.length === 0) {
+                sondesList.innerHTML = `
+                    <div class="no-sondes">
+                        <i class="bi bi-search"></i>
+                        <p>No active radiosondes detected</p>
+                        <small>Scanning frequencies...</small>
+                    </div>
+                `;
+                return;
+            }
+            
+            sondesList.innerHTML = sondes.map(sonde => {
+                const color = sondeColors[sonde.type] || '#6c757d';
+                // Extract clean subtype (e.g., "DFM17" from "0xC:DFM17" or just "DFM17") - prefer subtype when available
+                let typeLabel = sonde.type;
+                if (sonde.subtype && sonde.subtype !== '' && sonde.subtype !== null) {
+                    const cleanSubtype = sonde.subtype.includes(':') ? sonde.subtype.split(':').pop() : sonde.subtype;
+                    typeLabel = cleanSubtype;  // Show only subtype when available
+                }
+                return `
+                    <div class="sonde-card" onclick="focusSonde('${sonde.serial}')">
+                        <div class="sonde-header">
+                            <div style="display:flex; align-items:baseline; gap:4px;">
+                                <span class="sonde-serial">${sonde.serial}</span>
+                                <span style="font-size:0.72em; color:#999; white-space:nowrap;">&ndash; ${sonde.timestamp ? new Date(sonde.timestamp).toISOString().slice(11,19) + ' UTC' : ''}${sonde.frame !== undefined && sonde.frame !== null ? ' - #' + sonde.frame : ''}</span>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:8px;">
+                                <button class="btn btn-sm btn-outline-primary" style="padding:2px 6px; line-height:1;" onclick="openExternalUrl('${sonde.serial}'); event.stopPropagation();" title="View on external site">
+                                    <i class="bi bi-box-arrow-up-right"></i>
+                                </button>
+                                <span class="sonde-type" style="background: ${color}">${typeLabel}</span>
+                            </div>
+                        </div>
+                        <div class="sonde-data">
+                            <div class="data-item">
+                                <i class="bi bi-broadcast"></i>
+                                <span class="data-value">${sonde.frequency ? sonde.frequency.toFixed(3) + ' MHz' : 'N/A'}</span>
+                            </div>
+                            <div class="data-item">
+                                <i class="bi ${sonde.vel_v !== undefined && sonde.vel_v !== null ? (sonde.vel_v >= 0 ? 'bi-arrow-up' : 'bi-arrow-down') : 'bi-arrow-up-down'}"></i>
+                                <span class="data-value">${sonde.vel_v !== undefined && sonde.vel_v !== null ? sonde.vel_v.toFixed(1) + ' m/s' : 'N/A'}</span>
+                            </div>
+                            <div class="data-item">
+                                <i class="bi bi-reception-4"></i>
+                                <span class="data-value">${sonde.rssi !== undefined && sonde.rssi !== null ? sonde.rssi.toFixed(1) + ' dBm' : 'N/A'}</span>
+                            </div>
+                            <div class="data-item">
+                                <i class="bi bi-geo-alt"></i>
+                                <span class="data-value">${sonde.alt !== undefined && sonde.alt !== null ? Math.round(sonde.alt) + ' m' : 'N/A'}</span>
+                            </div>
+                            <div class="data-item">
+                                <i class="bi bi-speedometer2"></i>
+                                <span class="data-value">${sonde.vel_h !== undefined && sonde.vel_h !== null ? sonde.vel_h.toFixed(1) + ' m/s' : 'N/A'}</span>
+                            </div>
+                            <div class="data-item">
+                                <i class="bi bi-graph-up-arrow"></i>
+                                <span class="data-value">${sonde.snr !== undefined && sonde.snr !== null ? sonde.snr.toFixed(1) + ' dB' : 'N/A'}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+        
+        // Update map markers
+        function updateMap(sondes) {
+            const activeSondes = new Set();
+            
+            sondes.forEach(sonde => {
+                if (!sonde.lat || !sonde.lon) return;
+                
+                activeSondes.add(sonde.serial);
+                const position = [sonde.lat, sonde.lon];
+                const color = sondeColors[sonde.type] || '#6c757d';
+                
+                // Determine marker icon based on state
+                let iconUrl = '/static/img/balloon_live.png';  // default
+                
+                // Check if ascending or descending based on vertical velocity
+                if (sonde.vel_v !== undefined && sonde.vel_v !== null) {
+                    if (sonde.vel_v < -1) {
+                        // Descending (parachute)
+                        iconUrl = '/static/img/chute_green.png';
+                    } else if (sonde.vel_v > 1) {
+                        // Ascending (balloon)
+                        iconUrl = '/static/img/balloon_live.png';
+                    }
+                }
+                
+                // Create custom icon with different sizes based on type
+                let iconSize, iconAnchor;
+                if (iconUrl.includes('balloon_live')) {
+                    iconSize = [23, 42];
+                    iconAnchor = [11, 42];
+                } else if (iconUrl.includes('chute_green')) {
+                    iconSize = [16, 28];
+                    iconAnchor = [8, 28];
+                } else {
+                    iconSize = [32, 32];
+                    iconAnchor = [16, 16];
+                }
+                
+                const customIcon = L.icon({
+                    iconUrl: iconUrl,
+                    iconSize: iconSize,
+                    iconAnchor: iconAnchor,
+                    popupAnchor: [0, -iconAnchor[1]]
+                });
+                
+                // Create or update marker
+                if (!sondeMarkers[sonde.serial]) {
+                    const marker = L.marker(position, { icon: customIcon }).addTo(map);
+                    marker.bindPopup(createPopupContent(sonde.serial, sonde.type, sonde));
+                    sondeMarkers[sonde.serial] = marker;
+                } else {
+                    sondeMarkers[sonde.serial].setLatLng(position);
+                    sondeMarkers[sonde.serial].setIcon(customIcon);
+                    sondeMarkers[sonde.serial].setPopupContent(createPopupContent(sonde.serial, sonde.type, sonde));
+                }
+                
+                // Update path with launch marker
+                if (sonde.path && sonde.path.length > 0) {
+                    const pathCoords = sonde.path.map(p => [p[0], p[1]]);
+                    
+                    if (!sondePaths[sonde.serial]) {
+                        const path = L.polyline(pathCoords, {
+                            color: '#FF6A00',
+                            weight: 3,
+                            opacity: 0.8
+                        }).addTo(map);
+                        sondePaths[sonde.serial] = path;
+                        
+                        // Add launch marker at first position
+                        if (pathCoords.length > 0) {
+                            const launchIcon = L.icon({
+                                iconUrl: '/static/img/launch-marker-cyan.png',
+                                iconSize: [16, 16],
+                                iconAnchor: [8, 8]
+                            });
+                            const launchMarker = L.marker(pathCoords[0], { icon: launchIcon }).addTo(map);
+                            const launchPt = sonde.path[0];
+                            const launchAlt = sonde.path_alts ? sonde.path_alts[0] : (sonde.alt ? Math.round(sonde.alt) : null);
+                            const launchFreq = sonde.frequency ? sonde.frequency.toFixed(3) + ' MHz' : 'N/A';
+                            const launchTime = sonde.timestamp ? new Date(sonde.timestamp).toISOString().slice(0, 19).replace('T', ' ') + ' UTC' : 'N/A';
+                            launchMarker.bindPopup(
+                                `<b>Launch Site</b><br>${sonde.serial}<br>` +
+                                `<small>` +
+                                `${launchPt[0].toFixed(5)}, ${launchPt[1].toFixed(5)}<br>` +
+                                `Alt: ${launchAlt !== null ? launchAlt + ' m' : 'N/A'}<br>` +
+                                `Freq: ${launchFreq}<br>` +
+                                `${launchTime}` +
+                                `</small>`
+                            );
+                            
+                            // Store launch marker with sonde
+                            if (!sondePaths[sonde.serial + '_launch']) {
+                                sondePaths[sonde.serial + '_launch'] = launchMarker;
+                            }
+                        }
+                    } else {
+                        sondePaths[sonde.serial].setLatLngs(pathCoords);
+                    }
+                }
+            });
+            
+            // Note: markers and paths are only removed when the server evicts the sonde
+            // (after sonde_retention_time in config.yaml). We do not purge client-side
+            // so that tracks and popups remain visible after the SDR moves to another freq.
+            
+            // Auto-fit bounds if there are sondes
+            if (Object.keys(sondeMarkers).length > 0 && !map._userPanned) {
+                const group = L.featureGroup(Object.values(sondeMarkers));
+                map.fitBounds(group.getBounds().pad(0.2));
+            }
+        }
+        
+        // Create popup content
+        function createPopupContent(serial, type, data) {
+            const heading = data.heading !== undefined && data.heading !== null ? data.heading.toFixed(0) : '0';
+            // Prefer subtype when available (e.g., "DFM17" instead of "DFM")
+            let displayType = type;
+            if (data.subtype && data.subtype !== '' && data.subtype !== null) {
+                displayType = data.subtype.includes(':') ? data.subtype.split(':').pop() : data.subtype;
+            }
+            return `
+                <div class="custom-popup">
+                    <div class="popup-header">${displayType}: ${serial}</div>
+                    <div class="popup-data">
+                        <div><strong>Position:</strong> ${data.lat?.toFixed(5)}, ${data.lon?.toFixed(5)}</div>
+                        <div><strong>Altitude:</strong> ${data.alt ? Math.round(data.alt) + ' m' : 'N/A'}</div>
+                        <div><strong>Speed H/V:</strong> ${data.vel_h?.toFixed(1)}/${data.vel_v?.toFixed(1)} m/s</div>
+                        <div><strong>Heading:</strong> ${heading}°</div>
+                        <div><strong>Frequency:</strong> ${data.frequency?.toFixed(3)} MHz</div>
+                        <div><strong>RSSI:</strong> ${data.rssi !== undefined && data.rssi !== null ? data.rssi.toFixed(1) + ' dBm' : 'N/A'}</div>
+                        <div><strong>SNR:</strong> ${data.snr !== undefined && data.snr !== null ? data.snr.toFixed(1) + ' dB' : 'N/A'}</div>
+                        ${data.temp !== undefined && data.temp !== null ? `<div><strong>Temperature:</strong> ${data.temp.toFixed(1)}°C</div>` : ''}
+                        ${data.humidity !== undefined && data.humidity !== null ? `<div><strong>Humidity:</strong> ${data.humidity.toFixed(1)}%</div>` : ''}
+                        ${data.pressure !== undefined && data.pressure !== null ? `<div><strong>Pressure:</strong> ${data.pressure.toFixed(1)} hPa</div>` : ''}
+                    </div>
+                </div>
+            `;
+        }
+        
+        // Focus on specific sonde
+        function focusSonde(serial) {
+            if (sondeMarkers[serial]) {
+                const marker = sondeMarkers[serial];
+                map.setView(marker.getLatLng(), 12);
+                marker.openPopup();
+            }
+        }
+        
+        // Track if user has manually interacted with the map (pan or zoom)
+        map._userPanned = false;
+        map.on('dragstart', () => { map._userPanned = true; });
+        map.on('zoomstart', () => { map._userPanned = true; });  // Also track zoom
+        
+        // Initial updates
+        updateData();
+        updateHealth();
+        
+        // Update intervals
+        setInterval(updateData, 2000);  // Update data every 2 seconds
+        setInterval(updateHealth, 5000);  // Update health every 5 seconds
+        
+        // Load config and update menu state
+        async function loadConfigAndUpdateMenu() {
+            try {
+                const response = await fetch('/api/config');
+                const data = await response.json();
+                currentSdrType = data.sdr_type || 'rtlsdr';
+                fixedChannelsEnabled = (data.fixed_channels_enable === true);
+                updateMenuState();
+            } catch (error) {
+                console.error('Error loading config:', error);
+            }
+        }
+        
+        // Update menu item states based on SDR type
+        function updateMenuState() {
+            const enterFreqItem = document.getElementById('enterFrequencyMenuItem');
+            const fixedChannelsMenuItem = document.getElementById('fixedChannelsMenuItem');
+            // Manual freq entry and scanning supported for rtlsdr and airspy
+            const isManualSupported = (currentSdrType === 'rtlsdr' || currentSdrType === 'airspy');
+            if (!isManualSupported) {
+                enterFreqItem.classList.add('disabled');
+                enterFreqItem.setAttribute('aria-disabled', 'true');
+                enterFreqItem.style.opacity = '0.5';
+                enterFreqItem.style.cursor = 'not-allowed';
+            } else {
+                enterFreqItem.classList.remove('disabled');
+                enterFreqItem.removeAttribute('aria-disabled');
+                enterFreqItem.style.opacity = '1';
+                enterFreqItem.style.cursor = 'pointer';
+            }
+
+            if (fixedChannelsMenuItem) {
+                fixedChannelsMenuItem.style.display = fixedChannelsEnabled ? '' : 'none';
+            }
+        }
+
+        async function resetSystemStatistics() {
+            if (!confirm('Reset Active Sondes and Total Frames counters? This will clear current tracked sondes and frequency cache.')) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/reset_statistics', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ reset: true }),
+                });
+                const data = await response.json();
+
+                if (!data.success) {
+                    alert('Failed to reset statistics: ' + (data.error || 'Unknown error'));
+                    return;
+                }
+
+                await updateData();
+                await updateHealth();
+            } catch (error) {
+                console.error('Error resetting statistics:', error);
+                alert('Error resetting statistics: ' + error);
+            }
+        }
+        
+        // Load config on page load
+        loadConfigAndUpdateMenu();
+        
+        // Modal functions
+        function showEnterFrequencyModal() {
+            const isManualSupported = (currentSdrType === 'rtlsdr' || currentSdrType === 'airspy');
+            if (!isManualSupported) {
+                alert('Manual frequency entry is only available in RTL-SDR or Airspy mode.\nCurrently using: ' + currentSdrType.toUpperCase());
+                return;
+            }
+            // Populate device dropdown from /api/devices
+            fetch('/api/devices')
+                .then(r => r.json())
+                .then(data => {
+                    const sel = document.getElementById('manualDeviceSerial');
+                    sel.innerHTML = '<option value="auto">Auto (first available)</option>';
+                    (data.devices || []).forEach(d => {
+                        const opt = document.createElement('option');
+                        opt.value = d.serial;
+                        const stateLabel = d.status === 'scanning' ? ' [scanning]'
+                                         : d.status === 'decoding' ? ' [decoding]'
+                                         : ' [idle]';
+                        opt.textContent = d.serial + stateLabel;
+                        sel.appendChild(opt);
+                    });
+                })
+                .catch(() => {});
+            const modal = new bootstrap.Modal(document.getElementById('enterFrequencyModal'));
+            modal.show();
+        }
+        
+        function showScanningModal() {
+            fetch('/api/devices')
+                .then(r => r.json())
+                .then(data => {
+                    const container = document.getElementById('scanningDeviceList');
+                    const devices = data.devices || [];
+                    if (devices.length === 0) {
+                        container.innerHTML = '<p class="text-muted">No SDR devices found.</p>';
+                    } else {
+                        container.innerHTML = devices.map(d => {
+                            const statusBadge = d.status === 'scanning'
+                                ? '<span class="badge bg-primary">Scanning ' + (d.freq_label || '') + '</span>'
+                                : d.status === 'decoding'
+                                ? '<span class="badge bg-success">Decoding ' + (d.frequency ? d.frequency.toFixed(3) + ' MHz' : '') + '</span>'
+                                : '<span class="badge bg-secondary">Idle</span>';
+                            const canScan = (d.status === 'idle' || d.status === 'decoding');
+                            const btnLabel = d.status === 'decoding'
+                                ? '<i class="bi bi-arrow-repeat"></i> Restart Scan'
+                                : '<i class="bi bi-play-fill"></i> Start Scan';
+                            return `<div class="d-flex align-items-center justify-content-between mb-2 p-2 border rounded">
+                                <div><strong>${d.serial}</strong>&nbsp;${statusBadge}</div>
+                                <button class="btn btn-sm btn-outline-primary" ${canScan ? '' : 'disabled'}
+                                    onclick="startScanning('${d.serial}'); return false;">
+                                    ${btnLabel}
+                                </button>
+                            </div>`;
+                        }).join('');
+                    }
+                    const modal = new bootstrap.Modal(document.getElementById('scanningModal'));
+                    modal.show();
+                })
+                .catch(err => { console.error(err); alert('Failed to load device list'); });
+        }
+
+        function startScanning(serial) {
+            fetch('/api/start_scanning', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ device_serial: serial })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    // Refresh the modal content
+                    bootstrap.Modal.getInstance(document.getElementById('scanningModal')).hide();
+                    setTimeout(showScanningModal, 300);
+                } else {
+                    alert('Failed to start scan: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(err => { console.error(err); alert('Failed to start scan'); });
+        }
+
+        function showAboutModal() {
+            const modal = new bootstrap.Modal(document.getElementById('aboutModal'));
+            modal.show();
+        }
+
+        function showDecoderSettingsModal() {
+            // Load current settings
+            fetch('/api/config')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('sdrType').value = data.sdr_type || 'rtlsdr';
+                    // Show Airspy option only if airspy_support is enabled
+                    const airspyOption = document.getElementById('airspyOption');
+                    if (airspyOption) {
+                        airspyOption.style.display = data.airspy_available ? '' : 'none';
+                    }
+                    const modal = new bootstrap.Modal(document.getElementById('decoderSettingsModal'));
+                    modal.show();
+                })
+                .catch(error => {
+                    console.error('Error loading config:', error);
+                    alert('Failed to load current settings');
+                });
+        }
+        
+        let logfilesData = [];
+        let logfilesSortColumn = 'date';
+        let logfilesSortDirection = -1; // -1 = descending (newest first), 1 = ascending
+        let externalUrlProvider = 'openwx';
+        let externalUrlCustom = '';
+        
+        function openExternalUrl(sondeId) {
+            let url = '';
+            if (externalUrlProvider === 'openwx') {
+                url = `https://map.openwx.de/index.html?sondeid=${sondeId}`;
+            } else if (externalUrlProvider === 'sondehub') {
+                url = `https://sondehub.org/#!mt=Mapnik&mz=10&qm=3h&f=${sondeId}&q=${sondeId}`;
+            } else if (externalUrlProvider === 'custom' && externalUrlCustom) {
+                url = externalUrlCustom.replace(/<sondeid>/g, sondeId);
+            } else {
+                alert('External URL not configured');
+                return;
+            }
+            window.open(url, '_blank');
+        }
+        
+        function parseLogfileName(filename) {
+            // Activity log: openwxsdr_CALLSIGN.log
+            if (filename.startsWith('openwxsdr_')) {
+                return { filename, type: 'Activity', date: '', timestamp: 0 };
+            }
+            
+            // Sonde log: SERIAL-YYYYMMDD-HHMMSS.log
+            const match = filename.match(/^([A-Z0-9]+)-(\d{8})-(\d{6})\.log$/);
+            if (match) {
+                const serial = match[1];
+                const dateStr = match[2]; // YYYYMMDD
+                const timeStr = match[3]; // HHMMSS
+                
+                // Parse date/time
+                const year = dateStr.substr(0, 4);
+                const month = dateStr.substr(4, 2);
+                const day = dateStr.substr(6, 2);
+                const hour = timeStr.substr(0, 2);
+                const min = timeStr.substr(2, 2);
+                const sec = timeStr.substr(4, 2);
+                const formattedDate = `${year}-${month}-${day} ${hour}:${min}:${sec}`;
+                const timestamp = new Date(formattedDate).getTime();
+                
+                // Determine sonde type from serial prefix
+                let type = 'Sonde';
+                if (serial.match(/^[A-Z]\d{7}/)) type = 'RS41';
+                else if (serial.match(/^[A-Z]\d{6}/)) type = 'RS92';
+                else if (serial.match(/^\d{8}/)) type = 'DFM';
+                else if (serial.match(/^M\d+/)) type = serial.match(/^M10/) ? 'M10' : 'M20';
+                else if (serial.match(/^W\d+/)) type = 'iMet';
+                else if (serial.match(/^L\d+/)) type = 'LMS6';
+                else if (serial.match(/^ME\d+/)) type = 'MRZ';
+                
+                return { filename, type, date: formattedDate, timestamp };
+            }
+            
+            return { filename, type: 'Unknown', date: '', timestamp: 0 };
+        }
+        
+        function sortLogfiles(column) {
+            if (logfilesSortColumn === column) {
+                logfilesSortDirection *= -1; // Toggle direction
+            } else {
+                logfilesSortColumn = column;
+                logfilesSortDirection = column === 'date' ? -1 : 1; // Date defaults to descending
+            }
+            
+            // Update sort icons
+            document.getElementById('sortIconName').className = 'bi bi-arrow-down-up';
+            document.getElementById('sortIconType').className = 'bi bi-arrow-down-up';
+            document.getElementById('sortIconDate').className = 'bi bi-arrow-down-up';
+            
+            const iconId = 'sortIcon' + column.charAt(0).toUpperCase() + column.slice(1);
+            const iconClass = logfilesSortDirection === 1 ? 'bi-sort-alpha-down' : 'bi-sort-alpha-up';
+            document.getElementById(iconId).className = 'bi ' + iconClass;
+            
+            // Sort data
+            logfilesData.sort((a, b) => {
+                let valA, valB;
+                if (column === 'name') {
+                    valA = a.filename;
+                    valB = b.filename;
+                } else if (column === 'type') {
+                    valA = a.type;
+                    valB = b.type;
+                } else { // date
+                    valA = a.timestamp;
+                    valB = b.timestamp;
+                }
+                
+                if (valA < valB) return -logfilesSortDirection;
+                if (valA > valB) return logfilesSortDirection;
+                return 0;
+            });
+            
+            renderLogfileTable();
+        }
+        
+        function renderLogfileTable() {
+            const logList = document.getElementById('logfileList');
+            if (logfilesData.length === 0) {
+                logList.innerHTML = '<tr><td colspan="3" class="text-center text-muted">No log files found</td></tr>';
+                return;
+            }
+            
+            logList.innerHTML = logfilesData.map(item => {
+                const isActiveSonde = activeSondeSerials.some(serial => item.filename.startsWith(serial + '-'));
+                const rowClass = isActiveSonde ? 'table-success' : '';
+                return `<tr class="${rowClass}" style="cursor: pointer;" onclick="loadLogfile('${item.filename}')">
+                    <td>${item.filename}</td>
+                    <td><span class="badge bg-secondary">${item.type}</span></td>
+                    <td>${item.date || '-'}</td>
+                </tr>`;
+            }).join('');
+        }
+        
+        function showLogfilesModal() {
+            // Update active sonde serials first to ensure highlighting works on first open
+            fetch('/api/status')
+                .then(response => response.json())
+                .then(statusData => {
+                    // Update active sondes list for highlighting
+                    activeSondeSerials = (statusData.sondes || []).map(s => s.serial);
+                    
+                    // Load logfile list
+                    return fetch('/api/logfiles');
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.files && data.files.length > 0) {
+                        logfilesData = data.files.map(parseLogfileName);
+                        sortLogfiles('date'); // Default sort by date descending
+                    } else {
+                        logfilesData = [];
+                        renderLogfileTable();
+                    }
+                    const modal = new bootstrap.Modal(document.getElementById('logfilesModal'));
+                    modal.show();
+                })
+                .catch(error => {
+                    console.error('Error loading logfiles:', error);
+                    alert('Failed to load log files');
+                });
+        }
+        
+        function exportActionLog() {
+            // Download the structured activity log
+            window.location.href = '/api/export_action_log';
+        }
+        
+        function startManualDecoder() {
+            const frequency  = document.getElementById('manualFrequency').value;
+            const sondeType  = document.getElementById('manualSondeType').value;
+            const deviceSel  = document.getElementById('manualDeviceSerial');
+            const deviceSerial = deviceSel ? deviceSel.value : 'auto';
+            const duration = parseInt(document.getElementById('decoderDuration').value) || 0;
+            
+            if (!frequency || isNaN(frequency)) {
+                alert('Please enter a valid frequency in MHz');
+                return;
+            }
+            
+            if (duration < 0 || duration > 1440) {
+                alert('Duration must be between 0 and 1440 minutes');
+                return;
+            }
+            
+            const durationLabel = duration === 0 ? 'infinite' : `${duration} minute${duration !== 1 ? 's' : ''}`;
+            
+            fetch('/api/start_decoder', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    frequency: parseFloat(frequency),
+                    sonde_type: sondeType,
+                    device_serial: deviceSerial !== 'auto' ? deviceSerial : null,
+                    duration_minutes: duration
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert(`Decoder started for ${frequency} MHz (${sondeType}) - ${durationLabel}`);
+                    bootstrap.Modal.getInstance(document.getElementById('enterFrequencyModal')).hide();
+                } else {
+                    alert('Failed to start decoder: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(error => {
+                console.error('Error starting decoder:', error);
+                alert('Failed to start decoder');
+            });
+        }
+        
+        function saveDecoderSettings() {
+            const sdrType = document.getElementById('sdrType').value;
+            
+            if (confirm(`Change SDR type to ${sdrType}? This will restart the OpenWXSDR service.`)) {
+                fetch('/api/update_config', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        sdr_type: sdrType
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert('Settings saved. Service is restarting...');
+                        bootstrap.Modal.getInstance(document.getElementById('decoderSettingsModal')).hide();
+                        setTimeout(() => location.reload(), 3000);
+                    } else {
+                        alert('Failed to save settings: ' + (data.error || 'Unknown error'));
+                    }
+                })
+                .catch(error => {
+                    console.error('Error saving settings:', error);
+                    alert('Failed to save settings');
+                });
+            }
+        }
+        
+        function loadLogfile(filename) {
+            fetch(`/api/logfile/${encodeURIComponent(filename)}`)
+                .then(response => response.text())
+                .then(data => {
+                    document.getElementById('logfileContent').textContent = data;
+                    document.getElementById('logfileTitle').textContent = filename;
+                    
+                    // Determine file type and show/hide appropriate buttons
+                    const isActivityLog = filename.startsWith('openwxsdr_');
+                    const isSondeLog = filename.match(/^[A-Z0-9]+-\d{8}-\d{6}\.log$/);
+                    
+                    const exportGpxBtn = document.getElementById('exportGpxBtn');
+                    const exportActivityBtn = document.getElementById('exportActivityBtn');
+                    const showMapBtn = document.getElementById('showMapBtn');
+                    
+                    if (isActivityLog) {
+                        // Activity log: show Export Activity Log button only
+                        if (exportGpxBtn) exportGpxBtn.style.display = 'none';
+                        if (exportActivityBtn) exportActivityBtn.style.display = 'inline-block';
+                        if (showMapBtn) showMapBtn.style.display = 'none';
+                    } else if (isSondeLog) {
+                        // Sonde log: show Export GPX and Show on Map buttons
+                        if (exportGpxBtn) {
+                            exportGpxBtn.style.display = 'inline-block';
+                            exportGpxBtn.disabled = false;
+                        }
+                        if (exportActivityBtn) exportActivityBtn.style.display = 'none';
+                        
+                        // Show "Show on Map" button only if sonde is NOT currently active
+                        const sondeSerial = filename.split('-')[0];
+                        const isActive = activeSondeSerials.includes(sondeSerial);
+                        if (showMapBtn) {
+                            showMapBtn.style.display = isActive ? 'none' : 'inline-block';
+                            showMapBtn.disabled = false;
+                        }
+                    } else {
+                        // Unknown log type: hide all special buttons
+                        if (exportGpxBtn) exportGpxBtn.style.display = 'none';
+                        if (exportActivityBtn) exportActivityBtn.style.display = 'none';
+                        if (showMapBtn) showMapBtn.style.display = 'none';
+                    }
+                })
+                .catch(error => {
+                    console.error('Error loading logfile:', error);
+                    document.getElementById('logfileContent').textContent = 'Error loading file: ' + error;
+                });
+        }
+
+        function exportGpx() {
+            const content = document.getElementById('logfileContent').textContent;
+            const filename = document.getElementById('logfileTitle').textContent;
+            const trackName = filename.replace(/\.log$/, '');
+
+            // Parse trackpoints from log format:
+            // "Frame N - <timestamp>" then "  Position: lat, lon" then "  Altitude: X m"
+            const lines = content.split('\n');
+            const trackpoints = [];
+            let currentTime = null;
+            let currentLat = null;
+            let currentLon = null;
+            let currentAlt = null;
+
+            for (const line of lines) {
+                const frameMatch = line.match(/^Frame\s+\d+\s+-\s+(\S+)/);
+                if (frameMatch) {
+                    // Flush previous point
+                    if (currentLat !== null && currentLon !== null) {
+                        trackpoints.push({ lat: currentLat, lon: currentLon, alt: currentAlt, time: currentTime });
+                    }
+                    currentTime = frameMatch[1];
+                    currentLat = null;
+                    currentLon = null;
+                    currentAlt = null;
+                    continue;
+                }
+                const posMatch = line.match(/Position:\s*(-?[\d.]+),\s*(-?[\d.]+)/);
+                if (posMatch) {
+                    currentLat = parseFloat(posMatch[1]);
+                    currentLon = parseFloat(posMatch[2]);
+                    continue;
+                }
+                const altMatch = line.match(/Altitude:\s*(-?[\d.]+)\s*m/);
+                if (altMatch) {
+                    currentAlt = parseFloat(altMatch[1]);
+                }
+            }
+            // Flush last point
+            if (currentLat !== null && currentLon !== null) {
+                trackpoints.push({ lat: currentLat, lon: currentLon, alt: currentAlt, time: currentTime });
+            }
+
+            if (trackpoints.length === 0) {
+                alert('No position data found in this log file.');
+                return;
+            }
+
+            // Build GPX XML
+            const trkSegs = trackpoints.map(pt => {
+                const altTag = pt.alt !== null ? `\n        <ele>${pt.alt}</ele>` : '';
+                const timeTag = pt.time ? `\n        <time>${pt.time}</time>` : '';
+                return `      <trkpt lat="${pt.lat}" lon="${pt.lon}">${altTag}${timeTag}\n      </trkpt>`;
+            }).join('\n');
+
+            const gpx = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="OpenWXSDR" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk>
+    <name>${trackName}</name>
+    <trkseg>
+${trkSegs}
+    </trkseg>
+  </trk>
+</gpx>`;
+
+            const blob = new Blob([gpx], { type: 'application/gpx+xml' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = trackName + '.gpx';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+        
+        function showHistoricTrack() {
+            const content = document.getElementById('logfileContent').textContent;
+            const filename = document.getElementById('logfileTitle').textContent;
+            const trackName = filename.replace(/\.log$/, '');
+            const sondeSerial = filename.split('-')[0];
+            
+            // Parse trackpoints from log format (same as exportGpx)
+            const lines = content.split('\n');
+            const trackpoints = [];
+            let currentTime = null;
+            let currentLat = null;
+            let currentLon = null;
+            let currentAlt = null;
+            
+            for (const line of lines) {
+                const frameMatch = line.match(/^Frame\s+\d+\s+-\s+(\S+)/);
+                if (frameMatch) {
+                    // Flush previous point
+                    if (currentLat !== null && currentLon !== null) {
+                        trackpoints.push({ lat: currentLat, lon: currentLon, alt: currentAlt, time: currentTime });
+                    }
+                    currentTime = frameMatch[1];
+                    currentLat = null;
+                    currentLon = null;
+                    currentAlt = null;
+                    continue;
+                }
+                const posMatch = line.match(/Position:\s*(-?[\d.]+),\s*(-?[\d.]+)/);
+                if (posMatch) {
+                    currentLat = parseFloat(posMatch[1]);
+                    currentLon = parseFloat(posMatch[2]);
+                    continue;
+                }
+                const altMatch = line.match(/Altitude:\s*(-?[\d.]+)\s*m/);
+                if (altMatch) {
+                    currentAlt = parseFloat(altMatch[1]);
+                }
+            }
+            // Flush last point
+            if (currentLat !== null && currentLon !== null) {
+                trackpoints.push({ lat: currentLat, lon: currentLon, alt: currentAlt, time: currentTime });
+            }
+            
+            if (trackpoints.length === 0) {
+                alert('No position data found in this log file.');
+                return;
+            }
+            
+            // Remove any existing historic track
+            if (window.historicTrackLayer) {
+                map.removeLayer(window.historicTrackLayer);
+            }
+            if (window.historicMarker) {
+                map.removeLayer(window.historicMarker);
+            }
+            if (window.historicLaunchMarker) {
+                map.removeLayer(window.historicLaunchMarker);
+            }
+            
+            // Create polyline for the track
+            const latLngs = trackpoints.map(pt => [pt.lat, pt.lon]);
+            const polyline = L.polyline(latLngs, {
+                color: '#FF6A00',
+                weight: 3,
+                opacity: 0.8
+            }).addTo(map);
+            
+            // Create launch marker at the first position
+            const firstPoint = trackpoints[0];
+            const launchMarker = L.marker([firstPoint.lat, firstPoint.lon], {
+                icon: L.icon({
+                    iconUrl: '/static/img/launch-marker-cyan.png',
+                    iconSize: [21, 21],
+                    iconAnchor: [11, 11],
+                    popupAnchor: [0, -11]
+                })
+            }).addTo(map);
+            
+            launchMarker.bindPopup(`
+                <strong>Launch Site</strong><br>
+                ${sondeSerial}<br>
+                <small>
+                ${firstPoint.lat.toFixed(5)}, ${firstPoint.lon.toFixed(5)}<br>
+                Altitude: ${firstPoint.alt ? firstPoint.alt.toFixed(0) + ' m' : 'N/A'}<br>
+                Time: ${firstPoint.time || 'N/A'}
+                </small>
+            `);
+            
+            // Create marker at the last known position
+            const lastPoint = trackpoints[trackpoints.length - 1];
+            const marker = L.marker([lastPoint.lat, lastPoint.lon], {
+                icon: L.icon({
+                    iconUrl: '/static/img/target-red.png',
+                    iconSize: [21, 21],
+                    iconAnchor: [11, 11],
+                    popupAnchor: [0, -11]
+                })
+            }).addTo(map);
+            
+            marker.bindPopup(`
+                <strong>Historic Track: ${sondeSerial}</strong><br>
+                Last Position: ${lastPoint.lat.toFixed(5)}, ${lastPoint.lon.toFixed(5)}<br>
+                Altitude: ${lastPoint.alt ? lastPoint.alt.toFixed(0) + ' m' : 'N/A'}<br>
+                Time: ${lastPoint.time || 'N/A'}<br>
+                <em>Track from log file</em>
+            `);
+            
+            // Store references for cleanup
+            window.historicTrackLayer = polyline;
+            window.historicLaunchMarker = launchMarker;
+            window.historicMarker = marker;
+            
+            // Fit map to track bounds
+            map.fitBounds(polyline.getBounds(), { padding: [50, 50] });
+            
+            // Close the logfiles modal
+            const modal = bootstrap.Modal.getInstance(document.getElementById('logfilesModal'));
+            if (modal) modal.hide();
+            
+            // Show info message
+            setTimeout(() => {
+                alert(`Historic track for ${sondeSerial} displayed on map (${trackpoints.length} points)`);
+            }, 300);
+        }
+    </script>
+    
+    <!-- Enter Frequency Modal -->
+    <div class="modal fade" id="enterFrequencyModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-broadcast"></i> Enter Frequency</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label for="manualFrequency" class="form-label">Frequency (MHz)</label>
+                        <input type="number" class="form-control" id="manualFrequency" placeholder="403.230" step="0.001" min="400" max="406">
+                    </div>
+                    <div class="mb-3">
+                        <label for="manualSondeType" class="form-label">Sonde Type</label>
+                        <select class="form-select" id="manualSondeType">
+                            <option value="RS41">RS41 (Vaisala)</option>
+                            <option value="RS92">RS92 (Vaisala)</option>
+                            <option value="DFM">DFM (Graw)</option>
+                            <option value="M10">M10 (Meteomodem)</option>
+                            <option value="M20">M20 (Meteomodem)</option>
+                            <option value="iMet">iMet (InterMet)</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label for="manualDeviceSerial" class="form-label">RTL-SDR Device</label>
+                        <select class="form-select" id="manualDeviceSerial">
+                            <option value="auto">Auto (first available)</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label for="decoderDuration" class="form-label">Duration (minutes)</label>
+                        <input type="number" class="form-control" id="decoderDuration" placeholder="0 = infinite" step="1" min="0" max="1440" value="0">
+                        <div class="form-text">0 = keep decoding indefinitely; 1-1440 = auto-return to scanning after time elapses</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" onclick="startManualDecoder()">Start Decoder</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Start Scanning Modal -->
+    <div class="modal fade" id="scanningModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-radar"></i> Start Scanning</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="text-muted small mb-3">Each RTL-SDR device scans its configured frequency range independently. Press <strong>Start Scan</strong> on any idle device to begin scanning.</p>
+                    <div id="scanningDeviceList">
+                        <div class="text-center text-muted py-3"><i class="bi bi-hourglass-split"></i> Loading devices…</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-outline-secondary btn-sm" onclick="showScanningModal()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Decoder Settings Modal -->
+    <div class="modal fade" id="decoderSettingsModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-sliders"></i> Decoder Settings</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label for="sdrType" class="form-label">SDR Type</label>
+                        <select class="form-select" id="sdrType">
+                            <option value="rtlsdr">RTL-SDR (Built-in)</option>
+                            <option value="flux242">Flux242 (Multi-sonde)</option>
+                            <option value="ka9q">KA9Q Radio</option>
+                            <option value="airspy" id="airspyOption" style="display:none">Airspy Mini / Airspy 2</option>
+                        </select>
+                        <div class="form-text">Changing this will restart the OpenWXSDR service</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" onclick="saveDecoderSettings()">Save & Restart</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- About Modal -->
+    <div class="modal fade" id="aboutModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-info-circle"></i> &Uuml;ber OpenWXSDR</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <h6 class="mb-3">Systeminformationen</h6>
+                    <table class="table table-bordered table-sm mb-4">
+                        <tbody>
+                            <tr><th style="width:35%">Anwendung</th><td>OpenWX.de Radiosonden-Tracking-System (SDR Gateway)</td></tr>
+                            <tr><th>Version</th><td>V{{ version }} (Release)</td></tr>
+                            <tr><th>Station</th><td>{{ callsign }}</td></tr>
+                            <tr><th>Build-Datum</th><td>2026-05-06</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h6 class="mb-2">Beschreibung</h6>
+                    <p class="small">OpenWXSDR ist ein Echtzeit-Radiosonden-Empfangs- und Dekodiersystem f&uuml;r Amateurfunk-Enthusiasten. Das System empf&auml;ngt Radiosondensignale &uuml;ber RTL-SDR-Hardware und dekodiert die Telemetriedaten in Echtzeit.</p>
+
+                    <h6 class="mb-2">Hauptmerkmale</h6>
+                    <ul class="small">
+                        <li><i class="bi bi-geo-alt text-primary"></i> Echtzeit-Radiosonden-Tracking mit Live-Kartenanzeige</li>
+                        <li><i class="bi bi-broadcast text-primary"></i> Unterst&uuml;tzung mehrerer RTL-SDR-Ger&auml;te gleichzeitig</li>
+                        <li><i class="bi bi-wifi text-primary"></i> MQTT- und HTTP-Upload zu OpenWX.de</li>
+                        <li><i class="bi bi-reception-4 text-primary"></i> Automatische Frequenzsuche und Sondenerkennung</li>
+                        <li><i class="bi bi-file-earmark-code text-primary"></i> RS41, RS92, DFM, M10, M20 und weitere Sondentypen</li>
+                    </ul>
+
+                    <h6 class="mb-2">Copyright &amp; Lizenz</h6>
+                    <p class="small"><strong>Copyright &copy; 2025-2026 by DL2MF</strong><br>
+                    Diese Software wird unter der GNU General Public License v2.0 oder sp&auml;ter vertrieben.</p>
+
+                    <h6 class="mb-2">Kontakt &amp; Support</h6>
+                    <p class="small mb-0">
+                        <i class="bi bi-envelope"></i> E-Mail: <a href="mailto:dl2mf@darc.de">dl2mf@darc.de</a><br>
+                        <i class="bi bi-globe"></i> Website: <a href="https://openwx.de" target="_blank">openwx.de</a>
+                    </p>
+
+                    <div class="alert alert-danger border-0 mt-3 mb-0 py-2 small text-center" style="background: rgba(220,53,69,0.08);">
+                        <i class="bi bi-heart-fill text-danger"></i> Mit Liebe f&uuml;r die Amateurfunk-Community erstellt
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Schlie&szlig;en</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Logfiles Modal -->
+    <div class="modal fade" id="logfilesModal" tabindex="-1">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-file-text"></i> Logfiles</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="row">
+                        <div class="col-md-5">
+                            <h6>Available Logs</h6>
+                            <div style="max-height: 500px; overflow-y: auto;">
+                                <table class="table table-sm table-hover" id="logfileTable" style="font-size: 13px;">
+                                    <thead style="position: sticky; top: 0; background: white; z-index: 10;">
+                                        <tr>
+                                            <th style="cursor: pointer;" onclick="sortLogfiles('name')">
+                                                Filename <i class="bi bi-arrow-down-up" id="sortIconName"></i>
+                                            </th>
+                                            <th style="cursor: pointer;" onclick="sortLogfiles('type')">
+                                                Type <i class="bi bi-arrow-down-up" id="sortIconType"></i>
+                                            </th>
+                                            <th style="cursor: pointer;" onclick="sortLogfiles('date')">
+                                                Date & Time <i class="bi bi-arrow-down-up" id="sortIconDate"></i>
+                                            </th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="logfileList">
+                                        <tr><td colspan="3" class="text-center">Loading...</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="col-md-7">
+                            <div class="d-flex align-items-center justify-content-between mb-1">
+                                <h6 id="logfileTitle" class="mb-0">Select a log file</h6>
+                                <div class="btn-group btn-group-sm">
+                                    <button id="exportGpxBtn" class="btn btn-outline-success" onclick="exportGpx()" disabled style="display: none;">
+                                        <i class="bi bi-download"></i> Export GPX
+                                    </button>
+                                    <button id="showMapBtn" class="btn btn-outline-info" onclick="showHistoricTrack()" disabled style="display: none;">
+                                        <i class="bi bi-map"></i> Show on Map
+                                    </button>
+                                    <button id="exportActivityBtn" class="btn btn-outline-primary" onclick="exportActionLog()" style="display: none;">
+                                        <i class="bi bi-file-earmark-arrow-down"></i> Export Activity Log
+                                    </button>
+                                </div>
+                            </div>
+                            <pre id="logfileContent" style="max-height: 400px; overflow-y: auto; background: #f8f9fa; padding: 10px; border-radius: 4px; font-size: 12px;">No file selected</pre>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <!-- Configuration Modal -->
+    <div class="modal fade" id="configurationModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-gear-wide-connected"></i> Configuration</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body p-0">
+                    <!-- Nav tabs -->
+                    <ul class="nav nav-tabs px-3 pt-3" id="configTabs" role="tablist">
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link active" id="tab-general-btn" data-bs-toggle="tab" data-bs-target="#tab-general" type="button" role="tab">
+                                <i class="bi bi-sliders"></i> General
+                            </button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="tab-station-btn" data-bs-toggle="tab" data-bs-target="#tab-station" type="button" role="tab">
+                                <i class="bi bi-broadcast-pin"></i> Station
+                            </button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="tab-rtlsdr-btn" data-bs-toggle="tab" data-bs-target="#tab-rtlsdr" type="button" role="tab">
+                                <i class="bi bi-usb-plug"></i> RTL-SDR
+                            </button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="tab-airspy-btn" data-bs-toggle="tab" data-bs-target="#tab-airspy" type="button" role="tab">
+                                <i class="bi bi-router"></i> Airspy
+                            </button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="tab-mqtt-btn" data-bs-toggle="tab" data-bs-target="#tab-mqtt" type="button" role="tab">
+                                <i class="bi bi-cloud-upload"></i> MQTT
+                            </button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="tab-sondehub-btn" data-bs-toggle="tab" data-bs-target="#tab-sondehub" type="button" role="tab">
+                                <i class="bi bi-globe"></i> SondeHub
+                            </button>
+                        </li>
+                    </ul>
+
+                    <div class="tab-content p-3" id="configTabContent">
+
+                        <!-- ── Station tab ── -->
+                        <div class="tab-pane fade" id="tab-station" role="tabpanel">
+                            <div class="row g-3 mt-1">
+                                <div class="col-md-6">
+                                    <label for="stationCallsign" class="form-label fw-semibold">Callsign</label>
+                                    <input type="text" class="form-control" id="stationCallsign" placeholder="DL2MF-14">
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="stationSdrType" class="form-label fw-semibold">SDR Type</label>
+                                    <select class="form-select" id="stationSdrType">
+                                        <option value="airspy">Airspy</option>
+                                        <option value="rtlsdr">RTLSDR</option>
+                                        <option value="ka9q">KA9Q</option>
+                                        <option value="flux242">flux242</option>
+                                    </select>
+                                </div>
+                                <div class="col-md-6">
+                                    <div class="form-check form-switch config-upload-toggle mt-4">
+                                        <input class="form-check-input" type="checkbox" role="switch" id="stationUploadPosition">
+                                        <label class="form-check-label fw-semibold" for="stationUploadPosition">Upload Position</label>
+                                    </div>
+                                </div>
+                                <div class="col-md-6">
+                                    <div class="form-check form-switch config-upload-toggle mt-4">
+                                        <input class="form-check-input" type="checkbox" role="switch" id="stationUseDftDetect">
+                                        <label class="form-check-label fw-semibold" for="stationUseDftDetect">Use DFT Detect</label>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <hr class="my-3">
+                            <h6 class="fw-semibold mb-3">Receivers</h6>
+                            <div class="row g-3">
+                                <div class="col-md-3">
+                                    <label for="stationMaxConcurrent" class="form-label">Max Concurrent</label>
+                                    <input type="number" class="form-control" id="stationMaxConcurrent" min="1" max="8" step="1">
+                                </div>
+                                <div class="col-md-3">
+                                    <label for="stationScanInterval" class="form-label">Scan Interval (s)</label>
+                                    <input type="number" class="form-control" id="stationScanInterval" min="1" max="300" step="1">
+                                </div>
+                                <div class="col-md-3">
+                                    <label for="stationBandwidth" class="form-label">Bandwidth (Hz)</label>
+                                    <input type="number" class="form-control" id="stationBandwidth" min="1000" max="50000" step="100">
+                                </div>
+                                <div class="col-md-3">
+                                    <label for="stationMinSignal" class="form-label">Min Signal Strength</label>
+                                    <input type="number" class="form-control" id="stationMinSignal" min="-100" max="50" step="1">
+                                </div>
+                            </div>
+
+                            <div class="alert alert-warning small py-2 mt-3 mb-0">
+                                <i class="bi bi-exclamation-triangle"></i>
+                                Changes are written to config.yaml and require a <strong>service restart</strong> to take effect.
+                            </div>
+                            <div class="d-flex justify-content-end mt-3">
+                                <button type="button" class="btn btn-warning text-dark" onclick="saveStationConfig()">
+                                    <i class="bi bi-save"></i> Save (&amp; Restart)
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- ── General tab ── -->
+                        <div class="tab-pane fade  show active" id="tab-general" role="tabpanel">
+                            <div class="row g-3 mt-2">
+                                <div class="col-md-6">
+                                    <div class="mb-2">
+                                        <div class="form-check form-switch config-upload-toggle">
+                                            <input class="form-check-input" type="checkbox" role="switch" id="debugModeToggle">
+                                            <label class="form-check-label fw-semibold" for="debugModeToggle">Debug Mode</label>
+                                            <span class="badge bg-secondary" id="debugModeLabel">Off</span>
+                                        </div>
+                                    </div>
+                                    <div class="form-text small">Enable to show debug messages based on the level selected.</div>
+                                </div>
+                                <div class="col-md-6">
+                                    <label class="form-label fw-semibold">Debug Level</label>
+                                    <select class="form-select" id="debugLevelSelect">
+                                        <option value="basic">Basic - UI actions and mode changes only</option>
+                                        <option value="info">Info - Include decoder events</option>
+                                        <option value="verbose">Verbose - Full debug output</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="form-text small mt-1">Controls console and log verbosity. Basic mode logs UI actions, scan/decode state changes. Info adds decoder startup/stop. Verbose adds all scanner details.</div>
+                            <hr>
+                            <div class="mb-3">
+                                <label for="snrThresholdInput" class="form-label fw-semibold">
+                                    SNR Threshold &nbsp;<span class="badge bg-secondary" id="snrThresholdBadge">10 dB</span>
+                                </label>
+                                <input type="number" class="form-control" id="snrThresholdInput"
+                                       min="3" max="30" step="0.5" value="10">
+                                <div class="form-text">Minimum SNR (dB above noise floor) for signal detection. Lower = more sensitive but more false positives. Typical: 8–12 dB.</div>
+                            </div>
+                            <hr>
+                            <div class="mb-3">
+                                <label for="scanIntervalInput" class="form-label fw-semibold">
+                                    Scan Interval &nbsp;<span class="badge bg-secondary" id="scanIntervalBadge">15 s</span>
+                                </label>
+                                <input type="number" class="form-control" id="scanIntervalInput"
+                                       min="5" max="300" step="1" value="15">
+                                <div class="form-text">Seconds to wait between spectrum scans when no signal is found.</div>
+                            </div>
+                            <hr>
+                            <div class="mb-3">
+                                <label for="fixedChannelScantimeInput" class="form-label fw-semibold">
+                                    Fixed Channel Scantime &nbsp;<span class="badge bg-secondary" id="fixedChannelScantimeBadge">60 s</span>
+                                </label>
+                                <input type="number" class="form-control" id="fixedChannelScantimeInput"
+                                       min="15" max="600" step="5" value="60">
+                                <div class="form-text">Seconds each Fixed Channel decodes before cycling to the next frequency (RX Scan cycling). Recommended: 60-120s for USB hub stability.</div>
+                            </div>
+                            <hr>
+                            <div class="mb-3">
+                                <label class="form-label fw-semibold">External Link Provider</label>
+                                <select class="form-select" id="externalUrlProvider">
+                                    <option value="openwx">OpenWX - https://map.openwx.de</option>
+                                    <option value="sondehub">SondeHub - https://sondehub.org</option>
+                                    <option value="custom">User Defined (from config.yaml)</option>
+                                </select>
+                                <div class="form-text">Select which external site to open when clicking the link icon on active radiosondes.</div>
+                            </div>
+                            <div class="alert alert-info small py-2 mb-0">
+                                <i class="bi bi-info-circle"></i>
+                                Changes are applied immediately without restarting the service. They are <strong>not</strong> written to config.yaml.
+                            </div>
+                        </div>
+
+                        <!-- ── RTL-SDR tab ── -->
+                        <div class="tab-pane fade" id="tab-rtlsdr" role="tabpanel">
+                            <div class="mt-2 mb-3">
+                                <label for="rtlsdrDeviceSelect" class="form-label fw-semibold">Device</label>
+                                <select class="form-select" id="rtlsdrDeviceSelect" onchange="onRtlsdrDeviceChange()">
+                                    <option value="">Loading…</option>
+                                </select>
+                                <div class="form-text">Select one of the configured RTL-SDR devices to edit.</div>
+                            </div>
+                            <div id="rtlsdrDeviceFields">
+                                <div class="row g-3">
+                                    <div class="col-md-6">
+                                        <label for="rtlCenterFreq" class="form-label">Center Frequency (MHz)</label>
+                                        <input type="text" class="form-control" id="rtlCenterFreq" inputmode="decimal" placeholder="405.000">
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label for="rtlSampleRate" class="form-label">Sample Rate (Hz)</label>
+                                        <input type="number" class="form-control" id="rtlSampleRate" step="100000" min="250000" max="3200000">
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label for="rtlGain" class="form-label">Gain (0 = auto)</label>
+                                        <input type="number" class="form-control" id="rtlGain" step="1" min="0" max="50">
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label for="rtlPpm" class="form-label">PPM Correction</label>
+                                        <input type="number" class="form-control" id="rtlPpm" step="1" min="-100" max="100">
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="alert alert-warning small py-2 mt-3 mb-0">
+                                <i class="bi bi-exclamation-triangle"></i>
+                                Changes are written to config.yaml and require a <strong>service restart</strong> to take effect.
+                            </div>
+                            <div class="d-flex justify-content-end mt-3">
+                                <button type="button" class="btn btn-warning text-dark" onclick="saveRtlsdrConfig()">
+                                    <i class="bi bi-save"></i> Save (&amp; Restart)
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- ── Airspy tab ── -->
+                        <div class="tab-pane fade" id="tab-airspy" role="tabpanel">
+                            <div class="row g-3 mt-1">
+                                <div class="col-md-6">
+                                    <label for="airspyCenterFreq" class="form-label fw-semibold">Center Frequency (MHz)</label>
+                                    <input type="text" class="form-control" id="airspyCenterFreq" inputmode="decimal" placeholder="405.000">
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="airspySampleRate" class="form-label fw-semibold">Sample Rate (Hz)</label>
+                                    <select class="form-select" id="airspySampleRate">
+                                        <option value="3000000">3,000,000 (Airspy Mini)</option>
+                                        <option value="6000000">6,000,000 (Airspy Mini)</option>
+                                        <option value="2500000">2,500,000 (Airspy R2)</option>
+                                        <option value="10000000">10,000,000 (Airspy R2)</option>
+                                    </select>
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="airspyDecodeMode" class="form-label fw-semibold">Decode Mode</label>
+                                    <select class="form-select" id="airspyDecodeMode">
+                                        <option value="legacy">legacy (airspy_rx → sox)</option>
+                                        <option value="channelizer">channelizer (experimental)</option>
+                                    </select>
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="airspyGain" class="form-label fw-semibold">Decode Gain (0–14)</label>
+                                    <input type="number" class="form-control" id="airspyGain" step="1" min="0" max="14">
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="airspyScanGain" class="form-label fw-semibold">Scan Gain (0–14)</label>
+                                    <input type="number" class="form-control" id="airspyScanGain" step="1" min="0" max="14">
+                                </div>
+                            </div>
+                            <div class="alert alert-warning small py-2 mt-3 mb-0">
+                                <i class="bi bi-exclamation-triangle"></i>
+                                Changes are written to config.yaml and require a <strong>service restart</strong> to take effect.
+                            </div>
+                            <div class="d-flex justify-content-end mt-3">
+                                <button type="button" class="btn btn-warning text-dark" onclick="saveAirspyConfig()">
+                                    <i class="bi bi-save"></i> Save (&amp; Restart)
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- ── MQTT tab ── -->
+                        <div class="tab-pane fade" id="tab-mqtt" role="tabpanel">
+                            <div class="mt-2 mb-3">
+                                <div class="form-check form-switch config-upload-toggle">
+                                    <input class="form-check-input" type="checkbox" role="switch" id="mqttEnabled">
+                                    <label class="form-check-label fw-semibold" for="mqttEnabled">MQTT Upload Enabled</label>
+                                </div>
+                            </div>
+                            <div class="row g-3">
+                                <div class="col-md-8">
+                                    <label for="mqttServer" class="form-label">Server (hostname / IP)</label>
+                                    <input type="text" class="form-control" id="mqttServer" placeholder="82.165.59.144">
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="mqttPort" class="form-label">Port</label>
+                                    <input type="number" class="form-control" id="mqttPort" min="1" max="65535" step="1" placeholder="1883">
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="mqttUsername" class="form-label">Username</label>
+                                    <input type="text" class="form-control" id="mqttUsername" autocomplete="off">
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="mqttPassword" class="form-label">Password</label>
+                                    <input type="password" class="form-control" id="mqttPassword" autocomplete="new-password">
+                                </div>
+                            </div>
+                            <div class="alert alert-warning small py-2 mt-3 mb-0">
+                                <i class="bi bi-exclamation-triangle"></i>
+                                Changes are written to config.yaml and require a <strong>service restart</strong> to take effect.
+                            </div>
+                            <div class="d-flex justify-content-end mt-3">
+                                <button type="button" class="btn btn-warning text-dark" onclick="saveMqttConfig()">
+                                    <i class="bi bi-save"></i> Save (&amp; Restart)
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- ── SondeHub tab ── -->
+                        <div class="tab-pane fade" id="tab-sondehub" role="tabpanel">
+                            <div class="mt-2 mb-3">
+                                <div class="form-check form-switch config-upload-toggle">
+                                    <input class="form-check-input" type="checkbox" role="switch" id="sondehubEnabled">
+                                    <label class="form-check-label fw-semibold" for="sondehubEnabled">SondeHub Upload Enabled</label>
+                                </div>
+                            </div>
+                            <div class="mt-2 mb-3">
+                                <div class="form-check form-switch config-upload-toggle">
+                                    <input class="form-check-input" type="checkbox" role="switch" id="sondehubQueueMode">
+                                    <label class="form-check-label fw-semibold" for="sondehubQueueMode">Queue upload mode</label>
+                                </div>
+                                <div class="form-text">Batch uploads multiple telemetry frames per request for more robust transfer and on unstable links.</div>
+                            </div>
+                            <div class="row g-3">
+                                <div class="col-12">
+                                    <label for="sondehubUrl" class="form-label">Upload URL</label>
+                                    <input type="text" class="form-control" id="sondehubUrl" placeholder="https://api.v2.sondehub.org/sondes/telemetry">
+                                </div>
+                                <div class="col-md-8">
+                                    <label for="sondehubStationId" class="form-label">Station ID</label>
+                                    <input type="text" class="form-control" id="sondehubStationId">
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="sondehubRate" class="form-label">Upload Rate (s)</label>
+                                    <input type="number" class="form-control" id="sondehubRate" min="1" max="3600" step="1">
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="sondehubQueueBatchMax" class="form-label">Queue Batch Max (optional)</label>
+                                    <input type="number" class="form-control" id="sondehubQueueBatchMax" min="1" max="2000" step="1" placeholder="200">
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="sondehubQueueMaxSize" class="form-label">Queue Max Size (optional)</label>
+                                    <input type="number" class="form-control" id="sondehubQueueMaxSize" min="100" max="20000" step="100" placeholder="2000">
+                                </div>
+                            </div>
+                            <div class="alert alert-warning small py-2 mt-3 mb-0">
+                                <i class="bi bi-exclamation-triangle"></i>
+                                Changes are written to config.yaml and require a <strong>service restart</strong> to take effect.
+                            </div>
+                            <div class="d-flex justify-content-end mt-3">
+                                <button type="button" class="btn btn-warning text-dark" onclick="saveSondehubConfig()">
+                                    <i class="bi bi-save"></i> Save (&amp; Restart)
+                                </button>
+                            </div>
+                        </div>
+
+                    </div><!-- /tab-content -->
+                </div><!-- /modal-body -->
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-primary" onclick="saveGeneralConfig()">Apply</button>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Fixed Channels Modal -->
+    <div class="modal fade" id="fixedChannelsModal" tabindex="-1">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-list-check"></i> Fixed Channels</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="table-responsive">
+                        <table class="table table-sm table-hover align-middle mb-0" style="font-size: 13px;">
+                            <thead>
+                                <tr class="table-secondary">
+                                    <th style="width: 60px;">#</th>
+                                    <th style="width: 80px;">Enable</th>
+                                    <th style="width: 120px;">Frequency (MHz)</th>
+                                    <th style="width: 110px;">Sonde Type</th>
+                                    <th style="width: 100px;">RX Scan</th>
+                                    <th style="width: 200px;">Receiver Device</th>
+                                    <th>Receiver Band (MHz)</th>
+                                </tr>
+                            </thead>
+                            <tbody id="fixedChannelsRows">
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="alert alert-info small py-2 mt-3 mb-0">
+                        <i class="bi bi-info-circle"></i>
+                        <strong>Enable:</strong> Start decoding instantly on this channel. 
+                        <strong>RX Scan:</strong> Cycle through enabled scan channels (15s each).
+                        Frequencies must fit within the selected receiver bandwidth.
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-warning text-dark" onclick="saveFixedChannels()">
+                        <i class="bi bi-save"></i> Save &amp; Restart
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Service Status Modal -->
+    <div class="modal fade" id="serviceStatusModal" tabindex="-1">
+        <div class="modal-dialog" style="max-width: min(95vw, 700px);">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-hdd-network"></i> Service Status</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <table class="table table-sm align-middle mb-3">
+                        <tbody>
+                            <tr>
+                                <th class="text-muted" style="width: 32%;">Hardware</th>
+                                <td>
+                                    <strong id="serviceHardware">-</strong>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th class="text-muted">Hostname / IP</th>
+                                <td><span id="serviceHostnameIp">-</span></td>
+                            </tr>
+                            <tr>
+                                <th class="text-muted" style="width: 32%;">Service</th>
+                                <td><strong id="serviceUnit">openwxsdr.service</strong></td>
+                            </tr>
+                            <tr>
+                                <th class="text-muted">Loaded</th>
+                                <td><span id="serviceLoaded">-</span></td>
+                            </tr>
+                            <tr>
+                                <th class="text-muted">Active</th>
+                                <td class="d-flex align-items-center gap-2">
+                                    <span class="status-indicator" id="serviceActiveDot"></span>
+                                    <span id="serviceActive">-</span>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th class="text-muted">Main PID</th>
+                                <td><span id="serviceMainPid">-</span></td>
+                            </tr>
+                            <tr>
+                                <th class="text-muted">Tasks</th>
+                                <td><span id="serviceTasks">-</span></td>
+                            </tr>
+                            <tr>
+                                <th class="text-muted">CPU</th>
+                                <td><span id="serviceCpu">-</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="modal-footer d-flex justify-content-between">
+                    <div class="d-flex gap-2">
+                        <button type="button" class="btn btn-danger" onclick="confirmServiceAction('stop')">Stop</button>
+                        <button type="button" class="btn btn-warning text-dark" onclick="confirmServiceAction('restart')">Restart</button>
+                    </div>
+                    <div class="d-flex gap-2">
+                        <button type="button" class="btn btn-outline-info" onclick="showServiceConsoleModal()"><i class="bi bi-terminal"></i> Console</button>
+                        <button type="button" class="btn btn-outline-secondary" onclick="refreshServiceStatus()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Service Console Modal -->
+    <div class="modal fade" id="serviceConsoleModal" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable" style="max-width: min(95vw, 980px);">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-terminal"></i> Service Console</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <pre id="serviceConsoleText" style="min-height: 320px; max-height: 65vh; overflow:auto; background:#0b1020; color:#d7e3ff; border:1px solid #27314a; padding:12px; border-radius:6px; font-size:12px; line-height:1.45; margin-bottom:0;">Loading...</pre>
+                </div>
+                <div class="modal-footer justify-content-between">
+                    <div class="text-muted small" id="serviceConsoleMeta">-</div>
+                    <button type="button" class="btn btn-outline-secondary" onclick="refreshServiceConsole()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Service Confirmation Modal -->
+    <div class="modal fade" id="serviceConfirmModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-exclamation-triangle"></i> Confirmation</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p id="serviceConfirmText" class="mb-0">-</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-danger" id="serviceConfirmYesBtn">Yes, I want to stop/restart the service now</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Spectrum Modal -->
+    <div class="modal fade" id="spectrumModal" tabindex="-1">
+        <div class="modal-dialog" style="max-width: min(95vw, 1368px); height: 90vh;">
+            <div class="modal-content" style="height: 100%;">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="spectrumModalTitle"><i class="bi bi-bar-chart-line"></i> Spectrum scan</h5>
+                    <div class="d-flex align-items-center gap-3 ms-auto me-3">
+                        <label for="spectrumReceiverSelect" class="form-label mb-0 text-muted small">Receiver</label>
+                        <select id="spectrumReceiverSelect" class="form-select form-select-sm" style="min-width: 240px;"
+                                onchange="onSpectrumReceiverChanged()">
+                            <option value="">Loading...</option>
+                        </select>
+                    </div>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" style="background:#111; padding:12px; display: flex; flex-direction: column; overflow: hidden;">
+                    <!-- Spectrum Chart (Top) -->
+                    <div id="spectrumChartContainer" style="position:relative; flex: 0 0 40%; min-height: 200px;">
+                        <canvas id="spectrumChart"></canvas>
+                    </div>
+                    <!-- Waterfall Display (Bottom) -->
+                    <div id="waterfallContainer" style="position:relative; flex: 1; min-height: 150px; margin-top: 12px; display: flex;">
+                        <canvas id="waterfallCanvas" style="width: 100%; height: 100%; image-rendering: crisp-edges;"></canvas>
+                    </div>
+                    <!-- Footer Info -->
+                    <div class="d-flex justify-content-between align-items-center mt-2" style="flex: 0 0 auto;">
+                        <small class="spectrum-meta" id="spectrumTimestamp">-</small>
+                        <div class="d-flex gap-2 spectrum-meta">
+                            <small>Noise floor: <span id="spectrumNoiseFloor">-</span></small>
+                            <small>| Threshold: <span id="spectrumThreshold">-</span></small>
+                        </div>
+                        <button class="btn btn-sm btn-outline-secondary" onclick="refreshSpectrum()">
+                            <i class="bi bi-arrow-clockwise"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+                <div class="modal-footer d-flex justify-content-between">
+                    <div class="form-check form-switch mb-0">
+                        <input class="form-check-input" type="checkbox" id="waterfallToggle" checked onchange="toggleWaterfall()">
+                        <label class="form-check-label text-muted" for="waterfallToggle">Show waterfall</label>
+                    </div>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ---- Configuration modal ----
+        let _cfgSections = null;   // cached config sections from API
+        let _rtlsdrDevices = [];   // cached RTL-SDR device list
+        let _receiverBands = [];   // receiver bands for fixed-channel validation
+        let _fixedChannels = [];   // cached fixed channels from backend
+
+        function formatFreqMHz(value, fallback = 0) {
+            const n = Number(value);
+            if (!Number.isFinite(n)) return Number(fallback).toFixed(3);
+            return n.toFixed(3);
+        }
+
+        function attachFreqFormatters() {
+            const ids = ['rtlCenterFreq', 'airspyCenterFreq'];
+            ids.forEach((id) => {
+                const el = document.getElementById(id);
+                if (!el || el.dataset.freqFormatBound === '1') return;
+                el.addEventListener('blur', () => {
+                    el.value = formatFreqMHz(el.value, el.value || 0);
+                });
+                el.dataset.freqFormatBound = '1';
+            });
+        }
+
+        async function showConfigurationModal() {
+            // Reset to General tab
+            const generalTabBtn = document.getElementById('tab-general-btn');
+            if (generalTabBtn) bootstrap.Tab.getOrCreateInstance(generalTabBtn).show();
+
+            // Load runtime config (General tab)
+            try {
+                const r = await fetch('/api/runtime_config');
+                const cfg = await r.json();
+                const toggle = document.getElementById('debugModeToggle');
+                toggle.checked = !!cfg.debug_mode;
+                document.getElementById('debugModeLabel').textContent = cfg.debug_mode ? 'On' : 'Off';
+                const debugLevelSelect = document.getElementById('debugLevelSelect');
+                debugLevelSelect.value = cfg.debug_level || 'basic';
+                const snr = cfg.snr_threshold ?? 10;
+                document.getElementById('snrThresholdInput').value = snr;
+                document.getElementById('snrThresholdBadge').textContent = snr + ' dB';
+                const si = cfg.scan_interval ?? 15;
+                document.getElementById('scanIntervalInput').value = si;
+                document.getElementById('scanIntervalBadge').textContent = si + ' s';
+                const fcs = cfg.fixed_channel_scantime ?? 60;
+                document.getElementById('fixedChannelScantimeInput').value = fcs;
+                document.getElementById('fixedChannelScantimeBadge').textContent = fcs + ' s';
+                externalUrlProvider = cfg.external_url_provider || 'openwx';
+                externalUrlCustom = cfg.external_url_custom || '';
+                document.getElementById('externalUrlProvider').value = externalUrlProvider;
+            } catch(e) { console.error(e); }
+
+            // Live update labels (General tab)
+            document.getElementById('debugModeToggle').oninput = function() {
+                document.getElementById('debugModeLabel').textContent = this.checked ? 'On' : 'Off';
+            };
+            document.getElementById('snrThresholdInput').oninput = function() {
+                document.getElementById('snrThresholdBadge').textContent = this.value + ' dB';
+            };
+            document.getElementById('scanIntervalInput').oninput = function() {
+                document.getElementById('scanIntervalBadge').textContent = this.value + ' s';
+            };
+            document.getElementById('fixedChannelScantimeInput').oninput = function() {
+                document.getElementById('fixedChannelScantimeBadge').textContent = this.value + ' s';
+            };
+
+            // Load config sections (RTL-SDR, Airspy, MQTT, SondeHub tabs)
+            try {
+                const r = await fetch('/api/config_sections');
+                _cfgSections = await r.json();
+
+                // RTL-SDR
+                _rtlsdrDevices = _cfgSections.rtlsdr_devices || [];
+                _receiverBands = _cfgSections.available_receiver_bands || [];
+                _fixedChannels = _cfgSections.fixed_channels || [];
+                const sel = document.getElementById('rtlsdrDeviceSelect');
+                sel.innerHTML = _rtlsdrDevices.length === 0
+                    ? '<option value="">No RTL-SDR devices configured</option>'
+                    : _rtlsdrDevices.map((d, i) =>
+                        `<option value="${i}">${d.serial || 'Device ' + (i+1)}</option>`
+                      ).join('');
+                onRtlsdrDeviceChange();
+
+                // Airspy
+                const a = _cfgSections.airspy || {};
+                document.getElementById('airspyCenterFreq').value = formatFreqMHz(a.center_freq_mhz, 404.0);
+                document.getElementById('airspySampleRate').value = String(a.sample_rate ?? 6000000);
+                document.getElementById('airspyDecodeMode').value = a.decode_mode ?? 'legacy';
+                document.getElementById('airspyGain').value = a.gain ?? 14;
+                document.getElementById('airspyScanGain').value = a.scan_gain ?? 12;
+
+                // MQTT
+                const m = _cfgSections.mqtt || {};
+                document.getElementById('mqttEnabled').checked = !!m.enabled;
+                document.getElementById('mqttServer').value = m.server ?? '';
+                document.getElementById('mqttPort').value = m.port ?? 1883;
+                document.getElementById('mqttUsername').value = m.username ?? '';
+                document.getElementById('mqttPassword').value = m.password ?? '';
+
+                // SondeHub
+                const s = _cfgSections.sondehub || {};
+                document.getElementById('sondehubEnabled').checked = !!s.enabled;
+                document.getElementById('sondehubQueueMode').checked = !!s.queue_mode;
+                document.getElementById('sondehubUrl').value = s.upload_url ?? '';
+                document.getElementById('sondehubStationId').value = s.station_id ?? '';
+                document.getElementById('sondehubRate').value = s.upload_rate_s ?? 15;
+                document.getElementById('sondehubQueueBatchMax').value = s.queue_batch_max ?? 200;
+                document.getElementById('sondehubQueueMaxSize').value = s.queue_max_size ?? 2000;
+
+                // Station
+                const st = _cfgSections.station || {};
+                document.getElementById('stationCallsign').value = st.callsign ?? '';
+                document.getElementById('stationUploadPosition').checked = !!st.upload_position;
+                document.getElementById('stationSdrType').value = (st.sdr_type ?? 'airspy').toLowerCase();
+                document.getElementById('stationMaxConcurrent').value = st.max_concurrent ?? 1;
+                document.getElementById('stationScanInterval').value = st.scan_interval ?? 15;
+                document.getElementById('stationBandwidth').value = st.bandwidth ?? 12000;
+                document.getElementById('stationMinSignal').value = st.min_signal_strength ?? -20;
+                document.getElementById('stationUseDftDetect').checked = !!st.use_dft_detect;
+
+                attachFreqFormatters();
+
+            } catch(e) { console.error('Error loading config sections:', e); }
+
+            new bootstrap.Modal(document.getElementById('configurationModal')).show();
+        }
+
+        function onRtlsdrDeviceChange() {
+            const idx = parseInt(document.getElementById('rtlsdrDeviceSelect').value);
+            if (isNaN(idx) || !_rtlsdrDevices[idx]) return;
+            const d = _rtlsdrDevices[idx];
+            document.getElementById('rtlCenterFreq').value = formatFreqMHz(d.center_freq_mhz, 404.6);
+            document.getElementById('rtlSampleRate').value = d.sample_rate ?? 2400000;
+            document.getElementById('rtlGain').value = d.gain ?? 40;
+            document.getElementById('rtlPpm').value = d.ppm_error ?? 0;
+        }
+
+        async function saveGeneralConfig() {
+            const payload = {
+                debug_mode:    document.getElementById('debugModeToggle').checked,
+                debug_level:   document.getElementById('debugLevelSelect').value,
+                snr_threshold: parseFloat(document.getElementById('snrThresholdInput').value),
+                scan_interval: parseInt(document.getElementById('scanIntervalInput').value),
+                fixed_channel_scantime: parseInt(document.getElementById('fixedChannelScantimeInput').value),
+                external_url_provider: document.getElementById('externalUrlProvider').value,
+            };
+            try {
+                const r = await fetch('/api/runtime_config', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                const data = await r.json();
+                if (data.success) {
+                    // Update the global variable
+                    externalUrlProvider = payload.external_url_provider;
+                    bootstrap.Modal.getInstance(document.getElementById('configurationModal')).hide();
+                } else {
+                    alert('Failed to apply: ' + (data.error || 'Unknown error'));
+                }
+            } catch(e) { alert('Error: ' + e); }
+        }
+
+        // Alias for compatibility with old saveConfiguration() call
+        async function saveConfiguration() { await saveGeneralConfig(); }
+
+        async function _saveConfigSection(payload) {
+            if (!confirm('Save changes to config.yaml and restart the service?')) return;
+            try {
+                const r = await fetch('/api/save_config_sections', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                const data = await r.json();
+                if (data.success) {
+                    const configurationModal = bootstrap.Modal.getInstance(document.getElementById('configurationModal'));
+                    const fixedChannelsModal = bootstrap.Modal.getInstance(document.getElementById('fixedChannelsModal'));
+                    if (configurationModal) configurationModal.hide();
+                    if (fixedChannelsModal) fixedChannelsModal.hide();
+                    alert('Settings saved. Service is restarting…');
+                    setTimeout(() => location.reload(), 3500);
+                } else {
+                    alert('Failed to save: ' + (data.error || 'Unknown error'));
+                }
+            } catch(e) { alert('Error: ' + e); }
+        }
+
+        async function saveRtlsdrConfig() {
+            const idx = parseInt(document.getElementById('rtlsdrDeviceSelect').value);
+            if (isNaN(idx)) { alert('No device selected.'); return; }
+            await _saveConfigSection({
+                rtlsdr_device: {
+                    index: idx,
+                    center_freq_mhz: parseFloat(document.getElementById('rtlCenterFreq').value),
+                    sample_rate: parseInt(document.getElementById('rtlSampleRate').value),
+                    gain: parseInt(document.getElementById('rtlGain').value),
+                    ppm_error: parseInt(document.getElementById('rtlPpm').value),
+                }
+            });
+        }
+
+        async function saveAirspyConfig() {
+            await _saveConfigSection({
+                airspy: {
+                    center_freq_mhz: parseFloat(document.getElementById('airspyCenterFreq').value),
+                    sample_rate: parseInt(document.getElementById('airspySampleRate').value),
+                    decode_mode: document.getElementById('airspyDecodeMode').value,
+                    gain: parseInt(document.getElementById('airspyGain').value),
+                    scan_gain: parseInt(document.getElementById('airspyScanGain').value),
+                }
+            });
+        }
+
+        async function saveMqttConfig() {
+            await _saveConfigSection({
+                mqtt: {
+                    enabled: document.getElementById('mqttEnabled').checked,
+                    server: document.getElementById('mqttServer').value.trim(),
+                    port: parseInt(document.getElementById('mqttPort').value),
+                    username: document.getElementById('mqttUsername').value,
+                    password: document.getElementById('mqttPassword').value,
+                }
+            });
+        }
+
+        async function saveSondehubConfig() {
+            await _saveConfigSection({
+                sondehub: {
+                    enabled: document.getElementById('sondehubEnabled').checked,
+                    queue_mode: document.getElementById('sondehubQueueMode').checked,
+                    upload_url: document.getElementById('sondehubUrl').value.trim(),
+                    station_id: document.getElementById('sondehubStationId').value.trim(),
+                    queue_batch_max: parseInt(document.getElementById('sondehubQueueBatchMax').value),
+                    queue_max_size: parseInt(document.getElementById('sondehubQueueMaxSize').value),
+                    upload_rate_s: parseInt(document.getElementById('sondehubRate').value),
+                }
+            });
+        }
+
+        async function saveStationConfig() {
+            await _saveConfigSection({
+                station: {
+                    callsign: document.getElementById('stationCallsign').value.trim(),
+                    upload_position: document.getElementById('stationUploadPosition').checked,
+                    sdr_type: document.getElementById('stationSdrType').value,
+                    max_concurrent: parseInt(document.getElementById('stationMaxConcurrent').value),
+                    scan_interval: parseInt(document.getElementById('stationScanInterval').value),
+                    bandwidth: parseInt(document.getElementById('stationBandwidth').value),
+                    min_signal_strength: parseFloat(document.getElementById('stationMinSignal').value),
+                    use_dft_detect: document.getElementById('stationUseDftDetect').checked,
+                }
+            });
+        }
+
+        function _renderFixedChannelRows() {
+            const wrap = document.getElementById('fixedChannelsRows');
+            if (!wrap) return;
+
+            const sondeTypes = (_cfgSections && Array.isArray(_cfgSections.sonde_types) && _cfgSections.sonde_types.length)
+                ? _cfgSections.sonde_types
+                : ['RS41', 'RS92', 'DFM', 'M10', 'M20', 'iMet', 'LMS6', 'MRZ'];
+
+            // Calculate max rows: 4 per SDR, up to 12 max (for 3+ SDRs)
+            const numSDRs = (_receiverBands || []).length;
+            const maxRows = Math.min(numSDRs * 4, 12);
+
+            if (maxRows === 0) {
+                wrap.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-3">No receivers available</td></tr>';
+                return;
+            }
+
+            const rows = [];
+            for (let i = 0; i < maxRows; i++) {
+                const ch = _fixedChannels[i] || {};
+                const freqVal = ch.frequency != null ? Number(ch.frequency).toFixed(3) : '';
+                const typeVal = ch.type || 'RS41';
+                const enabledVal = ch.enabled === true;
+                const rxScanVal = ch.rx_scan === true;
+                const deviceId = ch.receiver_device || (_receiverBands[0]?.id || '');
+                
+                // Calculate band info for selected device
+                const selectedBand = (_receiverBands || []).find(b => b.id === deviceId);
+                let bandInfo = '-';
+                if (selectedBand) {
+                    const center = Number(selectedBand.center_freq_mhz);
+                    const half = Number(selectedBand.sample_rate_hz) / 2 / 1e6;
+                    bandInfo = `${(center - half).toFixed(3)} - ${(center + half).toFixed(3)}`;
+                }
+
+                rows.push(`
+                    <tr>
+                        <td class="text-center fw-semibold">${i + 1}</td>
+                        <td>
+                            <div class="form-check form-switch">
+                                <input class="form-check-input fixed-channel-enabled" type="checkbox" data-index="${i}" ${enabledVal ? 'checked' : ''}>
+                            </div>
+                        </td>
+                        <td>
+                            <input type="text" class="form-control form-control-sm fixed-channel-freq" data-index="${i}" inputmode="decimal" value="${freqVal}" placeholder="405.700">
+                        </td>
+                        <td>
+                            <select class="form-select form-select-sm fixed-channel-type" data-index="${i}">
+                                ${sondeTypes.map((t) => `<option value="${t}" ${t === typeVal ? 'selected' : ''}>${t}</option>`).join('')}
+                            </select>
+                        </td>
+                        <td>
+                            <div class="form-check form-switch">
+                                <input class="form-check-input fixed-channel-rxscan" type="checkbox" data-index="${i}" ${rxScanVal ? 'checked' : ''}>
+                            </div>
+                        </td>
+                        <td>
+                            <select class="form-select form-select-sm fixed-channel-device" data-index="${i}" onchange="_updateFixedChannelBandInfo(${i})">
+                                ${(_receiverBands || []).map(b => `<option value="${b.id}" ${b.id === deviceId ? 'selected' : ''}>${b.label}</option>`).join('')}
+                            </select>
+                        </td>
+                        <td class="fixed-channel-band-info" data-index="${i}">${bandInfo}</td>
+                    </tr>
+                `);
+            }
+            wrap.innerHTML = rows.join('');
+        }
+
+        function _updateFixedChannelBandInfo(index) {
+            const deviceSelect = document.querySelector(`.fixed-channel-device[data-index="${index}"]`);
+            const bandCell = document.querySelector(`.fixed-channel-band-info[data-index="${index}"]`);
+            if (!deviceSelect || !bandCell) return;
+
+            const deviceId = deviceSelect.value;
+            const band = (_receiverBands || []).find(b => b.id === deviceId);
+            
+            if (band) {
+                const center = Number(band.center_freq_mhz);
+                const half = Number(band.sample_rate_hz) / 2 / 1e6;
+                bandCell.textContent = `${(center - half).toFixed(3)} - ${(center + half).toFixed(3)}`;
+            } else {
+                bandCell.textContent = '-';
+            }
+        }
+
+        async function showFixedChannelsModal() {
+            if (!fixedChannelsEnabled) {
+                alert('Fixed Channels is disabled. Set detection.fixed_channels_enable to true in config.yaml to enable it.');
+                return;
+            }
+
+            try {
+                const r = await fetch('/api/config_sections');
+                const data = await r.json();
+                _cfgSections = data;
+                _receiverBands = data.available_receiver_bands || [];
+                _fixedChannels = data.fixed_channels || [];
+
+                _renderFixedChannelRows();
+
+                const freqs = document.querySelectorAll('.fixed-channel-freq');
+                freqs.forEach((el) => {
+                    el.addEventListener('blur', () => {
+                        if (el.value.trim() === '') return;
+                        const n = Number(el.value);
+                        if (Number.isFinite(n)) el.value = n.toFixed(3);
+                    });
+                });
+
+                new bootstrap.Modal(document.getElementById('fixedChannelsModal')).show();
+            } catch (e) {
+                console.error('Failed to load fixed channels modal:', e);
+                alert('Failed to load fixed channels configuration');
+            }
+        }
+
+        async function saveFixedChannels() {
+            const freqInputs = Array.from(document.querySelectorAll('.fixed-channel-freq'));
+            const typeInputs = Array.from(document.querySelectorAll('.fixed-channel-type'));
+            const enabledInputs = Array.from(document.querySelectorAll('.fixed-channel-enabled'));
+            const rxScanInputs = Array.from(document.querySelectorAll('.fixed-channel-rxscan'));
+            const deviceInputs = Array.from(document.querySelectorAll('.fixed-channel-device'));
+            
+            const channels = [];
+
+            for (let i = 0; i < freqInputs.length; i++) {
+                const raw = (freqInputs[i]?.value || '').trim();
+                if (!raw) continue; // Skip empty frequencies
+
+                const f = Number(raw);
+                if (!Number.isFinite(f)) {
+                    alert(`Channel ${i + 1}: invalid frequency.`);
+                    return;
+                }
+
+                const type = (typeInputs[i]?.value || '').trim();
+                const enabled = enabledInputs[i]?.checked || false;
+                const rxScan = rxScanInputs[i]?.checked || false;
+                const deviceId = deviceInputs[i]?.value || '';
+
+                // Validate frequency is within receiver band
+                const band = (_receiverBands || []).find(b => b.id === deviceId);
+                if (band) {
+                    const center = Number(band.center_freq_mhz);
+                    const half = Number(band.sample_rate_hz) / 2 / 1e6;
+                    const low = center - half;
+                    const high = center + half;
+                    
+                    if (f < low || f > high) {
+                        alert(`Channel ${i + 1}: ${f.toFixed(3)} MHz is outside receiver band ${low.toFixed(3)}-${high.toFixed(3)} MHz.`);
+                        return;
+                    }
+                }
+
+                channels.push({ 
+                    frequency: Number(f.toFixed(3)), 
+                    type: type,
+                    enabled: enabled,
+                    rx_scan: rxScan,
+                    receiver_device: deviceId
+                });
+            }
+
+            await _saveConfigSection({ fixed_channels: channels });
+        }
+
+        // ---- Service status modal ----
+        async function showServiceStatusModal() {
+            await refreshServiceStatus();
+            new bootstrap.Modal(document.getElementById('serviceStatusModal')).show();
+        }
+
+        async function showServiceConsoleModal() {
+            await refreshServiceConsole();
+            new bootstrap.Modal(document.getElementById('serviceConsoleModal')).show();
+        }
+
+        async function refreshServiceStatus() {
+            try {
+                const r = await fetch('/api/service_status', { cache: 'no-store' });
+                const data = await r.json();
+                if (!data.success) {
+                    alert('Failed to read service status: ' + (data.error || 'Unknown error'));
+                    return;
+                }
+                document.getElementById('serviceHardware').textContent = data.hardware || '-';
+                const hostname = data.hostname || '-';
+                const ipAddress = data.ip_address || '-';
+                document.getElementById('serviceHostnameIp').textContent = `${hostname} / ${ipAddress}`;
+                document.getElementById('serviceUnit').textContent = data.unit || 'openwxsdr.service';
+                document.getElementById('serviceLoaded').textContent = data.loaded_line || '-';
+                document.getElementById('serviceActive').textContent = data.active_line || data.active || '-';
+                document.getElementById('serviceMainPid').textContent = data.main_pid_line || '-';
+                document.getElementById('serviceTasks').textContent = data.tasks_line || '-';
+                document.getElementById('serviceCpu').textContent = data.cpu_line || '-';
+
+                const dot = document.getElementById('serviceActiveDot');
+                dot.className = 'status-indicator ' + ((data.active || '').trim() === 'active' ? 'status-healthy' : 'status-error');
+            } catch (e) {
+                console.error('Service status error:', e);
+                alert('Failed to read service status');
+            }
+        }
+
+        async function refreshServiceConsole() {
+            try {
+                const r = await fetch('/api/service_console', { cache: 'no-store' });
+                const data = await r.json();
+                if (!data.success) {
+                    alert('Failed to read service console: ' + (data.error || 'Unknown error'));
+                    return;
+                }
+                document.getElementById('serviceConsoleText').textContent = data.console_status || data.summary || '-';
+                document.getElementById('serviceConsoleMeta').textContent = data.unit || 'openwxsdr.service';
+            } catch (e) {
+                console.error('Service console error:', e);
+                alert('Failed to read service console');
+            }
+        }
+
+        function confirmServiceAction(action) {
+            const text = action === 'stop'
+                ? 'This will stop the OPENWXSDR service immediately.'
+                : 'This will restart the OPENWXSDR service immediately.';
+            document.getElementById('serviceConfirmText').textContent = text;
+
+            const yesBtn = document.getElementById('serviceConfirmYesBtn');
+            yesBtn.textContent = 'Yes, I want to stop/restart the service now';
+            yesBtn.className = action === 'stop' ? 'btn btn-danger' : 'btn btn-warning text-dark';
+            yesBtn.onclick = () => executeServiceAction(action);
+
+            new bootstrap.Modal(document.getElementById('serviceConfirmModal')).show();
+        }
+
+        async function executeServiceAction(action) {
+            try {
+                const confirmModal = bootstrap.Modal.getInstance(document.getElementById('serviceConfirmModal'));
+                if (confirmModal) confirmModal.hide();
+
+                const r = await fetch('/api/service_control', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ action })
+                });
+                const data = await r.json();
+                if (!data.success) {
+                    alert('Failed to ' + action + ' service: ' + (data.error || 'Unknown error'));
+                    return;
+                }
+
+                if (action === 'restart') {
+                    alert('OPENWXSDR service restart initiated. The web UI will reconnect shortly.');
+                    setTimeout(() => location.reload(), 5000);
+                } else {
+                    alert('OPENWXSDR service stop initiated.');
+                    setTimeout(() => refreshServiceStatus(), 1500);
+                }
+            } catch (e) {
+                console.error('Service control error:', e);
+                alert('Service action failed');
+            }
+        }
+
+        // ---- Spectrum modal ----
+        let _spectrumChart = null;
+        let _selectedSpectrumReceiver = '';
+        let _waterfallHistory = [];  // Array of {freqs, powers, timestamp}
+        let _waterfallMaxLines = 200;  // Maximum history lines
+        let _waterfallTimer = null;
+        let _scanInterval = 15;  // Default scan interval
+        let _waterfallEnabled = true;  // Waterfall toggle state
+        let _waterfallStartTime = null;  // Track when waterfall started for time scale
+
+        const peakLabelPlugin = {
+            id: 'peakLabelPlugin',
+            afterDatasetsDraw(chart) {
+                const dsIndex = chart.data.datasets.findIndex(d => d.id === 'peaks');
+                if (dsIndex < 0) return;
+                const meta = chart.getDatasetMeta(dsIndex);
+                const dataset = chart.data.datasets[dsIndex];
+                if (!meta || !dataset || !dataset.data) return;
+
+                const ctx = chart.ctx;
+                ctx.save();
+                ctx.fillStyle = '#87d37c';
+                ctx.font = '11px sans-serif';
+
+                meta.data.forEach((pt, i) => {
+                    const item = dataset.data[i] || {};
+                    const label = item.label;
+                    if (!label) return;
+                    ctx.fillText(label, pt.x + 6, pt.y - 8);
+                });
+                ctx.restore();
+            }
+        };
+
+        async function showSpectrumModal() {
+            // Fetch scan interval from config
+            try {
+                const res = await fetch('/api/runtime_settings');
+                const settings = await res.json();
+                _scanInterval = settings.scan_interval || 15;
+            } catch(e) {
+                console.warn('Failed to fetch scan_interval, using default 15s', e);
+            }
+            
+            new bootstrap.Modal(document.getElementById('spectrumModal')).show();
+            
+            // Clear old waterfall data
+            _waterfallHistory = [];
+            _waterfallStartTime = Date.now();
+            
+            // Defer draw until canvas is visible
+            setTimeout(() => refreshSpectrum(), 150);
+            
+            // Start auto-refresh timer (1 second refresh)
+            if (_waterfallTimer) clearInterval(_waterfallTimer);
+            _waterfallTimer = setInterval(() => refreshSpectrum(), 1000);
+        }
+        
+        function toggleWaterfall() {
+            _waterfallEnabled = document.getElementById('waterfallToggle').checked;
+            const container = document.getElementById('waterfallContainer');
+            const chartContainer = document.getElementById('spectrumChartContainer');
+            if (_waterfallEnabled) {
+                container.style.display = 'flex';
+                chartContainer.style.flex = '0 0 40%';
+            } else {
+                container.style.display = 'none';
+                chartContainer.style.flex = '1';
+            }
+            if (_spectrumChart) _spectrumChart.resize();
+        }
+
+        function onSpectrumReceiverChanged() {
+            const sel = document.getElementById('spectrumReceiverSelect');
+            _selectedSpectrumReceiver = sel.value || '';
+            _waterfallHistory = [];  // Clear waterfall on receiver change
+            _waterfallStartTime = Date.now();
+            refreshSpectrum();
+        }
+
+        function _updateSpectrumReceiverSelector(spec) {
+            const sel = document.getElementById('spectrumReceiverSelect');
+            const receivers = spec.available_receivers || [];
+            if (!sel) return;
+
+            if (receivers.length === 0) {
+                sel.innerHTML = '<option value="">No receivers</option>';
+                sel.disabled = true;
+                _selectedSpectrumReceiver = '';
+                return;
+            }
+
+            sel.disabled = false;
+            sel.innerHTML = receivers.map(r =>
+                `<option value="${r.id}">${r.name}</option>`
+            ).join('');
+
+            const selected = spec.selected_receiver || _selectedSpectrumReceiver || receivers[0].id;
+            _selectedSpectrumReceiver = selected;
+            sel.value = selected;
+            if (sel.value !== selected) {
+                sel.value = receivers[0].id;
+                _selectedSpectrumReceiver = receivers[0].id;
+            }
+        }
+
+        async function refreshSpectrum() {
+            try {
+                const params = new URLSearchParams();
+                if (_selectedSpectrumReceiver) {
+                    params.set('receiver', _selectedSpectrumReceiver);
+                }
+                // Cache buster to ensure manual refresh always requests fresh data.
+                params.set('_ts', Date.now().toString());
+                const r = await fetch('/api/spectrum?' + params.toString(), { cache: 'no-store' });
+                const spec = await r.json();
+                _updateSpectrumReceiverSelector(spec || {});
+
+                const modalTitle = document.getElementById('spectrumModalTitle');
+                if (modalTitle) {
+                    const rxName = (spec && spec.receiver_name) ? spec.receiver_name : '';
+                    modalTitle.innerHTML = `<i class="bi bi-bar-chart-line"></i> Spectrum scan${rxName ? ' - ' + rxName : ''}`;
+                }
+
+                if (!spec || !spec.freqs_mhz || spec.freqs_mhz.length === 0) {
+                    const ts = document.getElementById('spectrumTimestamp');
+                    ts.textContent = 'No spectrum data yet - wait for next scan cycle.';
+                    ts.style.color = '#ff6b6b';
+                    return;
+                }
+
+                // Restore normal info color when data is available.
+                const ts = document.getElementById('spectrumTimestamp');
+                ts.style.color = '#8ecbff';
+                drawSpectrum(spec);
+                
+                // Add to waterfall history if enabled
+                if (_waterfallEnabled && spec.freqs_mhz && spec.power_db) {
+                    _waterfallHistory.push({
+                        freqs: spec.freqs_mhz,
+                        powers: spec.power_db,
+                        timestamp: Date.now(),
+                        noiseFloor: spec.noise_floor || -100
+                    });
+                    
+                    // Keep only last N lines
+                    if (_waterfallHistory.length > _waterfallMaxLines) {
+                        _waterfallHistory.shift();
+                    }
+                    
+                    drawWaterfall();
+                }
+            } catch(e) {
+                console.error('Spectrum fetch error', e);
+                const ts = document.getElementById('spectrumTimestamp');
+                ts.textContent = 'Spectrum refresh failed - check server/API connectivity.';
+                ts.style.color = '#ff6b6b';
+            }
+        }
+
+        function drawSpectrum(spec) {
+            const freqs  = spec.freqs_mhz;
+            const powers = spec.power_db;
+            const floor  = spec.noise_floor;
+            const thr    = spec.threshold_db;
+            const signals = spec.signals || [];
+
+            document.getElementById('spectrumTimestamp').textContent = 'Latest scan: ' + (spec.timestamp || '-');
+            document.getElementById('spectrumNoiseFloor').textContent = floor != null ? floor.toFixed(1) + ' dB' : '-';
+            document.getElementById('spectrumThreshold').textContent = thr != null ? ('+' + thr.toFixed(1) + ' dB SNR') : '-';
+
+            const ctx = document.getElementById('spectrumChart').getContext('2d');
+
+            if (_spectrumChart) {
+                _spectrumChart.destroy();
+                _spectrumChart = null;
+            }
+
+            // Noise floor and threshold lines
+            const floorLine  = freqs.map(() => floor);
+            const thrLine    = freqs.map(() => floor + thr);
+
+            // Peak markers: green dot + frequency label
+            const peakPoints = signals.map(s => {
+                const x = s.freq_mhz;
+                const snr = s.snr_db != null ? s.snr_db : 0;
+                const y = floor + snr;
+                return {
+                    x,
+                    y,
+                    label: `${x.toFixed(3)} MHz`,
+                };
+            });
+
+            _spectrumChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: freqs,
+                    datasets: [
+                        {
+                            label: 'Power (dB)',
+                            data: powers,
+                            borderColor: '#4DA6FF',
+                            backgroundColor: 'rgba(77,166,255,0.08)',
+                            borderWidth: 1,
+                            pointRadius: 0,
+                            fill: true,
+                            tension: 0,
+                            order: 1,
+                        },
+                        {
+                            label: 'Noise Floor',
+                            data: floorLine,
+                            borderColor: 'rgba(40,167,69,0.7)',
+                            borderWidth: 1,
+                            borderDash: [6, 3],
+                            pointRadius: 0,
+                            fill: false,
+                            order: 2,
+                        },
+                        {
+                            label: 'Threshold',
+                            data: thrLine,
+                            borderColor: 'rgba(255,193,7,0.7)',
+                            borderWidth: 1,
+                            borderDash: [4, 3],
+                            pointRadius: 0,
+                            fill: false,
+                            order: 3,
+                        },
+                        {
+                            id: 'peaks',
+                            label: 'Peaks',
+                            type: 'scatter',
+                            data: peakPoints,
+                            parsing: false,
+                            showLine: false,
+                            pointRadius: 4,
+                            pointHoverRadius: 6,
+                            pointBackgroundColor: '#4caf50',
+                            pointBorderColor: '#d4ffd7',
+                            pointBorderWidth: 1,
+                            order: 4,
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    interaction: { mode: 'nearest', intersect: false },
+                    plugins: {
+                        legend: {
+                            labels: { color: '#ccc', boxWidth: 20, padding: 10 }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                title: items => {
+                                    const first = items[0];
+                                    if (first.raw && first.raw.x != null) return first.raw.x.toFixed(4) + ' MHz';
+                                    return first.label.toString() + ' MHz';
+                                },
+                                label: item => {
+                                    if (item.dataset && item.dataset.id === 'peaks') {
+                                        return 'Peak: ' + item.raw.x.toFixed(3) + ' MHz';
+                                    }
+                                    const v = item.raw;
+                                    if (typeof v === 'number') return `${item.dataset.label}: ${v.toFixed(1)} dB`;
+                                    if (v && v.y != null) return `${item.dataset.label}: ${v.y.toFixed(1)} dB`;
+                                    return item.dataset.label || '';
+                                }
+                            }
+                        },
+                    },
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            title: { display: true, text: 'Frequency (MHz)', color: '#aaa' },
+                            ticks: {
+                                color: '#aaa',
+                                maxTicksLimit: 14,
+                                callback: v => v.toFixed(2),
+                            },
+                            grid: { color: 'rgba(255,255,255,0.06)' }
+                        },
+                        y: {
+                            title: { display: true, text: 'Power (dB, uncalibrated)', color: '#aaa' },
+                            ticks: { color: '#aaa' },
+                            grid: { color: 'rgba(255,255,255,0.06)' }
+                        }
+                    }
+                },
+                plugins: [peakLabelPlugin]
+            });
+
+            // Draw signal dot markers manually after chart render
+            _spectrumChart.update();
+        }
+
+        function drawWaterfall() {
+            const canvas = document.getElementById('waterfallCanvas');
+            if (!canvas) return;
+            
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            
+            // Set canvas resolution to match display size
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = rect.width;
+            canvas.height = rect.height;
+            
+            if (_waterfallHistory.length === 0) {
+                ctx.fillStyle = '#111';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#666';
+                ctx.font = '14px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('Waterfall will appear after spectrum scans...', canvas.width / 2, canvas.height / 2);
+                return;
+            }
+            
+            // Get Chart.js chart area for precise alignment
+            if (!_spectrumChart || !_spectrumChart.chartArea) {
+                console.warn('Spectrum chart not ready for waterfall alignment');
+                return;
+            }
+            const chartArea = _spectrumChart.chartArea;
+            
+            // Get frequency range from chart scales
+            const xScale = _spectrumChart.scales.x;
+            const minFreq = xScale.min;
+            const maxFreq = xScale.max;
+            const freqRange = maxFreq - minFreq;
+            
+            // Calculate dynamic power range from all history
+            let minPower = Infinity;
+            let maxPower = -Infinity;
+            _waterfallHistory.forEach(scan => {
+                const scanMin = Math.min(...scan.powers);
+                const scanMax = Math.max(...scan.powers);
+                minPower = Math.min(minPower, scanMin);
+                maxPower = Math.max(maxPower, scanMax);
+            });
+            
+            // Add some headroom
+            const powerRange = maxPower - minPower;
+            minPower -= powerRange * 0.1;
+            maxPower += powerRange * 0.1;
+            
+            // Use Chart.js chart area dimensions for perfect alignment
+            const timeAxisWidth = 55;  // Width for hh:mm:ss timestamps
+            const drawHeight = canvas.height;
+            
+            // Calculate waterfall drawable area to match spectrum chart area exactly
+            // Match the chart's left and right positions
+            const drawX = chartArea.left;
+            const drawWidth = chartArea.right - chartArea.left;
+            
+            // Draw waterfall with newest scans at TOP, scrolling down
+            const lineHeight = drawHeight / Math.min(_waterfallHistory.length, _waterfallMaxLines);
+            
+            _waterfallHistory.forEach((scan, scanIdx) => {
+                // Reverse index: newest (last in array) at y=0 (top), oldest at bottom
+                const reversedIdx = _waterfallHistory.length - 1 - scanIdx;
+                const y = reversedIdx * lineHeight;
+                
+                scan.powers.forEach((power, freqIdx) => {
+                    const freq = scan.freqs[freqIdx];
+                    // Map frequency to chart area coordinates
+                    const x = drawX + ((freq - minFreq) / freqRange) * drawWidth;
+                    
+                    // Normalize power to 0-1 range
+                    const normalizedPower = (power - minPower) / (maxPower - minPower);
+                    
+                    // Color gradient: blue (weak) -> cyan -> green -> yellow -> red (strong)
+                    const color = powerToColor(normalizedPower);
+                    
+                    ctx.fillStyle = color;
+                    ctx.fillRect(Math.floor(x), Math.floor(y), Math.ceil(drawWidth / scan.powers.length) + 1, Math.ceil(lineHeight) + 1);
+                });
+            });
+            
+            // Draw time scale on left axis (hh:mm:ss format, every 5 seconds)
+            ctx.fillStyle = 'rgba(200, 200, 200, 0.9)';
+            ctx.font = '9px monospace';
+            ctx.textAlign = 'right';
+            ctx.textBaseline = 'middle';
+            
+            // Draw timestamp for each 5-second interval that has data
+            _waterfallHistory.forEach((scan, scanIdx) => {
+                const reversedIdx = _waterfallHistory.length - 1 - scanIdx;
+                const y = reversedIdx * lineHeight;
+                
+                // Only draw label every 5 seconds
+                const scanTime = new Date(scan.timestamp);
+                const seconds = scanTime.getSeconds();
+                if (seconds % 5 === 0) {
+                    const timeStr = scanTime.toTimeString().substr(0, 8);  // hh:mm:ss
+                    ctx.fillText(timeStr, drawX - 5, y + lineHeight / 2);
+                }
+            });
+        }
+        
+        function powerToColor(normalized) {
+            // Clamp to 0-1
+            normalized = Math.max(0, Math.min(1, normalized));
+            
+            // Color gradient mapping
+            let r, g, b;
+            
+            if (normalized < 0.2) {
+                // Dark blue to blue
+                const t = normalized / 0.2;
+                r = 0;
+                g = 0;
+                b = Math.floor(50 + t * 155);
+            } else if (normalized < 0.4) {
+                // Blue to cyan
+                const t = (normalized - 0.2) / 0.2;
+                r = 0;
+                g = Math.floor(t * 200);
+                b = 205;
+            } else if (normalized < 0.6) {
+                // Cyan to green
+                const t = (normalized - 0.4) / 0.2;
+                r = 0;
+                g = 200;
+                b = Math.floor(205 - t * 155);
+            } else if (normalized < 0.8) {
+                // Green to yellow
+                const t = (normalized - 0.6) / 0.2;
+                r = Math.floor(t * 255);
+                g = 200;
+                b = 0;
+            } else {
+                // Yellow to red
+                const t = (normalized - 0.8) / 0.2;
+                r = 255;
+                g = Math.floor(200 - t * 200);
+                b = 0;
+            }
+            
+            return `rgb(${r}, ${g}, ${b})`;
+        }
+        
+        // Clean up timer when modal is closed
+        document.getElementById('spectrumModal')?.addEventListener('hidden.bs.modal', function() {
+            if (_waterfallTimer) {
+                clearInterval(_waterfallTimer);
+                _waterfallTimer = null;
+            }
+        });
+    </script>
+
+</body>
+</html>

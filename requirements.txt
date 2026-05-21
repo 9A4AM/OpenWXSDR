@@ -1,0 +1,33 @@
+# OpenWXSDR Requirements
+
+# Core dependencies
+numpy>=1.24.0
+scipy>=1.10.0
+PyYAML>=6.0
+setuptools<75.0
+
+# SDR support
+pyrtlsdr==0.3.0
+
+# Web UI
+Flask>=2.3.0
+Flask-CORS>=4.0.0
+requests>=2.28.0
+
+# System monitoring
+psutil>=5.9.0
+
+# Data handling
+pytz>=2023.3
+
+# Optional: MQTT upload support (install with: pip install paho-mqtt)
+# Required if openwx.mqtt.enabled = true or sondehub MQTT upload is used
+# paho-mqtt>=1.6.1
+
+# Optional dependencies
+# For KA9Q support
+# socket (built-in)
+# struct (built-in)
+
+# Development
+pytest>=7.4.0
