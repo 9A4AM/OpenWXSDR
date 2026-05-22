@@ -1,6 +1,7 @@
-# OpenWXSDR - Streamlined Radiosonde Decoder Framework
+# OpenWX <img src="https://cdn.jsdelivr.net/npm/bootstrap-icons/icons/radar.svg" width="24"> SDR - Streamlined Radiosonde Decoder
 
-A lightweight, efficient radiosonde decoder framework for Raspberry Pi, designed to work with RTL-SDR and KA9Q radio receivers. Uses the excellent rs1729/RS decoder suite.
+A lightweight, efficient radiosonde decoder for Raspberry Pi, designed to work with RTL-SDR, Airspy and KA9Q radio receivers. 
+Using the excellent rs1729/RS decoders embedded into this framework.
 
 ## Features
 
@@ -16,12 +17,40 @@ A lightweight, efficient radiosonde decoder framework for Raspberry Pi, designed
 
 ## Hardware Requirements
 
-- Raspberry Pi 4 /5 / 400 / 500 (8GB recommended) or Intel x86_64 client
-- Debian 13 or Rasbian OS - 64 Bit
-- RTL-SDR dongle or KA9Q-compatible SDR
+- Raspberry Pi 4 / 5 / 400 / 500 (8GB recommended) or Intel x86_64 client
+- Debian 13 "Trixie" or Raspberry Pi OS (64 Bit)
+- RTL-SDR, Airspy R2, Airspy Mini dongle or KA9Q-compatible SDR
 - Antenna tuned for 400-406 MHz
 - Selective 400 MHz LNA
 - SAW filter recommended
+
+## Architecture
+
+```
+┌─────────────────┐
+│  RTL-SDR/Airspy │
+│   KA9Q Radio    │
+└────────┬────────┘
+         │
+    ┌────▼──────────────┐
+    │ Spectrum Analyzer │
+    │ Signal Detector   │
+    └────┬──────────────┘
+         │
+    ┌────▼─────────────────┐
+    │   Decoder Manager    │
+    │ (rs1729/RS decoders) │
+    └────┬─────────────────┘
+         │
+    ┌────▼────────┬──────────┬─────────┐
+    │             │          │         │
+┌───▼────┐   ┌────▼─────┐  ┌─▼──────┐  │
+│ Web UI │   │ UDP JSON │  │  Log   │  │
+│ Flask  │   │ OpenWX   │  │  File  │  │
+└────────┘   └──────────┘  └────────┘  │
+                                       │ 
+                                   [sondehub]
+```
 
 ## Installation
 
@@ -66,16 +95,8 @@ pip install -r requirements.txt
 Edit `config.yaml` to match your setup:
 - Set SDR type and parameters
 - Configure frequency ranges for your region
-- Set max concurrent receivers
-- Configure OpenWX UDP output destination
-
-### 5. Run
-
-```bash
-python3 openwxsdr.py
-```
-
-Access the web UI at `http://raspberry-pi-ip:5000`
+- Set receiver specific settings (span, gain, fft, treshold)
+- Configure OpenWX UDP and external output destinations
 
 ## Configuration
 
@@ -86,33 +107,6 @@ Key configuration options in `config.yaml`:
 - **detection.freq_ranges**: Frequency ranges to scan
 - **output.udp**: Configure OpenWX server destination
 
-## Architecture
-
-```
-┌─────────────────┐
-│   RTL-SDR/      │
-│   KA9Q Radio    │
-└────────┬────────┘
-         │
-    ┌────▼──────────────┐
-    │ Spectrum Analyzer │
-    │ Signal Detector   │
-    └────┬──────────────┘
-         │
-    ┌────▼─────────────────┐
-    │ Decoder Manager      │
-    │ (rs1729/RS decoders) │
-    └────┬─────────────────┘
-         │
-    ┌────▼────────┬──────────┬─────────┐
-    │             │          │         │
-┌───▼────┐   ┌────▼─────┐  ┌─▼──────┐  │
-│ Web UI │   │ UDP JSON │  │  Log   │  │
-│ Flask  │   │ OpenWX   │  │  File  │  │
-└────────┘   └──────────┘  └────────┘  │
-                                       │ 
-                                   [sondehub]
-```
 
 ## UDP JSON Format
 
@@ -155,6 +149,29 @@ Data sent to OpenWX server:
 | iMet | imet54mod | InterMet iMet-54        |
 | LMS6 | lms6mod   | Lockheed Martin LMS6    |
 | MRZ  | mrzmod    | Meteo-Radiy MRZ         |
+
+
+### 5. Run
+
+```bash
+python3 openwxsdr.py
+```
+
+Access the web UI at `http://raspberry-pi-ip:5000` 
+
+Many configuration settings are also available in the WebUI and can be changed during operation:
+- SNR treshold
+- Scan interval
+- Callsign and SSID
+- SDR-Type and device settings
+ - Center Frequency
+ - Sample Rate
+ - Gain
+ - PPM correction
+- MQTT and upload
+ - Server IP / hostname
+ - Port
+ - User credentials
 
 
 ## Local WebUI on your device 
