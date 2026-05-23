@@ -54,7 +54,15 @@ Using the excellent rs1729/RS decoders embedded into this framework.
 
 ## Installation
 
-### 1. Install System Dependencies
+### 1a. One-Step-Installer
+
+OpenWXSDR offers an easy-to-use One-Step-Installer to install the necessary libraries, packages and OpenWXSDR package.
+
+See the wiki for detailed installation instructions: https://github.com/DL2MF/OpenWXSDR/wiki/Installation
+
+If you prefer manual installation of the package, continue below.
+
+### 1b. Install System Dependencies
 
 ```bash
 sudo apt-get update
