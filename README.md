@@ -272,4 +272,6 @@ GNU GPL2 License - See LICENSE file
 
 ## Support
 
+[![paypal](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/donate?token=8zPp8MT2DKdshzvmRxDi6yJhCdXGJSb_wIulhbD73TTYGuveGIrCGbGb0jhV9m4Tpj3D2ijR2JXltlGC)
+
 For issues and questions, please open an issue on GitHub.
