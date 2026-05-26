@@ -5,7 +5,7 @@ Using the excellent rs1729/RS decoders embedded into this framework.
 
 ## Currently under development:
 
-Important notice: The upload of radiosonde telemetry to sondehub.org (see below) is currently under development and review process.
+⚠ <u>Important notice:</u> The upload of radiosonde telemetry to sondehub.org (see below) is still under development and review process.
 Please let the feature currently disabled until we release a new fixed version! mni tnx!
 
 ## Features
