@@ -237,8 +237,8 @@ If enabled in config.yaml your device will upload radiosonde telemetry and senso
 # SondeHub Upload
 # ============================================================
 sondehub:
-  enabled: true
-  queue_mode: false                                        # false = direct upload mode, true = queued batch upload mode
+  enabled: false                                           # See notice at the beginning, please don't activate in V1.0.45
+  queue_mode: true                                         # false = direct upload mode, true = queued batch upload mode
   queue_batch_max: 50                                      # Max telemetry objects uploaded per queued request (10-fast 50-robust)
   queue_max_size: 1000                                     # Max queued  objects before oldest/new drops may occur (200-fast 1000-robust)
   upload_url: 'https://api.v2.sondehub.org/sondes/telemetry'
@@ -252,7 +252,7 @@ sondehub:
   uploader_lon: 10.00                                      # Must match station.lon above
   uploader_alt: 100                                        # Must match station.alt above
   upload_rate_s: 10                                        # Upload interval in seconds (1-5 for queue mode -10 recommended for single tracking)
-  listener_upload_interval_s: 900                          # Listener metadata upload interval in seconds (reduced from 900 for testing)
+  listener_upload_interval_s: 21600                        # Listener metadata upload interval in seconds (6h / 4 times/day recommend)
 ```
 
 
