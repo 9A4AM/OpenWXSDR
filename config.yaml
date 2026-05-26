@@ -240,7 +240,7 @@ openwx:
 # SondeHub Upload
 # ============================================================
 sondehub:
-  enabled: true								# false = no upload, true = upload to sondehub active
+  enabled: false								# false = no upload, true = upload to sondehub active
   queue_mode: false                         # false = direct upload mode, true = queued batch upload mode
   queue_batch_max: 200                      # Max telemetry objects uploaded per queued request (10-fast 50-robust)
   queue_max_size: 2000                      # Max queued  objects before oldest/new drops may occur (200-fast 1000-robust)
@@ -254,5 +254,5 @@ sondehub:
   uploader_lat: 52.620                      # Must match station.lat above
   uploader_lon: 10.280                      # Must match station.lon above
   uploader_alt: 45                          # Must match station.alt above
-  upload_rate_s: 1                          # Upload interval in seconds (1-5 for queue mode - 10 recommended for single tracking)
-  listener_upload_interval_s: 900           # Listener metadata upload interval in seconds
+  upload_rate_s: 15                          # Upload interval in seconds (1-5 for queue mode - 10 recommended for single tracking)
+  listener_upload_interval_s: 21600         # Listener metadata upload interval in seconds (every 6h)
