@@ -3,6 +3,11 @@
 A lightweight, efficient radiosonde decoder for Raspberry Pi, designed to work with RTL-SDR, Airspy and KA9Q radio receivers. 
 Using the excellent rs1729/RS decoders embedded into this framework.
 
+## Currently under development:
+
+Important notice: The upload of radiosonde telemetry to sondehub.org (see below) is currently under development and review process.
+Please let the feature currently disabled until we release a new fixed version! mni tnx!
+
 ## Features
 
 - 🎯 **Automatic Signal Detection**: Scans spectrum and automatically detects radiosonde signals
