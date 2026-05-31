@@ -391,6 +391,7 @@ class OpenWXSDR:
                 # Wait for timeout to see if frames are decoded
                 start_time = time.time()
                 frames_received = False
+                no_progress_timeout = 10  # Abort if no frames after 10s (faster than full timeout)
                 
                 while time.time() - start_time < timeout:
                     # Check if we're receiving frames
@@ -399,10 +400,21 @@ class OpenWXSDR:
                         self.logger.info(f"Priority frequency is decoding successfully - keeping decoder active")
                         break
                     
+                    # Early abort if no frames after 10 seconds - likely PLL/hardware issue
+                    if time.time() - start_time >= no_progress_timeout and not frames_received:
+                        self.logger.warning(
+                            f"Priority frequency check: No frames decoded after {no_progress_timeout}s. "
+                            f"Likely RTL-SDR PLL failure or weak signal. Aborting to free device for scanning."
+                        )
+                        # Force cleanup of stuck decoder
+                        if hasattr(self.device_manager, 'stop_all_decoders'):
+                            self.device_manager.stop_all_decoders()
+                        break
+                    
                     time.sleep(1)
                 
                 if not frames_received:
-                    self.logger.info(f"No frames decoded on priority frequency after {timeout}s - will start scanner")
+                    self.logger.info(f"No frames decoded on priority frequency after {int(time.time() - start_time)}s - will start scanner")
                     # The decoder manager will handle cleanup of idle decoders
             
         except Exception as e:

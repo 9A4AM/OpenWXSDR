@@ -2,7 +2,7 @@
 OpenWXSDR - Streamlined Radiosonde Decoder Framework
 """
 
-__version__ = '1.0.45'
+__version__ = '1.0.46'
 __software_name__ = 'OpenWXSDR'
 __author__ = 'OpenWX Team'
 
