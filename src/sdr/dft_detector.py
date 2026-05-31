@@ -184,7 +184,8 @@ class DftDetector:
         self,
         frequency: float,
         device_serial: str,
-        sample_rate: int
+        sample_rate: int,
+        retry_count: int = 0
     ) -> Optional[str]:
         """
         Capture FM-demodulated audio using rtl_fm.
@@ -198,10 +199,17 @@ class DftDetector:
             frequency: Center frequency in Hz
             device_serial: RTL-SDR device serial number (used directly with rtl_fm -d)
             sample_rate: Output sample rate in Hz (48000 recommended)
+            retry_count: Current retry attempt (for PLL lock failures)
 
         Returns:
             Path to temporary file containing FM audio samples, or None on failure
         """
+        # CRITICAL: Add USB settling delay before opening device
+        # This prevents "[R82XX] PLL not locked!" errors after scanner closes
+        if retry_count == 0:
+            self.logger.debug(f"Waiting 2s for USB device {device_serial} to settle before rtl_fm...")
+            time.sleep(2.0)
+        
         fd, audio_file = tempfile.mkstemp(suffix='.raw', prefix='openwxsdr_dft_')
         os.close(fd)
 
@@ -242,18 +250,39 @@ class DftDetector:
                     proc.kill()
                     proc.wait()
 
+            # Check stderr for PLL lock failures
+            stderr_out = b''
+            if proc and proc.stderr:
+                try:
+                    stderr_out = proc.stderr.read()
+                except Exception:
+                    pass
+            
+            stderr_text = stderr_out.decode('utf-8', errors='ignore')
+            
+            # Detect PLL lock failure
+            if 'PLL not locked' in stderr_text or 'usb_claim_interface' in stderr_text:
+                if retry_count < 2:  # Allow up to 2 retries
+                    self.logger.warning(
+                        f"RTL-SDR PLL lock failure (attempt {retry_count + 1}/3), "
+                        f"retrying after 3s cooldown..."
+                    )
+                    os.unlink(audio_file)
+                    time.sleep(3.0)  # Longer cooldown for hardware recovery
+                    return self._capture_fm_audio(frequency, device_serial, sample_rate, retry_count + 1)
+                else:
+                    self.logger.error(
+                        f"RTL-SDR PLL lock failure after {retry_count + 1} attempts, giving up"
+                    )
+                    os.unlink(audio_file)
+                    return None
+
             # Verify file has usable data
             file_size = os.path.getsize(audio_file) if os.path.exists(audio_file) else 0
             if file_size < 1000:
-                stderr_out = b''
-                if proc and proc.stderr:
-                    try:
-                        stderr_out = proc.stderr.read()
-                    except Exception:
-                        pass
                 self.logger.error(
                     f"FM capture file too small ({file_size} bytes): "
-                    f"{stderr_out.decode('utf-8', errors='ignore')[:200]}"
+                    f"{stderr_text[:200]}"
                 )
                 os.unlink(audio_file)
                 return None
@@ -308,7 +337,19 @@ class DftDetector:
             )
             
             if result.returncode != 0:
-                self.logger.warning(f"dft_detect returned non-zero exit code: {result.returncode}")
+                # Exit code 206 typically means corrupted/insufficient input data
+                # Often caused by PLL lock failures or USB issues in rtl_fm capture
+                if result.returncode == 206:
+                    self.logger.warning(
+                        f"dft_detect exit code 206 (corrupted input data) - "
+                        f"likely RTL-SDR USB/PLL issue"
+                    )
+                else:
+                    self.logger.warning(f"dft_detect returned non-zero exit code: {result.returncode}")
+                
+                # Log stderr for debugging
+                if result.stderr:
+                    self.logger.debug(f"dft_detect stderr: {result.stderr[:200]}")
             
             # Parse output for correlation results
             # Expected format: "RS41: 0.653" or "DFM: 0.701"

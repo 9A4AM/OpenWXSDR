@@ -158,13 +158,15 @@ class DeviceWorker:
     def __init__(self, device_config: dict, app_config: dict,
                  sonde_registry: SondeRegistry,
                  telemetry_callback: Callable[[SondeTelemetry], None],
-                 device_index: int = 0):
+                 device_index: int = 0,
+                 manager=None):
         self.device_config   = device_config
         self.device_serial   = device_config['serial']
         self.device_index    = device_index  # Used for staggered USB initialization
         self.app_config      = app_config
         self.registry        = sonde_registry
         self.telemetry_cb    = telemetry_callback
+        self._manager        = manager  # Reference to RTLSDRDeviceManager for fixed_channels check
         self.logger          = logging.getLogger(f'Worker.{self.device_serial}')
 
         self._state          = self.STATE_SCANNING  # Start in SCANNING state (will open USB on first cycle)
@@ -172,6 +174,7 @@ class DeviceWorker:
         self._thread: Optional[threading.Thread] = None
         self._first_usb_init = True  # Flag to track first USB device open
         self._device_lock = threading.Lock()  # CRITICAL: Prevent USB race conditions
+        self._manual_decode_pending = threading.Event()  # Signals scan cycle to abort early
 
         # Active scanning components
         self._analyzer: Optional[SpectrumAnalyzer] = None
@@ -374,8 +377,24 @@ class DeviceWorker:
             duration_seconds: If set, auto-return to scanning after this many seconds.
                             None or 0 = infinite decoding.
         """
-        # CRITICAL: Acquire device lock to prevent race with worker thread
-        with self._device_lock:
+        # Signal the scan cycle to stop ASAP so we can acquire the lock quickly
+        self._manual_decode_pending.set()
+        self.logger.info(f"Manual decode: waiting for device lock on {self.device_serial}...")
+
+        # CRITICAL: Acquire device lock to prevent race with worker thread.
+        # Use a timeout so we get an error log instead of blocking forever if the
+        # scan cycle is stuck (e.g. read_samples() hang on a USB error).
+        if not self._device_lock.acquire(timeout=20.0):
+            self._manual_decode_pending.clear()
+            self.logger.error(
+                f"Manual decode: could not acquire device lock on {self.device_serial} "
+                f"after 20 s — scan cycle may be stuck"
+            )
+            return False
+
+        try:
+            self._manual_decode_pending.clear()  # Lock is ours; clear the interrupt flag
+
             if self._state == self.STATE_DECODING:
                 self.logger.warning(f"Device {self.device_serial} already decoding, cannot start manual decode")
                 return False
@@ -385,6 +404,8 @@ class DeviceWorker:
             if self._state == self.STATE_SCANNING:
                 self._state = self.STATE_IDLE  # Stop worker thread from scanning
                 self.logger.info(f"Manual decode: stopping scanner on device {self.device_serial}")
+        finally:
+            self._device_lock.release()
         
         # Wait for USB device to be fully released before starting rtl_fm
         # Conservative 5-second delay for USB hub stability (increased from 3s for long-running sessions)
@@ -475,6 +496,10 @@ class DeviceWorker:
             return
         
         try:
+            # Abort early if manual decode was requested while we were waiting
+            if self._manual_decode_pending.is_set():
+                return
+
             if self._analyzer is None:
                 # If we just transitioned from DECODING, wait for USB device to be fully released
                 # Conservative 3-second delay for USB hub stability
@@ -512,12 +537,25 @@ class DeviceWorker:
                 time.sleep(5)
                 return
 
+            # Abort if manual decode was requested during spectrum capture
+            if self._manual_decode_pending.is_set():
+                return
+
             # Sort by strength descending; skip blacklisted / already-decoded freqs
             for sig in sorted(signals, key=lambda s: s.strength, reverse=True):
                 if self._is_blacklisted(sig.frequency):
                     continue
                 if self.registry.is_active(sig.frequency):
                     continue
+                
+                # CRITICAL: Skip signals that are assigned to fixed_channels
+                # Let fixed_channels start them with the correct type, not auto-detection
+                if self._is_fixed_channel_frequency(sig.frequency):
+                    self.logger.debug(
+                        f"Skipping {sig.frequency/1e6:.4f} MHz - reserved for fixed_channel with specified type"
+                    )
+                    continue
+                
                 self.logger.info(
                     f"New signal at {sig.frequency/1e6:.4f} MHz "
                     f"(SNR {sig.strength:.1f} dB, BW {sig.bandwidth/1e3:.1f} kHz)"
@@ -579,17 +617,32 @@ class DeviceWorker:
 
         # Close pyrtlsdr so rtl_fm can open the same USB device
         self._teardown_scan()
-        # Wait for USB device to be fully released before starting rtl_fm
-        # Conservative 3-second delay for USB hub stability
+        # Wait for USB device to be fully released before DFT detection
+        # This prevents "[R82XX] PLL not locked!" errors
+        # Conservative 3-second delay for USB hub stability with multiple devices
+        self.logger.debug(f"Waiting 3s for USB device {self.device_serial} to settle...")
         time.sleep(3.0)
 
-        # Identify sonde type
-        sonde_type = override_type or self._identify_sonde_type(sig)
-        if not sonde_type:
-            self.registry.unregister(sig.frequency)
-            return False
+        # Identify sonde type (this will use rtl_fm internally for DFT detection)
+        if override_type:
+            sonde_type = override_type
+            self.logger.info(f"Manual decode: using override type {sonde_type} at {sig.frequency/1e6:.4f} MHz")
+        else:
+            sonde_type = self._identify_sonde_type(sig)
+            if not sonde_type:
+                self.logger.error(f"Failed to identify sonde type at {sig.frequency/1e6:.4f} MHz")
+                self.registry.unregister(sig.frequency)
+                return False
+
+        # Add brief delay after DFT detection before starting AudioPipeline
+        # DFT detection just used rtl_fm, so give device time to settle
+        # Skip this delay if override_type was provided (DFT wasn't run)
+        if not override_type:
+            self.logger.debug(f"Waiting 1s after DFT detection before starting AudioPipeline...")
+            time.sleep(1.0)
 
         # Start rtl_fm audio pipeline
+        self.logger.info(f"Starting AudioPipeline for {sonde_type} at {sig.frequency/1e6:.4f} MHz on {self.device_serial}")
         pipeline = AudioPipeline(
             frequency=sig.frequency,
             sample_rate=48000,
@@ -598,16 +651,22 @@ class DeviceWorker:
             ppm_correction=self.device_config.get('ppm_error', 0)
         )
         if not pipeline.start():
-            self.logger.error("AudioPipeline failed to start")
+            self.logger.error(f"AudioPipeline failed to start for {sonde_type} at {sig.frequency/1e6:.4f} MHz")
             self.registry.unregister(sig.frequency)
             return False
 
         # Start rs1729 decoder
+        self.logger.info(f"Starting RS1729 decoder for {sonde_type} at {sig.frequency/1e6:.4f} MHz")
         decoder = RS1729Decoder(frequency=sig.frequency, sonde_type=sonde_type)
         decoder.set_frame_callback(self._on_frame)
         audio_stream = pipeline.get_audio_stream()
-        if not audio_stream or not decoder.start(audio_stream=audio_stream):
-            self.logger.error("RS1729 decoder failed to start")
+        if not audio_stream:
+            self.logger.error(f"AudioPipeline audio stream is None for {sonde_type} at {sig.frequency/1e6:.4f} MHz")
+            pipeline.stop()
+            self.registry.unregister(sig.frequency)
+            return False
+        if not decoder.start(audio_stream=audio_stream):
+            self.logger.error(f"RS1729 decoder failed to start for {sonde_type} at {sig.frequency/1e6:.4f} MHz")
             pipeline.stop()
             self.registry.unregister(sig.frequency)
             return False
@@ -700,15 +759,67 @@ class DeviceWorker:
             if bw >= 22000:   return 'M20'
             if bw >= 16000:   return 'iMet'
             if bw >= 14000:   return 'M10'
-            if bw >= 10000:
+            if bw >= 12000:
+                self.logger.info(f"BW {bw/1e3:.1f} kHz → RS92")
+                return 'RS92'
+            if bw >= 7000:
+                # DFM-06/09/17 typically 7.5-8.5 kHz
                 self.logger.info(f"BW {bw/1e3:.1f} kHz → DFM")
                 return 'DFM'
+            # RS41 typically 4.8-6 kHz
             self.logger.info(f"BW {bw/1e3:.1f} kHz → RS41 (default)")
             return 'RS41'
         return 'RS41'
 
     def _is_blacklisted(self, freq_hz: float) -> bool:
         return any(abs(freq_hz - b) < 10_000 for b in self._blacklist)
+
+    def _is_fixed_channel_frequency(self, freq_hz: float) -> bool:
+        """Check if frequency matches a configured fixed_channel (within 10 kHz tolerance)."""
+        # Get fixed_channels from manager (they're stored at manager level)
+        try:
+            if not hasattr(self, '_manager') or not self._manager:
+                self.logger.debug(f"_is_fixed_channel_frequency: No manager reference")
+                return False
+                
+            if not hasattr(self._manager, '_fixed_channels'):
+                self.logger.debug(f"_is_fixed_channel_frequency: Manager has no _fixed_channels attribute")
+                return False
+            
+            fixed_channels = self._manager._fixed_channels
+            if not fixed_channels:
+                self.logger.debug(f"_is_fixed_channel_frequency: fixed_channels list is empty")
+                return False
+            
+            self.logger.debug(f"_is_fixed_channel_frequency: Checking {freq_hz/1e6:.3f} MHz against {len(fixed_channels)} fixed channel(s)")
+            
+            for ch in fixed_channels:
+                if not ch.get('enabled', False):
+                    self.logger.debug(f"  Channel {ch.get('frequency')} MHz: disabled, skipping")
+                    continue
+                    
+                ch_freq_mhz = ch.get('frequency', 0)
+                ch_freq_hz = float(ch_freq_mhz) * 1e6
+                freq_diff_khz = abs(freq_hz - ch_freq_hz) / 1e3
+                
+                self.logger.debug(
+                    f"  Channel {ch_freq_mhz} MHz: diff={freq_diff_khz:.1f} kHz, "
+                    f"type={ch.get('type')}, device={ch.get('receiver_device')}"
+                )
+                
+                if abs(freq_hz - ch_freq_hz) < 10_000:  # Within 10 kHz
+                    self.logger.info(
+                        f"Frequency {freq_hz/1e6:.3f} MHz matches fixed_channel {ch_freq_mhz} MHz "
+                        f"(type={ch.get('type')}) - will skip scanning"
+                    )
+                    return True
+                    
+            self.logger.debug(f"_is_fixed_channel_frequency: No match for {freq_hz/1e6:.3f} MHz")
+            return False
+            
+        except Exception as exc:
+            self.logger.error(f"_is_fixed_channel_frequency error: {exc}", exc_info=True)
+            return False
 
     # ------------------------------------------------------------------
     # Telemetry / frame conversion
@@ -768,14 +879,34 @@ class DeviceWorker:
             elif snr_db is None:
                 snr_db = self._cur_signal_strength_db
 
-            # Frame number from raw line "[  361] …"
-            frame_number = 0
-            raw = frame_data.get('raw_line', '')
-            if '[' in raw and ']' in raw:
-                try:
-                    frame_number = int(raw[raw.find('[')+1:raw.find(']')].strip())
-                except ValueError:
-                    pass
+            # Frame number from parsed frame_data or fallback to raw line "[  361] …"
+            frame_number = frame_data.get('frame_number', 0)
+            if frame_number == 0:
+                # Try fallback parsing from raw line
+                raw = frame_data.get('raw_line', '')
+                if '[' in raw and ']' in raw:
+                    try:
+                        frame_number = int(raw[raw.find('[')+1:raw.find(']')].strip())
+                    except ValueError:
+                        pass
+            
+            # Skip upload if frame_number is still 0 or None (invalid/failed decode)
+            if not frame_number or frame_number == 0:
+                self.logger.debug(
+                    f"Skipping frame with invalid frame_number={frame_number} for {sonde_id} "
+                    f"(likely incomplete decode)"
+                )
+                return
+            
+            # Get decoded datetime from sonde (NOT gateway time!)
+            decoded_datetime = frame_data.get('decoded_datetime')
+            if not decoded_datetime:
+                # Fallback to UTC now only if no decoded time available
+                decoded_datetime = datetime.utcnow()
+                self.logger.warning(
+                    f"No decoded_datetime available for {sonde_id} frame {frame_number}, "
+                    f"using gateway time as fallback"
+                )
 
             position = None
             if 'lat' in frame_data and 'lon' in frame_data and 'alt' in frame_data:
@@ -783,7 +914,7 @@ class DeviceWorker:
                     latitude=frame_data['lat'],
                     longitude=frame_data['lon'],
                     altitude=frame_data['alt'],
-                    datetime=datetime.utcnow()
+                    datetime=decoded_datetime  # Use decoded sonde time!
                 )
 
             velocity = None
@@ -814,7 +945,14 @@ class DeviceWorker:
                 snr=snr_db,
                 rssi=rssi_db,
                 satellites=frame_data.get('sats'),
-                timestamp=datetime.utcnow(),
+                battery=frame_data.get('battery'),
+                burst_timer=frame_data.get('burst_timer'),
+                rs41_mainboard=frame_data.get('rs41_mainboard'),
+                rs41_mainboard_fw=frame_data.get('rs41_mainboard_fw'),
+                ref_datetime=frame_data.get('ref_datetime'),
+                ref_position=frame_data.get('ref_position'),
+                tx_frequency=frame_data.get('tx_frequency'),
+                timestamp=decoded_datetime,  # Use decoded sonde time!
                 decoder_name='rs1729',
                 decoder_version='rs1729'
             )
@@ -886,6 +1024,15 @@ class RTLSDRDeviceManager:
         max_fixed = min(len(self.device_configs) * 4, 12)
         self._fixed_channels: List[dict] = list(raw_fixed[:max_fixed])
         self._fixed_start_done = (len(self._fixed_channels) == 0 or not self._fixed_channels_enabled)
+        
+        # Diagnostic logging for fixed_channels configuration
+        self.logger.info(f"Fixed channels config: enabled={self._fixed_channels_enabled}, count={len(self._fixed_channels)}")
+        if self._fixed_channels:
+            for idx, ch in enumerate(self._fixed_channels):
+                self.logger.info(
+                    f"  Fixed channel {idx+1}: {ch.get('frequency')} MHz, type={ch.get('type')}, "
+                    f"enabled={ch.get('enabled')}, device={ch.get('receiver_device')}"
+                )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -898,7 +1045,8 @@ class RTLSDRDeviceManager:
                 app_config=self.config,
                 sonde_registry=self._registry,
                 telemetry_callback=self.telemetry_callback,
-                device_index=idx  # Pass index for staggered USB init
+                device_index=idx,  # Pass index for staggered USB init
+                manager=self  # Pass manager reference for fixed_channels check
             )
             self._workers.append(worker)
         self.logger.info(f"Initialized {len(self._workers)} worker(s)")
@@ -921,6 +1069,8 @@ class RTLSDRDeviceManager:
         self.logger.info("All device workers started")
         
         # Start fixed channels if enabled (wait for workers to stabilize)
+        self.logger.debug(f"Checking fixed_channels startup: enabled={self._fixed_channels_enabled}, channels={len(self._fixed_channels)}")
+        
         if self._fixed_channels_enabled and self._fixed_channels:
             self.logger.info(f"Fixed Channels enabled: {len(self._fixed_channels)} channels configured")
             threading.Thread(
@@ -928,12 +1078,31 @@ class RTLSDRDeviceManager:
             ).start()
         elif self._fixed_channels:
             self.logger.info("Fixed Channels configured but disabled (fixed_channels_enable: false)")
+        else:
+            self.logger.debug("No fixed channels configured")
 
     def stop(self):
         self.running = False
         for w in self._workers:
             w.stop()
         self.logger.info("All device workers stopped")
+
+    def stop_all_decoders(self):
+        """Force stop all active decoders and return devices to scanning/idle state.
+        
+        Used for emergency cleanup when decoders are stuck (e.g., PLL failures during priority check).
+        """
+        stopped_count = 0
+        for w in self._workers:
+            if w._state == w.STATE_DECODING:
+                self.logger.info(f"Force stopping decoder on device {w.device_serial}")
+                w.stop_decode_and_scan()
+                stopped_count += 1
+        
+        if stopped_count > 0:
+            self.logger.info(f"Force stopped {stopped_count} decoder(s)")
+        else:
+            self.logger.debug("No active decoders to stop")
 
     # ------------------------------------------------------------------
     # Fixed-channel startup
@@ -987,6 +1156,8 @@ class RTLSDRDeviceManager:
         time.sleep(2.0)
         
         try:
+            self.logger.debug("Fixed Channels: starting channel assignment phase")
+            
             # Filter for enabled channels only
             enabled_channels = [ch for ch in self._fixed_channels if ch.get('enabled', False)]
             
@@ -1021,7 +1192,13 @@ class RTLSDRDeviceManager:
                 worker_channels = device_channels.get(worker.device_serial, [])
                 
                 if not worker_channels:
+                    self.logger.debug(f"Device {worker.device_serial}: no fixed channels assigned")
                     continue
+                
+                self.logger.debug(
+                    f"Device {worker.device_serial}: {len(worker_channels)} channel(s) assigned, "
+                    f"current state={worker.state}"
+                )
                 
                 # Check if ANY channel for this device has rx_scan enabled
                 has_rx_scan = any(ch.get('rx_scan', False) for ch in worker_channels)
@@ -1066,11 +1243,27 @@ class RTLSDRDeviceManager:
                         f"{freq_hz/1e6:.3f} MHz (single channel, rx_scan=false)"
                     )
                     
-                    if worker.start_manual_decode(freq_hz, stype, duration_seconds=None):
-                        success_count += 1
-                    else:
-                        self.logger.warning(
-                            f"Device {worker.device_serial}: Failed to start decoder"
+                    try:
+                        self.logger.debug(
+                            f"Calling start_manual_decode() for {worker.device_serial}: "
+                            f"freq={freq_hz/1e6:.3f} MHz, type={stype}"
+                        )
+                        result = worker.start_manual_decode(freq_hz, stype, duration_seconds=None)
+                        self.logger.debug(
+                            f"start_manual_decode() returned: {result} for {worker.device_serial}"
+                        )
+                        
+                        if result:
+                            success_count += 1
+                        else:
+                            self.logger.warning(
+                                f"Device {worker.device_serial}: Failed to start decoder (returned False)"
+                            )
+                            skipped_count += 1
+                    except Exception as e:
+                        self.logger.error(
+                            f"Device {worker.device_serial}: Exception starting decoder: {e}",
+                            exc_info=True
                         )
                         skipped_count += 1
                         
@@ -1089,12 +1282,28 @@ class RTLSDRDeviceManager:
                         "Set rx_scan=true to enable cycling."
                     )
                     
-                    if worker.start_manual_decode(freq_hz, stype, duration_seconds=None):
-                        success_count += 1
-                        skipped_count += len(worker_channels) - 1
-                    else:
-                        self.logger.warning(
-                            f"Device {worker.device_serial}: Failed to start decoder"
+                    try:
+                        self.logger.debug(
+                            f"Calling start_manual_decode() for {worker.device_serial}: "
+                            f"freq={freq_hz/1e6:.3f} MHz, type={stype}"
+                        )
+                        result = worker.start_manual_decode(freq_hz, stype, duration_seconds=None)
+                        self.logger.debug(
+                            f"start_manual_decode() returned: {result} for {worker.device_serial}"
+                        )
+                        
+                        if result:
+                            success_count += 1
+                            skipped_count += len(worker_channels) - 1
+                        else:
+                            self.logger.warning(
+                                f"Device {worker.device_serial}: Failed to start decoder (returned False)"
+                            )
+                            skipped_count += len(worker_channels)
+                    except Exception as e:
+                        self.logger.error(
+                            f"Device {worker.device_serial}: Exception starting decoder: {e}",
+                            exc_info=True
                         )
                         skipped_count += len(worker_channels)
                 
@@ -1104,6 +1313,12 @@ class RTLSDRDeviceManager:
             self.logger.info(
                 f"Fixed Channels startup complete: {success_count}/{len(self._workers)} "
                 f"device(s) started, {skipped_count} channel(s) skipped"
+            )
+        
+        except Exception as e:
+            self.logger.error(
+                f"Fatal error in Fixed Channels startup: {e}",
+                exc_info=True
             )
                 
         finally:
