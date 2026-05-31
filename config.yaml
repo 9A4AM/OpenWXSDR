@@ -157,7 +157,8 @@ decoders:
 # Logging / Debug
 logging:
   debug_mode: true          # When true, verbose scanner/device messages visible
-  log_level: DEBUG          # Base log level: DEBUG, INFO, WARNING, ERROR
+  level: DEBUG              # Base log level: DEBUG, INFO, WARNING, ERROR
+  debug_mqtt: false         # When true, show MQTTOutput DEBUG messages (PINGREQ/PINGRESP etc)  
 
 # Web UI Configuration
 webui:
@@ -225,13 +226,13 @@ openwx:
     enabled: true
     server: '192.168.1.123'           		# MQTT broker hostname or IP
     port: 1883                        		# MQTT broker port (1883 = plain, 8883 = TLS)
-    username: '<username>'                 	# MQTT username (leave empty if not required)
+    username: '<username>'               	# MQTT username (leave empty if not required)
     password: '<password'              		# MQTT password (leave empty if not required)
-    topic_prefix: 'OPENWXSDR/<callsign>/'   # MQTT topic prefix (e.g. OPENWXSDR/<callsign>/<serial>)
+    topic_prefix: 'OPENWXSDR/<callsign>'  # MQTT topic prefix (e.g. OPENWXSDR/<callsign>/<serial>)
     client_id: '<callsign>'             	# MQTT client ID
     keepalive: 60                     		# MQTT keepalive in seconds
     connect_timeout: 10               		# Wait this many seconds for initial CONNACK
-    tls_enabled: true                		# Set false for username/password brokers on plain TCP (usually port 1883)
+    tls_enabled: true                	  	# Set false for username/password brokers on plain TCP (usually port 1883)
     tls_insecure: true                		# Accept brokers by IP/self-signed cert without CA validation
     tls_ca_certs: ''                  		# Optional CA bundle path for strict TLS validation
     transport: 'tcp'                  		# MQTT transport
@@ -240,7 +241,7 @@ openwx:
 # SondeHub Upload
 # ============================================================
 sondehub:
-  enabled: false								# false = no upload, true = upload to sondehub active
+  enabled: false								            # true = normal upload, false = disabled, "json" = log payloads to data/logs/<serial>.json without uploading
   queue_mode: false                         # false = direct upload mode, true = queued batch upload mode
   queue_batch_max: 200                      # Max telemetry objects uploaded per queued request (10-fast 50-robust)
   queue_max_size: 2000                      # Max queued  objects before oldest/new drops may occur (200-fast 1000-robust)
@@ -249,10 +250,10 @@ sondehub:
   station_id: '<callsign>'                  # Station ID (use callsign/SSID style)
   uploader_callsign: '<callsign>'           # Receiver callsign shown in SondeHub
   uploader_antenna: '1/4 wave UHF vertical' # Receiver antenna info shon in SondeHub
-  uploader_radio: 'RTLSDR + rs1729'   		# Optional receiver hardware/radio description
+  uploader_radio: 'RTLSDR + rs1729'     		# Optional receiver hardware/radio description
   contact_email: ''                         # Optional contact email for listener metadata
-  uploader_lat: 52.620                      # Must match station.lat above
-  uploader_lon: 10.280                      # Must match station.lon above
-  uploader_alt: 45                          # Must match station.alt above
-  upload_rate_s: 15                          # Upload interval in seconds (1-5 for queue mode - 10 recommended for single tracking)
+  uploader_lat: 52.000                      # Must match station.lat above
+  uploader_lon: 10.000                      # Must match station.lon above
+  uploader_alt: 100                         # Must match station.alt above
+  upload_rate_s: 15                         # Upload interval in seconds (1-5 for queue mode - 10 recommended for single tracking)
   listener_upload_interval_s: 21600         # Listener metadata upload interval in seconds (every 6h)
