@@ -99,13 +99,17 @@ class WebUI:
         # Structured action logger
         self.action_log_path = os.path.abspath(f"data/logs/openwxsdr_{config.get('station', {}).get('callsign', 'unknown')}.log")
         self.action_logger = self._setup_action_logger()
-        self.debug_level = str(config.get('logging', {}).get('debug_level', 'basic'))  # Track debug level: basic, info, verbose
+        
+        # Unified debug configuration - single log_level setting
+        logging_cfg = config.get('logging', {})
+        self.log_level = str(logging_cfg.get('log_level', 'INFO')).upper()  # INFO, WARNING, DEBUG
+        self.debug_mode = bool(logging_cfg.get('debug_mode', self.log_level == 'DEBUG'))  # Auto-enable for DEBUG
+        
         self.sonde_first_frames = {}  # Track first frame logged per sonde serial
         self.sonde_last_frames = {}  # Track last frame for each sonde
         
         # Apply initial logging levels from config
-        debug_mode = bool(config.get('logging', {}).get('debug_mode', False))
-        self._apply_logging_levels(debug_mode)
+        self._apply_logging_levels()
         
         # External URL settings
         webui_config = config.get('webui', {})
@@ -152,7 +156,7 @@ class WebUI:
                                  default_zoom=map_config['default_zoom'],
                                  tile_server=map_config['tile_server'],
                                  callsign=station_cfg.get('callsign', ''),
-                                 version='1.0.45')
+                                 version='1.0.46')
         
         @self.app.route('/api/sondes')
         def get_sondes():
@@ -479,8 +483,8 @@ class WebUI:
                 log = self.config.get('logging', {})
                 result = {
                     'success': True,
-                    'debug_mode': bool(log.get('debug_mode', False)),
-                    'debug_level': str(log.get('debug_level', 'basic')),
+                    'debug_mode': bool(self.debug_mode if hasattr(self, 'debug_mode') else log.get('debug_mode', False)),
+                    'log_level': str(self.log_level if hasattr(self, 'log_level') else log.get('log_level', 'INFO')),
                     'snr_threshold': float(det.get('scan_threshold', 10.0)),
                     'scan_interval': int(self.config.get('receivers', {}).get('scan_interval', 15)),
                     'fixed_channel_scantime': int(det.get('fixed_channel_scantime', 60)),
@@ -501,18 +505,16 @@ class WebUI:
                 if 'debug_mode' in data and dm is not None and hasattr(dm, 'set_debug_mode'):
                     debug_enabled = bool(data['debug_mode'])
                     dm.set_debug_mode(debug_enabled)
+                    self.debug_mode = debug_enabled
                     changed.append('debug_mode')
                     self._log_action('config_change', {'setting': 'debug_mode', 'value': debug_enabled})
-                    # Apply logging level based on debug mode and level
-                    self._apply_logging_levels(debug_enabled)
+                    self._apply_logging_levels()
                 
-                if 'debug_level' in data:
-                    self.debug_level = str(data['debug_level'])
-                    changed.append('debug_level')
-                    self._log_action('config_change', {'setting': 'debug_level', 'value': self.debug_level})
-                    # Apply logging level based on debug mode and level
-                    debug_enabled = bool(data.get('debug_mode', self.config.get('logging', {}).get('debug_mode', False)))
-                    self._apply_logging_levels(debug_enabled)
+                if 'log_level' in data:
+                    self.log_level = str(data['log_level']).upper()
+                    changed.append('log_level')
+                    self._log_action('config_change', {'setting': 'log_level', 'value': self.log_level})
+                    self._apply_logging_levels()
 
                 if 'snr_threshold' in data and dm is not None and hasattr(dm, 'set_snr_threshold'):
                     dm.set_snr_threshold(float(data['snr_threshold']))
@@ -1050,34 +1052,41 @@ class WebUI:
         except Exception as e:
             self.logger.error(f"Error logging action: {e}")
     
-    def _apply_logging_levels(self, debug_enabled: bool):
-        """Apply logging levels based on debug mode and debug level"""
+    def _apply_logging_levels(self):
+        """Apply logging levels based on unified log_level setting.
+        
+        Supports three levels:
+        - WARNING: Minimal logging (errors and warnings only)
+        - INFO: Standard logging (info, warnings, errors)
+        - DEBUG: Verbose logging (everything including debug messages)
+        """
         try:
-            # Get current debug level
-            level = self.debug_level if hasattr(self, 'debug_level') else 'basic'
+            # Get log level from config
+            level_str = self.log_level if hasattr(self, 'log_level') else 'INFO'
             
-            if not debug_enabled or level == 'basic':
-                # Basic: Only show WARNING and above (suppress INFO and DEBUG)
-                logging.getLogger().setLevel(logging.WARNING)
-                # But allow main app messages
-                logging.getLogger('OpenWXSDR').setLevel(logging.WARNING)
-                logging.getLogger('WebUI').setLevel(logging.INFO)
-            elif level == 'info':
-                # Info: Show INFO and above, but suppress verbose decoder stdout
-                logging.getLogger().setLevel(logging.INFO)
-                logging.getLogger('OpenWXSDR').setLevel(logging.INFO)
-                # Keep decoder stdout at WARNING to hide verbose GPS data
-                for logger_name in logging.Logger.manager.loggerDict:
-                    if 'Decoder' in logger_name:
-                        logging.getLogger(logger_name).setLevel(logging.INFO)
-            elif level == 'verbose':
-                # Verbose: Show everything including DEBUG
-                logging.getLogger().setLevel(logging.DEBUG)
-                for logger_name in logging.Logger.manager.loggerDict:
-                    if 'Decoder' in logger_name:
-                        logging.getLogger(logger_name).setLevel(logging.DEBUG)
+            # Map string to logging level
+            if level_str == 'DEBUG':
+                level = logging.DEBUG
+            elif level_str == 'WARNING':
+                level = logging.WARNING
+            else:  # INFO or unknown defaults to INFO
+                level = logging.INFO
             
-            self.logger.info(f"Logging level updated: debug_mode={debug_enabled}, debug_level={level}")
+            # Set root logger and all application loggers
+            logging.getLogger().setLevel(level)
+            
+            # Explicitly set main components to same level
+            for logger_name in ['OpenWXSDR', 'WebUI', 'RTLSDRDeviceManager', 'Worker', 
+                                'DftDetector', 'AudioPipeline', 'RS1729Decoder',
+                                'SondeHubQueueOutput', 'MQTTOutput']:
+                logging.getLogger(logger_name).setLevel(level)
+            
+            # For worker-specific loggers (Worker.NESDR001, etc.)
+            for logger_name in logging.Logger.manager.loggerDict:
+                if logger_name.startswith('Worker.'):
+                    logging.getLogger(logger_name).setLevel(level)
+            
+            self.logger.info(f"Logging level set to: {level_str} (debug_mode={self.debug_mode})")
         except Exception as e:
             self.logger.error(f"Error applying logging levels: {e}")
     
