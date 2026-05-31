@@ -329,9 +329,10 @@ class SondeHubOutput:
         if sonde_type_upper in ('RS41', 'RS92'):
             return bool(re.match(r'^[A-Z][0-9]{7,8}$', serial))
         
-        # DFM: D[0-9]{8}
+        # DFM: Accept either D[0-9]{8} (with prefix) or [0-9]{8} (JSON format without prefix)
+        # Examples: "D21062636" or "21062636"
         elif sonde_type_upper == 'DFM':
-            return bool(re.match(r'^D[0-9]{8}$', serial))
+            return bool(re.match(r'^(D)?[0-9]{8}$', serial))
         
         # M10/M20: M[0-9A-Z]{8,10}
         elif sonde_type_upper in ('M10', 'M20'):
@@ -367,6 +368,14 @@ class SondeHubOutput:
         serial = (telemetry.serial or '').strip()
         if not serial or serial == 'UNKNOWN':
             self.logger.debug(f"[SONDEHUB] Invalid serial {serial}, skipping payload")
+            return None
+        
+        # Filter out invalid frame numbers (0 or None = incomplete decode)
+        if not telemetry.frame_number or telemetry.frame_number == 0:
+            self.logger.warning(
+                f"[SONDEHUB] Invalid frame_number={telemetry.frame_number} for {serial}, "
+                f"skipping upload (frame not successfully decoded)"
+            )
             return None
 
         sonde_type = self._effective_type(telemetry)
@@ -437,6 +446,23 @@ class SondeHubOutput:
             )
         else:
             self.logger.debug(f"[SONDEHUB-PTU] {serial}: No environment data in telemetry object")
+
+        if telemetry.battery is not None:
+            payload['batt'] = round(float(telemetry.battery), 2)
+
+        # RS41-specific fields
+        if telemetry.burst_timer is not None:
+            payload['burst_timer'] = int(telemetry.burst_timer)
+        if telemetry.rs41_mainboard is not None:
+            payload['rs41_mainboard'] = str(telemetry.rs41_mainboard)
+        if telemetry.rs41_mainboard_fw is not None:
+            payload['rs41_mainboard_fw'] = int(telemetry.rs41_mainboard_fw)
+        if telemetry.ref_datetime is not None:
+            payload['ref_datetime'] = str(telemetry.ref_datetime)
+        if telemetry.ref_position is not None:
+            payload['ref_position'] = str(telemetry.ref_position)
+        if telemetry.tx_frequency is not None:
+            payload['tx_frequency'] = int(telemetry.tx_frequency)
 
         if telemetry.snr is not None:
             payload['snr'] = round(float(telemetry.snr), 2)

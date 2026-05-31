@@ -68,7 +68,22 @@ class SondeHubQueueOutput:
         self.logger = logging.getLogger('SondeHubQueueOutput')
 
         sh_cfg = config.get('sondehub', {})
-        self.enabled = bool(sh_cfg.get('enabled', False))
+        enabled_value = sh_cfg.get('enabled', False)
+        
+        # Handle enabled as boolean (true/false) or string "json" for payload logging
+        # enabled: true → self.enabled=True, self.log_json_only=False (upload to SondeHub)
+        # enabled: false → self.enabled=False, self.log_json_only=False (disabled)
+        # enabled: "json" → self.enabled=False, self.log_json_only=True (log to file, no upload)
+        if enabled_value == 'json' or enabled_value == "json":
+            self.log_json_only = True
+            self.enabled = False  # Not uploading to SondeHub
+        elif enabled_value:
+            self.log_json_only = False
+            self.enabled = True  # Upload to SondeHub
+        else:
+            self.log_json_only = False
+            self.enabled = False  # Completely disabled
+        
         self.upload_url = sh_cfg.get('upload_url', self.DEFAULT_UPLOAD_URL)
         self.listeners_url = sh_cfg.get('listeners_url', self.DEFAULT_LISTENERS_URL)
         self.upload_rate_s = max(1, int(sh_cfg.get('upload_rate_s', 1)))
@@ -96,8 +111,9 @@ class SondeHubQueueOutput:
         self.station_lon = sh_cfg.get('uploader_lon', station_cfg.get('lon'))
         self.station_alt = sh_cfg.get('uploader_alt', station_cfg.get('alt'))
 
-        self._last_subtype_by_serial: Dict[str, str] = {}
-        self._last_sats_by_serial: Dict[str, int] = {}
+        # JSON payload logging directory (used when enabled="json")
+        self.json_log_dir = './data/logs'
+
         self._lock = threading.Lock()
         self._last_listener_upload_t = 0.0
         self._last_flush_t = time.monotonic()
@@ -113,43 +129,57 @@ class SondeHubQueueOutput:
         self._last_upload_ok_t = 0.0
         self._last_upload_error = ''
 
-        if self.enabled:
-            try:
-                requests_module = importlib.import_module('requests')
-                self._session = requests_module.Session()
-            except ImportError:
-                self.logger.error("requests library not installed; SondeHub queue upload disabled")
-                self.enabled = False
-                return
+        if self.enabled or self.log_json_only:
+            # JSON logging mode doesn't need requests library
+            if self.enabled:  # Only need requests for actual upload
+                try:
+                    requests_module = importlib.import_module('requests')
+                    self._session = requests_module.Session()
+                except ImportError:
+                    self.logger.error("requests library not installed; SondeHub queue upload disabled")
+                    self.enabled = False
+                    return
 
-            self.logger.info(
-                f"SondeHub queue upload enabled -> {self.upload_url} "
-                f"(callsign={self.uploader_callsign}, flush_rate={self.upload_rate_s}s, "
-                f"listener_rate={self.listener_upload_interval_s}s, batch_max={self.queue_batch_max}, "
-                f"queue_max={self.queue_max_size})"
-            )
+            if self.log_json_only:
+                self.logger.info(
+                    f"SondeHub JSON logging mode enabled -> {self.json_log_dir}/<serial>.json "
+                    f"(payloads written to file, NOT uploaded to SondeHub)"
+                )
+            elif self.enabled:
+                self.logger.info(
+                    f"SondeHub queue upload enabled -> {self.upload_url} "
+                    f"(callsign={self.uploader_callsign}, flush_rate={self.upload_rate_s}s, "
+                    f"listener_rate={self.listener_upload_interval_s}s, batch_max={self.queue_batch_max}, "
+                    f"queue_max={self.queue_max_size})"
+                )
 
-            self._worker_thread = threading.Thread(
-                target=self._worker_loop,
-                daemon=True,
-                name='SondeHubQueueWorker',
-            )
-            self._worker_thread.start()
+            # Only start worker thread if actually uploading to SondeHub
+            if self.enabled:
+                self._worker_thread = threading.Thread(
+                    target=self._worker_loop,
+                    daemon=True,
+                    name='SondeHubQueueWorker',
+                )
+                self._worker_thread.start()
 
-            # Queue immediate listener metadata upload on startup.
-            timer = threading.Timer(0.5, self._upload_listener_metadata)
-            timer.daemon = True
-            timer.start()
+                # Queue immediate listener metadata upload on startup.
+                timer = threading.Timer(0.5, self._upload_listener_metadata)
+                timer.daemon = True
+                timer.start()
         else:
             self.logger.debug("SondeHub queue upload is disabled in configuration")
 
     def send_telemetry(self, telemetry: SondeTelemetry):
         """Queue a telemetry frame for SondeHub upload (non-blocking)."""
-        if not self.enabled:
+        if not self.enabled and not self.log_json_only:
             return
 
-        payload = self._build_payload(telemetry)
+        payload = self._build_payload(telemetry, strict=not self.log_json_only)
         if not payload:
+            return
+
+        if self.log_json_only:
+            self._write_json_log(payload)
             return
 
         try:
@@ -182,6 +212,14 @@ class SondeHubQueueOutput:
         """Return SondeHub queue upload status for health endpoints."""
         if not self.enabled:
             return {'status': 'disabled', 'mode': 'queue'}
+
+        if self.log_json_only:
+            return {
+                'status': 'json_logging',
+                'mode': 'json_log',
+                'log_dir': self.json_log_dir,
+                'note': 'Payloads written to file, NOT uploaded to SondeHub',
+            }
 
         with self._lock:
             queued = self._telemetry_queue.qsize()
@@ -293,22 +331,10 @@ class SondeHubQueueOutput:
 
     def _effective_subtype(self, telemetry: SondeTelemetry, serial: str) -> str:
         subtype = (telemetry.subtype or '').strip()
-        sonde_type = (telemetry.sonde_type or '').strip()
-
-        if not subtype and '-' in sonde_type:
-            subtype = sonde_type
-
-        if not subtype and sonde_type.upper() == 'RS41' and serial.upper().startswith('V'):
-            subtype = 'RS41-SGP'
-
+        sonde_type = self._effective_type(telemetry)
         if not subtype and sonde_type.upper() == 'RS41':
-            subtype = 'RS41'
-
-        with self._lock:
-            if subtype:
-                self._last_subtype_by_serial[serial] = subtype
-                return subtype
-            return self._last_subtype_by_serial.get(serial, '')
+            subtype = 'RS41-SGP' if serial.upper().startswith('V') else 'RS41'
+        return subtype
 
     def _normalize_sats(self, value) -> Optional[int]:
         if value is None:
@@ -319,26 +345,8 @@ class SondeHubQueueOutput:
             return None
         return sats_i if sats_i >= 0 else None
 
-    def _effective_sats(self, telemetry: SondeTelemetry, serial: str) -> Optional[int]:
-        candidate_values = [
-            getattr(telemetry, 'satellites', None),
-            getattr(telemetry, 'sats', None),
-        ]
-
-        try:
-            candidate_values.append(telemetry.to_dict().get('sats'))
-        except Exception:
-            pass
-
-        for candidate in candidate_values:
-            sats_i = self._normalize_sats(candidate)
-            if sats_i is not None:
-                with self._lock:
-                    self._last_sats_by_serial[serial] = sats_i
-                return sats_i
-
-        with self._lock:
-            return self._last_sats_by_serial.get(serial)
+    def _effective_sats(self, telemetry: SondeTelemetry) -> Optional[int]:
+        return self._normalize_sats(getattr(telemetry, 'satellites', None))
 
     def _uploader_position(self) -> Optional[list]:
         if self.station_lat is None or self.station_lon is None:
@@ -356,7 +364,7 @@ class SondeHubQueueOutput:
         Validate sonde serial format according to SondeHub requirements.
         
         RS41/RS92: Must start with A-Z followed by 7-8 digits (e.g., V1220530, S12345678)
-        DFM: Must start with 'D' followed by 8 digits (e.g., D12345678)
+        DFM: Must start with 'DFM-' followed by 8 digits (e.g., DFM-21065615)
         M10/M20: Must start with 'M' followed by 8-10 characters
         iMet: Must start with 'iMet' or 'IMET'
         LMS6: Starts with 'LMS'
@@ -376,9 +384,9 @@ class SondeHubQueueOutput:
         if sonde_type_upper in ('RS41', 'RS92'):
             return bool(re.match(r'^[A-Z][0-9]{7,8}$', serial))
         
-        # DFM: D[0-9]{8}
+        # DFM: DFM-[0-9]{8} (e.g., DFM-21065615)
         elif sonde_type_upper == 'DFM':
-            return bool(re.match(r'^D[0-9]{8}$', serial))
+            return bool(re.match(r'^DFM-[0-9]{8}$', serial))
         
         # M10/M20: M[0-9A-Z]{8,10}
         elif sonde_type_upper in ('M10', 'M20'):
@@ -406,30 +414,38 @@ class SondeHubQueueOutput:
         # Allow other types with alphanumeric serials
         return bool(re.match(r'^[A-Z0-9][A-Z0-9\-]{2,}$', serial, re.IGNORECASE))
 
-    def _build_payload(self, telemetry: SondeTelemetry) -> Optional[dict]:
+    def _build_payload(self, telemetry: SondeTelemetry, strict: bool = True) -> Optional[dict]:
+        """Build a SondeHub telemetry payload dict.
+
+        strict=True  – enforces serial validation; used for actual SondeHub uploads.
+        strict=False – accepts any serial (falls back to 'UNKNOWN'); used for JSON file logging.
+        """
         if not telemetry.position:
             return None
 
         serial = (telemetry.serial or '').strip()
-        if not serial or serial == 'UNKNOWN':
-            return None
+        if strict:
+            if not serial or serial == 'UNKNOWN':
+                return None
+        else:
+            if not serial:
+                serial = 'UNKNOWN'
 
         sonde_type = self._effective_type(telemetry)
-        
-        # Validate serial format before building payload
-        if not self._is_valid_serial(serial, sonde_type):
-            self.logger.warning(
-                f"[SONDEHUB-QUEUE] Invalid serial format: '{serial}' for {sonde_type}. "
-                f"Skipping upload (likely partial/corrupted decode). "
-                f"Valid formats: RS41=[A-Z][0-9]{{7-8}}, DFM=D[0-9]{{8}}"
-            )
-            return None
-        
-        subtype = self._effective_subtype(telemetry, serial)
-        sats = self._effective_sats(telemetry, serial)
 
-        if sonde_type.upper().startswith('DFM') and serial in ('UNKNOWN', ''):
-            return None
+        if strict:
+            if not self._is_valid_serial(serial, sonde_type):
+                self.logger.warning(
+                    f"[SONDEHUB-QUEUE] Invalid serial format: '{serial}' for {sonde_type}. "
+                    f"Skipping upload (likely partial/corrupted decode). "
+                    f"Valid formats: RS41=[A-Z][0-9]{{7-8}}, DFM=DFM-[0-9]{{8}}"
+                )
+                return None
+            if sonde_type.upper().startswith('DFM') and serial in ('UNKNOWN', ''):
+                return None
+
+        subtype = self._effective_subtype(telemetry, serial)
+        sats = self._effective_sats(telemetry)
 
         payload = {
             'software_name': self.software_name,
@@ -458,15 +474,33 @@ class SondeHubQueueOutput:
         if telemetry.velocity:
             payload['vel_h'] = round(float(telemetry.velocity.horizontal_speed), 2)
             payload['vel_v'] = round(float(telemetry.velocity.vertical_speed), 2)
-            payload['heading'] = round(float(telemetry.velocity.heading), 1)
+            if telemetry.velocity.heading is not None:
+                payload['heading'] = round(float(telemetry.velocity.heading), 1)
 
         if telemetry.environment:
             if telemetry.environment.temperature is not None:
-                payload['temp'] = round(float(telemetry.environment.temperature), 2)
+                payload['temp'] = round(float(telemetry.environment.temperature), 1)
             if telemetry.environment.humidity is not None:
-                payload['humidity'] = round(float(telemetry.environment.humidity), 2)
+                payload['humidity'] = round(float(telemetry.environment.humidity), 1)
             if telemetry.environment.pressure is not None:
                 payload['pressure'] = round(float(telemetry.environment.pressure), 2)
+
+        if telemetry.battery is not None:
+            payload['batt'] = round(float(telemetry.battery), 2)
+
+        # RS41-specific fields
+        if telemetry.burst_timer is not None:
+            payload['burst_timer'] = int(telemetry.burst_timer)
+        if telemetry.rs41_mainboard is not None:
+            payload['rs41_mainboard'] = str(telemetry.rs41_mainboard)
+        if telemetry.rs41_mainboard_fw is not None:
+            payload['rs41_mainboard_fw'] = int(telemetry.rs41_mainboard_fw)
+        if telemetry.ref_datetime is not None:
+            payload['ref_datetime'] = str(telemetry.ref_datetime)
+        if telemetry.ref_position is not None:
+            payload['ref_position'] = str(telemetry.ref_position)
+        if telemetry.tx_frequency is not None:
+            payload['tx_frequency'] = int(telemetry.tx_frequency)
 
         if telemetry.snr is not None:
             payload['snr'] = round(float(telemetry.snr), 2)
@@ -502,6 +536,24 @@ class SondeHubQueueOutput:
 
         base = min(5.0, 0.5 * (2 ** max(0, retries - 1)))
         return base + random.uniform(0.0, 0.25)
+
+    def _write_json_log(self, payload: dict):
+        """Write JSON payload to file (one JSON object per line) for SondeHub admin review."""
+        serial = payload.get('serial', 'UNKNOWN')
+        if serial == 'UNKNOWN':
+            return
+
+        try:
+            import os
+            os.makedirs(self.json_log_dir, exist_ok=True)
+            log_file = os.path.join(self.json_log_dir, f"{serial}.json")
+            
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(payload) + '\n')
+            
+            self.logger.debug(f"[SONDEHUB-JSON] Logged payload for {serial} to {log_file}")
+        except Exception as exc:
+            self.logger.error(f"[SONDEHUB-JSON] Failed to write JSON log: {type(exc).__name__}: {exc}")
 
     def _upload_payloads(self, payloads: list) -> bool:
         telem_json = json.dumps(payloads).encode('utf-8')

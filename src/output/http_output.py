@@ -162,6 +162,24 @@ class HttpOutput:
             if env.pressure is not None:
                 data['pressure'] = round(env.pressure,    2)
 
+        # Battery
+        if telemetry.battery is not None:
+            data['batt'] = round(telemetry.battery, 2)
+
+        # RS41-specific fields
+        if hasattr(telemetry, 'burst_timer') and telemetry.burst_timer is not None:
+            data['burst_timer'] = int(telemetry.burst_timer)
+        if hasattr(telemetry, 'rs41_mainboard') and telemetry.rs41_mainboard is not None:
+            data['rs41_mainboard'] = str(telemetry.rs41_mainboard)
+        if hasattr(telemetry, 'rs41_mainboard_fw') and telemetry.rs41_mainboard_fw is not None:
+            data['rs41_mainboard_fw'] = int(telemetry.rs41_mainboard_fw)
+        if hasattr(telemetry, 'ref_datetime') and telemetry.ref_datetime is not None:
+            data['ref_datetime'] = str(telemetry.ref_datetime)
+        if hasattr(telemetry, 'ref_position') and telemetry.ref_position is not None:
+            data['ref_position'] = str(telemetry.ref_position)
+        if hasattr(telemetry, 'tx_frequency') and telemetry.tx_frequency is not None:
+            data['tx_frequency'] = int(telemetry.tx_frequency)
+
         return data
 
     def _upload(self, telemetry: SondeTelemetry):

@@ -380,5 +380,23 @@ class MQTTOutput:
             except (TypeError, ValueError):
                 pass
 
+        # Battery
+        if telemetry.battery is not None:
+            payload['batt'] = round(telemetry.battery, 2)
+
+        # RS41-specific fields
+        if hasattr(telemetry, 'burst_timer') and telemetry.burst_timer is not None:
+            payload['burst_timer'] = int(telemetry.burst_timer)
+        if hasattr(telemetry, 'rs41_mainboard') and telemetry.rs41_mainboard is not None:
+            payload['rs41_mainboard'] = str(telemetry.rs41_mainboard)
+        if hasattr(telemetry, 'rs41_mainboard_fw') and telemetry.rs41_mainboard_fw is not None:
+            payload['rs41_mainboard_fw'] = int(telemetry.rs41_mainboard_fw)
+        if hasattr(telemetry, 'ref_datetime') and telemetry.ref_datetime is not None:
+            payload['ref_datetime'] = str(telemetry.ref_datetime)
+        if hasattr(telemetry, 'ref_position') and telemetry.ref_position is not None:
+            payload['ref_position'] = str(telemetry.ref_position)
+        if hasattr(telemetry, 'tx_frequency') and telemetry.tx_frequency is not None:
+            payload['tx_frequency'] = int(telemetry.tx_frequency)
+
         return payload
 
