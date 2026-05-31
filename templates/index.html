@@ -958,6 +958,48 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                                 sondePaths[sonde.serial + '_launch'] = launchMarker;
                             }
                         }
+
+                        // Add pop-marker at burst (ascent-to-descent) point
+                        if (sonde.path_vel_v && sonde.path_vel_v.length === sonde.path.length) {
+                            let negCount = 0;
+                            let popIndex = -1;
+                            for (let i = 0; i < sonde.path_vel_v.length; i++) {
+                                if (sonde.path_vel_v[i] < 0) {
+                                    negCount++;
+                                    if (negCount >= 3) {
+                                        popIndex = i - 2;
+                                        break;
+                                    }
+                                } else {
+                                    negCount = 0;
+                                }
+                            }
+                            if (popIndex > 0 && popIndex < sonde.path.length) {
+                                const popIcon = L.icon({
+                                    iconUrl: '/static/img/pop-marker.png',
+                                    iconSize: [24, 24],
+                                    iconAnchor: [12, 12]
+                                });
+                                const popPt = sonde.path[popIndex];
+                                const popAlt = sonde.path_alts ? sonde.path_alts[popIndex] : null;
+                                const popTime = sonde.path_times ? new Date(sonde.path_times[popIndex]).toISOString().slice(0, 19).replace('T', ' ') + ' UTC' : 'N/A';
+                                const popVel = sonde.path_vel_v[popIndex]?.toFixed(1) + ' m/s';
+                                const popMarker = L.marker([popPt[0], popPt[1]], { icon: popIcon }).addTo(map);
+                                popMarker.bindPopup(
+                                    `<b>Burst/Descent Start</b><br>${sonde.serial}<br>` +
+                                    `<small>` +
+                                    `${popPt[0].toFixed(5)}, ${popPt[1].toFixed(5)}<br>` +
+                                    `Alt: ${popAlt !== null ? popAlt + ' m' : 'N/A'}<br>` +
+                                    `Vel_v: ${popVel}<br>` +
+                                    `Time: ${popTime}` +
+                                    `</small>`
+                                );
+                                // Store pop marker with sonde
+                                if (!sondePaths[sonde.serial + '_pop']) {
+                                    sondePaths[sonde.serial + '_pop'] = popMarker;
+                                }
+                            }
+                        }
                     } else {
                         sondePaths[sonde.serial].setLatLngs(pathCoords);
                     }
@@ -1172,7 +1214,39 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
 
         function showAboutModal() {
             const modal = new bootstrap.Modal(document.getElementById('aboutModal'));
+            // Initialize with English by default
+            const currentLang = localStorage.getItem('aboutLanguage') || 'en';
+            setAboutLanguage(currentLang);
             modal.show();
+        }
+
+        function setAboutLanguage(lang) {
+            // Save preference
+            localStorage.setItem('aboutLanguage', lang);
+            
+            // Toggle content visibility
+            const enContent = document.getElementById('aboutContentEN');
+            const deContent = document.getElementById('aboutContentDE');
+            const enBtn = document.getElementById('langEN');
+            const deBtn = document.getElementById('langDE');
+            const titleEl = document.getElementById('aboutModalTitle');
+            const closeBtn = document.getElementById('aboutCloseBtn');
+            
+            if (lang === 'en') {
+                enContent.style.display = 'block';
+                deContent.style.display = 'none';
+                enBtn.classList.add('active');
+                deBtn.classList.remove('active');
+                titleEl.textContent = 'About OpenWXSDR';
+                closeBtn.textContent = 'Close';
+            } else {
+                enContent.style.display = 'none';
+                deContent.style.display = 'block';
+                enBtn.classList.remove('active');
+                deBtn.classList.add('active');
+                titleEl.textContent = 'Über OpenWXSDR';
+                closeBtn.textContent = 'Schließen';
+            }
         }
 
         function showDecoderSettingsModal() {
@@ -1767,48 +1841,99 @@ ${trkSegs}
         <div class="modal-dialog modal-lg">
             <div class="modal-content">
                 <div class="modal-header">
-                    <h5 class="modal-title"><i class="bi bi-info-circle"></i> &Uuml;ber OpenWXSDR</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    <h5 class="modal-title">
+                        <i class="bi bi-info-circle"></i> 
+                        <span id="aboutModalTitle">About OpenWXSDR</span>
+                    </h5>
+                    <div class="d-flex align-items-center ms-auto">
+                        <div class="btn-group btn-group-sm me-2">
+                            <button type="button" class="btn btn-outline-secondary" id="langEN" onclick="setAboutLanguage('en')">EN</button>
+                            <button type="button" class="btn btn-outline-secondary" id="langDE" onclick="setAboutLanguage('de')">DE</button>
+                        </div>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
                 </div>
                 <div class="modal-body">
-                    <h6 class="mb-3">Systeminformationen</h6>
-                    <table class="table table-bordered table-sm mb-4">
-                        <tbody>
-                            <tr><th style="width:35%">Anwendung</th><td>OpenWX.de Radiosonden-Tracking-System (SDR Gateway)</td></tr>
-                            <tr><th>Version</th><td>V{{ version }} (Release)</td></tr>
-                            <tr><th>Station</th><td>{{ callsign }}</td></tr>
-                            <tr><th>Build-Datum</th><td>2026-05-06</td></tr>
-                        </tbody>
-                    </table>
+                    <!-- English Content -->
+                    <div id="aboutContentEN" style="display:none;">
+                        <h6 class="mb-3">System Information</h6>
+                        <table class="table table-bordered table-sm mb-4">
+                            <tbody>
+                                <tr><th style="width:35%">Application</th><td>OpenWX.de Radiosonde Tracking System (SDR Gateway)</td></tr>
+                                <tr><th>Version</th><td>V{{ version }} (Release)</td></tr>
+                                <tr><th>Station</th><td>{{ callsign }}</td></tr>
+                                <tr><th>Build Date</th><td>2026-05-06</td></tr>
+                            </tbody>
+                        </table>
 
-                    <h6 class="mb-2">Beschreibung</h6>
-                    <p class="small">OpenWXSDR ist ein Echtzeit-Radiosonden-Empfangs- und Dekodiersystem f&uuml;r Amateurfunk-Enthusiasten. Das System empf&auml;ngt Radiosondensignale &uuml;ber RTL-SDR-Hardware und dekodiert die Telemetriedaten in Echtzeit.</p>
+                        <h6 class="mb-2">Description</h6>
+                        <p class="small">OpenWXSDR is a real-time radiosonde reception and decoding system for amateur radio enthusiasts. The system receives radiosonde signals via RTL-SDR hardware and decodes telemetry data in real-time.</p>
 
-                    <h6 class="mb-2">Hauptmerkmale</h6>
-                    <ul class="small">
-                        <li><i class="bi bi-geo-alt text-primary"></i> Echtzeit-Radiosonden-Tracking mit Live-Kartenanzeige</li>
-                        <li><i class="bi bi-broadcast text-primary"></i> Unterst&uuml;tzung mehrerer RTL-SDR-Ger&auml;te gleichzeitig</li>
-                        <li><i class="bi bi-wifi text-primary"></i> MQTT- und HTTP-Upload zu OpenWX.de</li>
-                        <li><i class="bi bi-reception-4 text-primary"></i> Automatische Frequenzsuche und Sondenerkennung</li>
-                        <li><i class="bi bi-file-earmark-code text-primary"></i> RS41, RS92, DFM, M10, M20 und weitere Sondentypen</li>
-                    </ul>
+                        <h6 class="mb-2">Key Features</h6>
+                        <ul class="small">
+                            <li><i class="bi bi-geo-alt text-primary"></i> Real-time radiosonde tracking with live map display</li>
+                            <li><i class="bi bi-broadcast text-primary"></i> Support for multiple RTL-SDR devices simultaneously</li>
+                            <li><i class="bi bi-wifi text-primary"></i> MQTT and HTTP upload to OpenWX.de</li>
+                            <li><i class="bi bi-reception-4 text-primary"></i> Automatic frequency scanning and sonde detection</li>
+                            <li><i class="bi bi-file-earmark-code text-primary"></i> RS41, RS92, DFM, M10, M20 and other sonde types</li>
+                        </ul>
 
-                    <h6 class="mb-2">Copyright &amp; Lizenz</h6>
-                    <p class="small"><strong>Copyright &copy; 2025-2026 by DL2MF</strong><br>
-                    Diese Software wird unter der GNU General Public License v2.0 oder sp&auml;ter vertrieben.</p>
+                        <h6 class="mb-2">Copyright &amp; License</h6>
+                        <p class="small"><strong>Copyright &copy; 2025-2026 by DL2MF</strong><br>
+                        This software is distributed under the GNU General Public License v2.0 or later.</p>
 
-                    <h6 class="mb-2">Kontakt &amp; Support</h6>
-                    <p class="small mb-0">
-                        <i class="bi bi-envelope"></i> E-Mail: <a href="mailto:dl2mf@darc.de">dl2mf@darc.de</a><br>
-                        <i class="bi bi-globe"></i> Website: <a href="https://openwx.de" target="_blank">openwx.de</a>
-                    </p>
+                        <h6 class="mb-2">Contact &amp; Support</h6>
+                        <p class="small mb-0">
+                            <i class="bi bi-envelope"></i> E-Mail: <a href="mailto:dl2mf@darc.de">dl2mf@darc.de</a><br>
+                            <i class="bi bi-globe"></i> Website: <a href="https://openwx.de" target="_blank">openwx.de</a>
+                        </p>
 
-                    <div class="alert alert-danger border-0 mt-3 mb-0 py-2 small text-center" style="background: rgba(220,53,69,0.08);">
-                        <i class="bi bi-heart-fill text-danger"></i> Mit Liebe f&uuml;r die Amateurfunk-Community erstellt
+                        <div class="alert alert-danger border-0 mt-3 mb-0 py-2 small text-center" style="background: rgba(220,53,69,0.08);">
+                            <i class="bi bi-heart-fill text-danger"></i> Made with love for the amateur radio community
+                        </div>
+                    </div>
+
+                    <!-- German Content -->
+                    <div id="aboutContentDE" style="display:none;">
+                        <h6 class="mb-3">Systeminformationen</h6>
+                        <table class="table table-bordered table-sm mb-4">
+                            <tbody>
+                                <tr><th style="width:35%">Anwendung</th><td>OpenWX.de Radiosonden-Tracking-System (SDR Gateway)</td></tr>
+                                <tr><th>Version</th><td>V{{ version }} (Release)</td></tr>
+                                <tr><th>Station</th><td>{{ callsign }}</td></tr>
+                                <tr><th>Build-Datum</th><td>2026-05-06</td></tr>
+                            </tbody>
+                        </table>
+
+                        <h6 class="mb-2">Beschreibung</h6>
+                        <p class="small">OpenWXSDR ist ein Echtzeit-Radiosonden-Empfangs- und Dekodiersystem f&uuml;r Amateurfunk-Enthusiasten. Das System empf&auml;ngt Radiosondensignale &uuml;ber RTL-SDR-Hardware und dekodiert die Telemetriedaten in Echtzeit.</p>
+
+                        <h6 class="mb-2">Hauptmerkmale</h6>
+                        <ul class="small">
+                            <li><i class="bi bi-geo-alt text-primary"></i> Echtzeit-Radiosonden-Tracking mit Live-Kartenanzeige</li>
+                            <li><i class="bi bi-broadcast text-primary"></i> Unterst&uuml;tzung mehrerer RTL-SDR-Ger&auml;te gleichzeitig</li>
+                            <li><i class="bi bi-wifi text-primary"></i> MQTT- und HTTP-Upload zu OpenWX.de</li>
+                            <li><i class="bi bi-reception-4 text-primary"></i> Automatische Frequenzsuche und Sondenerkennung</li>
+                            <li><i class="bi bi-file-earmark-code text-primary"></i> RS41, RS92, DFM, M10, M20 und weitere Sondentypen</li>
+                        </ul>
+
+                        <h6 class="mb-2">Copyright &amp; Lizenz</h6>
+                        <p class="small"><strong>Copyright &copy; 2025-2026 by DL2MF</strong><br>
+                        Diese Software wird unter der GNU General Public License v2.0 oder sp&auml;ter vertrieben.</p>
+
+                        <h6 class="mb-2">Kontakt &amp; Support</h6>
+                        <p class="small mb-0">
+                            <i class="bi bi-envelope"></i> E-Mail: <a href="mailto:dl2mf@darc.de">dl2mf@darc.de</a><br>
+                            <i class="bi bi-globe"></i> Website: <a href="https://openwx.de" target="_blank">openwx.de</a>
+                        </p>
+
+                        <div class="alert alert-danger border-0 mt-3 mb-0 py-2 small text-center" style="background: rgba(220,53,69,0.08);">
+                            <i class="bi bi-heart-fill text-danger"></i> Mit Liebe f&uuml;r die Amateurfunk-Community erstellt
+                        </div>
                     </div>
                 </div>
                 <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Schlie&szlig;en</button>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" id="aboutCloseBtn">Close</button>
                 </div>
             </div>
         </div>
