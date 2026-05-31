@@ -734,15 +734,8 @@ class DecoderManager:
                 available_keys = [k for k in frame_data.keys() if k in ('sats', 'lat', 'lon', 'alt', 'velocity_horizontal')]
                 self.logger.debug(f"[TELEMETRY] {sonde_id}: No sats field (available: {available_keys})")
             
-            # Parse frame number from raw line
-            frame_number = 0
-            raw_line = frame_data.get('raw_line', '')
-            if '[' in raw_line and ']' in raw_line:
-                try:
-                    frame_str = raw_line[raw_line.find('[')+1:raw_line.find(']')].strip()
-                    frame_number = int(frame_str)
-                except:
-                    pass
+            # Frame number comes directly from the decoder JSON
+            frame_number = frame_data.get('frame_number', 0)
             
             # Create position if we have coordinates
             position = None
@@ -751,7 +744,7 @@ class DecoderManager:
                     latitude=frame_data['lat'],
                     longitude=frame_data['lon'],
                     altitude=frame_data['alt'],
-                    datetime=datetime.utcnow()  # Use UTC to match web UI expectations
+                    datetime=frame_data.get('decoded_datetime') or datetime.utcnow()
                 )
             
             # Create velocity if we have speed data
@@ -789,6 +782,13 @@ class DecoderManager:
                 snr=snr_db,
                 rssi=rssi_db,
                 satellites=frame_data.get('sats'),
+                battery=frame_data.get('battery'),  # Battery voltage
+                burst_timer=frame_data.get('burst_timer'),  # RS41 burst timer
+                rs41_mainboard=frame_data.get('rs41_mainboard'),  # RS41 mainboard type
+                rs41_mainboard_fw=frame_data.get('rs41_mainboard_fw'),  # RS41 mainboard FW
+                ref_datetime=frame_data.get('ref_datetime'),  # RS41 datetime reference
+                ref_position=frame_data.get('ref_position'),  # RS41 position reference
+                tx_frequency=frame_data.get('tx_frequency'),  # Transmit frequency (Hz)
                 timestamp=datetime.utcnow(),  # Use UTC to match web UI expectations
                 decoder_name='rs41mod',
                 decoder_version='rs1729'

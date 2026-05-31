@@ -44,6 +44,7 @@
 
 import shutil
 import subprocess
+import json
 import logging
 import threading
 import time
@@ -115,8 +116,6 @@ class RS1729Decoder:
         self.last_frame_time: Optional[datetime] = None
         self.frame_count = 0
         self._start_time: Optional[float] = None
-        self._latest_fields: dict = {}
-        self._latest_fields_time: Optional[float] = None
     
     def set_frame_callback(self, callback: Callable[[dict], None]):
         """Set callback for decoded frames"""
@@ -139,32 +138,30 @@ class RS1729Decoder:
         try:
             # Build decoder command based on sonde type
             # Different decoders have different command-line options
+            # NOTE: RS/demod/mod decoders (rs41mod, dfm09mod) support --json with full telemetry
             cmd = [self.decoder_path]
             
             # Add decoder-specific flags
             if self.sonde_type == 'RS41':
-                # RS41: rs41mod -v --ptu2 --sat --IQ 0.0 - 48000 16
-                # --sat adds GPS satellite count to each output line as (N)
-                # NOTE: --ptu2 should output T=...C, P=...hPa, RH=...% lines
-                cmd.extend(['-v', '--ptu2', '--sat', '--IQ', '0.0', '-', '48000', '16'])
+                # RS41: rs41mod (from RS/demod/mod) supports --json output
+                # -v: verbose, --ptu2: PTU sensor data, --sat: satellite count
+                # --json: JSON output with full telemetry
+                cmd.extend(['-v', '--ptu2', '--sat', '--json', '--IQ', '0.0', '-', '48000', '16'])
             elif self.sonde_type == 'DFM':
                 # DFM: dfm09mod -i -vv --IQ 0.0 --ecc --json --dist --ptu - 48000 16
-                cmd.extend(['-i', '-vv', '--IQ', '0.0', '--ecc', '--json', '--dist', '--ptu', '-', '48000', '16'])
+                # DFM decoder reliably supports --json with full telemetry
+                # -ID flag shows actual serial (without it, serial is masked as "xxxxxxxx")
+                cmd.extend(['-i', '-vv', '-ID', '--IQ', '0.0', '--ecc', '--json', '--dist', '--ptu', '-', '48000', '16'])
             elif self.sonde_type == 'M10':
-                # M10: m10mod -v --IQ 0.0 - 48000 16
-                cmd.extend(['-v', '--IQ', '0.0', '-', '48000', '16'])
+                cmd.extend(['-v', '--json', '--IQ', '0.0', '-', '48000', '16'])
             elif self.sonde_type == 'RS92':
-                # RS92: rs92mod -v --IQ 0.0 - 48000 16
-                cmd.extend(['-v', '--IQ', '0.0', '-', '48000', '16'])
+                cmd.extend(['-v', '--json', '--IQ', '0.0', '-', '48000', '16'])
             elif self.sonde_type == 'M20':
-                # M20: m20mod -v --IQ 0.0 - 48000 16
-                cmd.extend(['-v', '--IQ', '0.0', '-', '48000', '16'])
+                cmd.extend(['-v', '--json', '--IQ', '0.0', '-', '48000', '16'])
             elif self.sonde_type == 'iMet':
-                # iMet: imet54mod -v --IQ 0.0 - 48000 16
-                cmd.extend(['-v', '--IQ', '0.0', '-', '48000', '16'])
+                cmd.extend(['-v', '--json', '--IQ', '0.0', '-', '48000', '16'])
             else:
-                # Default: assume RS41-like syntax
-                cmd.extend(['-v', '--ptu2', '--IQ', '0.0', '-', '48000', '16'])
+                cmd.extend(['-v', '--json', '--IQ', '0.0', '-', '48000', '16'])
             
             # Wrap with stdbuf (if available) to force line-buffered stdout on the
             # child process.  Without this, libc switches to 8 KB block-buffering
@@ -274,7 +271,12 @@ class RS1729Decoder:
         }
     
     def _monitor_stdout(self):
-        """Monitor decoder stdout for frame data"""
+        """Monitor decoder stdout for frame data.
+
+        All supported decoders are started with --json, so every decoded frame
+        arrives as a single JSON object on stdout.  TEXT lines (e.g. the verbose
+        copy that rs41mod also writes) are logged for diagnostics only.
+        """
         if not self.process or not self.process.stdout:
             return
 
@@ -283,36 +285,32 @@ class RS1729Decoder:
                 if not self.running:
                     break
 
-                # stdout is binary (bufsize=0, universal_newlines=False)
                 if isinstance(raw_line, bytes):
                     line = raw_line.decode('utf-8', errors='replace').strip()
                 else:
                     line = raw_line.strip()
                 if not line:
                     continue
-                
-                # Check for frame data (rs41mod outputs lines with frame info)
-                # Example: "[   20] (DL2MF-11)  Sat 2026-05-02 07:19:05.000  lat: 48.1234 ..."
-                if line.startswith('[') and ']' in line:
-                    self.frame_count += 1
-                    self.last_frame_time = datetime.now()
-                    self.logger.info(f"Frame {self.frame_count}: {line}")
 
-                    # Parse and callback if handler registered
-                    if self.frame_callback:
-                        try:
-                            frame_data = self._parse_frame(line)
-                            frame_data = self._merge_latest_fields(frame_data)
-                            if frame_data:
-                                self.frame_callback(frame_data)
-                        except Exception as e:
-                            self.logger.error(f"Error in frame callback: {e}")
+                if line.startswith('{'):
+                    # Primary frame source: JSON output from --json flag
+                    self.logger.debug(f"Decoder JSON: {line}")
+                    try:
+                        json_data = json.loads(line)
+                        frame_data = self._parse_json_frame(json_data)
+                        if frame_data and self.frame_callback:
+                            self.frame_count += 1
+                            self.last_frame_time = datetime.now()
+                            self.frame_callback(frame_data)
+                    except (json.JSONDecodeError, Exception) as e:
+                        self.logger.debug(f"Could not parse JSON decoder line: {e}")
                 else:
-                    self._update_latest_fields(line)
-                    # Log all other decoder stdout at DEBUG (verbose GPS/satellite data)
-                    # This prevents log spam when debug mode is off
-                    self.logger.debug(f"Decoder stdout: {line}")
-        
+                    # TEXT / verbose lines – log for diagnostics, not used for frame data
+                    if line.startswith('[') and ']' in line:
+                        self.logger.info(f"Decoder: {line}")
+                    else:
+                        self.logger.debug(f"Decoder: {line}")
+
         except Exception as e:
             if self.running:
                 self.logger.error(f"Error monitoring decoder stdout: {e}")
@@ -342,241 +340,84 @@ class RS1729Decoder:
             if self.running:
                 self.logger.error(f"Error monitoring decoder stderr: {e}")
     
-    def _parse_frame(self, line: str) -> Optional[dict]:
+    def _parse_json_frame(self, json_data: dict) -> Optional[dict]:
+        """Build a normalised frame_data dict from a decoder JSON object.
+
+        Validates the required fields (id, lat, lon, alt, frame) and maps
+        the decoder's key names to the internal names expected by
+        decoder_manager._on_frame_decoded().
+
+        Returns None if any required field is missing or invalid.
         """
-        Parse frame data from decoder output
-        
-        Args:
-            line: Output line from decoder
-            
-        Returns:
-            Dictionary with frame data or None
-        """
-        try:
-            # First try to parse as JSON (if --json flag was used)
-            if line.strip().startswith('{'):
-                import json
-                try:
-                    json_data = json.loads(line)
-                    frame = {
-                        'raw_line': line,
-                        'frequency': self.frequency,
-                        'timestamp': datetime.now().isoformat(),
-                        'sonde_id': json_data.get('id', 'UNKNOWN'),
-                        'sonde_type': json_data.get('type', self.sonde_type),
-                        'subtype': json_data.get('subtype'),  # e.g., "0xC:DFM17"
-                        'lat': json_data.get('lat'),
-                        'lon': json_data.get('lon'),
-                        'alt': json_data.get('alt'),
-                        'velocity_horizontal': json_data.get('vel_h'),
-                        'velocity_vertical': json_data.get('vel_v'),
-                        'heading': json_data.get('heading'),
-                        'temp': json_data.get('temp'),
-                        'humidity': json_data.get('humidity'),
-                        'pressure': json_data.get('pressure'),
-                        'battery': json_data.get('batt'),
-                        'sats': json_data.get('sats')
-                    }
-                    return frame
-                except json.JSONDecodeError:
-                    pass  # Fall through to text parsing
-            
-            # Parse text format
-            # Example RS41: "[   20] (DL2MF-11)  Sat 2026-05-02 07:19:05.000  lat: 48.1234  lon: 11.5678  alt: 123.45   vH:  5.0  D: 270.0  vV: 2.5"
-            # Example DFM: "[225] 2026-05-04 16:32:44.0 (0,0,0)   lat: 53.07775 (0)   lon: 10.69429 (0)   alt: 12674.2 (0)   vH: 17.21  D:  77.5  vV: -5.45   T=-55.1C  (IDxC:23030665:DFM17)"
-            
-            frame = {
-                'raw_line': line,
-                'frequency': self.frequency,
-                'timestamp': datetime.now().isoformat(),
-                'sonde_type': self.sonde_type
-            }
-            
-            # Extract sonde ID - for DFM, look for (IDxC:serial:type) pattern first
-            if '(IDxC:' in line or '(ID' in line:
-                # DFM format: (IDxC:23030665:DFM17)
-                import re
-                id_match = re.search(r'\(ID[^:]*:(\d+):([^)]+)\)', line)
-                if id_match:
-                    serial = id_match.group(1)
-                    subtype = id_match.group(2)
-                    frame['sonde_id'] = f"{self.sonde_type}-{serial}"
-                    frame['subtype'] = subtype
-            
-            # If no special ID found, try standard parentheses format
-            if 'sonde_id' not in frame and '(' in line and ')' in line:
-                start = line.find('(') + 1
-                end = line.find(')', start)
-                sonde_id = line[start:end]
-                # Skip if it's just coordinates like (0,0,0)
-                if ',' not in sonde_id:
-                    frame['sonde_id'] = sonde_id
-
-            # RS41 subtype/model may appear near end of line, e.g.
-            # ": RS41-SGP : RSM421". Capture subtype for SondeHub mapping.
-            import re
-            rs41_subtype_match = re.search(r':\s*(RS41-[A-Z0-9]+)\s*:', line)
-            if rs41_subtype_match:
-                frame['subtype'] = rs41_subtype_match.group(1)
-                frame['sonde_type'] = 'RS41'
-
-            rs41_model_match = re.search(r':\s*RS41-[A-Z0-9]+\s*:\s*([A-Z0-9]+)\s*$', line)
-            if rs41_model_match:
-                frame['rs41_model'] = rs41_model_match.group(1)
-
-            # Parse optional PTU/satellite fields commonly present in rs41mod text output.
-            temp_match = re.search(r'\bT=\s*(-?\d+(?:\.\d+)?)C\b', line)
-            if temp_match:
-                frame['temp'] = float(temp_match.group(1))
-                self.logger.debug(f"[PTU] Parsed temp={frame['temp']}°C from frame line")
-
-            pressure_match = re.search(r'\bP=\s*(-?\d+(?:\.\d+)?)hPa\b', line)
-            if pressure_match:
-                frame['pressure'] = float(pressure_match.group(1))
-                self.logger.debug(f"[PTU] Parsed pressure={frame['pressure']}hPa from frame line")
-
-            humidity_match = re.search(r'\bRH\d*=\s*(-?\d+(?:\.\d+)?)%\b', line)
-            if humidity_match:
-                frame['humidity'] = float(humidity_match.group(1))
-                self.logger.debug(f"[PTU] Parsed humidity={frame['humidity']}% from frame line")
-
-            # rs41mod may report GPS SV count as '(23)', sometimes followed by
-            # extra decoder annotations such as ': fq 405700' or ': cd 223.5min'.
-            sats_match = re.search(r'\bRH\d*=\s*-?\d+(?:\.\d+)?%\s+\((\d{1,2})\)(?:\s*:\s*.*)?$', line)
-            if not sats_match:
-                sats_match = re.search(r'\((\d{1,2})\)(?:\s*:\s*.*)?$', line)
-            if sats_match:
-                frame['sats'] = int(sats_match.group(1))
-            
-            # Extract coordinates and altitude
-            parts = line.split()
-            for i, part in enumerate(parts):
-                if part == 'lat:' and i + 1 < len(parts):
-                    try:
-                        frame['lat'] = float(parts[i + 1])
-                    except:
-                        pass
-                elif part == 'lon:' and i + 1 < len(parts):
-                    try:
-                        frame['lon'] = float(parts[i + 1])
-                    except:
-                        pass
-                elif part == 'alt:' and i + 1 < len(parts):
-                    try:
-                        frame['alt'] = float(parts[i + 1])
-                    except:
-                        pass
-                elif part == 'vH:' and i + 1 < len(parts):
-                    try:
-                        frame['velocity_horizontal'] = float(parts[i + 1])
-                    except:
-                        pass
-                elif part == 'vV:' and i + 1 < len(parts):
-                    try:
-                        frame['velocity_vertical'] = float(parts[i + 1])
-                    except:
-                        pass
-                elif part == 'D:' and i + 1 < len(parts):
-                    try:
-                        frame['heading'] = float(parts[i + 1])
-                    except:
-                        pass
-            
-            return frame
-            
-        except Exception as e:
-            self.logger.debug(f"Could not parse frame: {e}")
+        sonde_id = str(json_data.get('id') or json_data.get('serial') or '').strip()
+        if not sonde_id:
+            self.logger.debug("Skipping JSON frame: missing 'id' field")
             return None
 
-    def _update_latest_fields(self, line: str):
-        """Parse non-frame stdout lines and cache latest telemetry fields."""
-        try:
-            # Log raw line for PTU debugging if it might contain PTU data
-            if any(pattern in line for pattern in ['T=', 'P=', 'RH', 'temp', 'pres', 'hum']):
-                self.logger.info(f"[PTU-RAW] Potential PTU line: {line}")
-            
-            updated = {}
+        lat = json_data.get('lat')
+        lon = json_data.get('lon')
+        alt = json_data.get('alt')
+        frame_num = json_data.get('frame')
+        if lat is None or lon is None or alt is None or frame_num is None:
+            self.logger.debug(f"Skipping JSON frame for {sonde_id}: missing lat/lon/alt/frame")
+            return None
 
-            # Example: "lat: 51.49438  lon: 7.41763  alt: 23699.61   vH:  1.9  D:  10.3  vV: 4.5"
-            pos_match = re.search(
-                r'lat:\s*(-?\d+(?:\.\d+)?)\s+lon:\s*(-?\d+(?:\.\d+)?)\s+alt:\s*(-?\d+(?:\.\d+)?)',
-                line
-            )
-            if pos_match:
-                updated['lat'] = float(pos_match.group(1))
-                updated['lon'] = float(pos_match.group(2))
-                updated['alt'] = float(pos_match.group(3))
+        sonde_type = str(json_data.get('type') or self.sonde_type).strip().upper()
 
-            vh_match = re.search(r'\bvH:\s*(-?\d+(?:\.\d+)?)', line)
-            if vh_match:
-                updated['velocity_horizontal'] = float(vh_match.group(1))
+        # DFM serials arrive as plain digits – normalise to "DFM-<serial>"
+        if 'DFM' in sonde_type and sonde_id.lstrip('D').isdigit():
+            sonde_id = f"DFM-{sonde_id.lstrip('D')}"
 
-            vv_match = re.search(r'\bvV:\s*(-?\d+(?:\.\d+)?)', line)
-            if vv_match:
-                updated['velocity_vertical'] = float(vv_match.group(1))
+        # GPS datetime from decoder (naive UTC)
+        decoded_datetime = None
+        dt_raw = json_data.get('datetime')
+        if dt_raw:
+            try:
+                dt_str = dt_raw.rstrip('Z')
+                fmt = '%Y-%m-%dT%H:%M:%S.%f' if '.' in dt_str else '%Y-%m-%dT%H:%M:%S'
+                decoded_datetime = datetime.strptime(dt_str, fmt)
+            except Exception:
+                pass
 
-            heading_match = re.search(r'\bD:\s*(-?\d+(?:\.\d+)?)', line)
-            if heading_match:
-                updated['heading'] = float(heading_match.group(1))
+        frame_data: dict = {
+            'sonde_id':   sonde_id,
+            'sonde_type': sonde_type,
+            'frame_number': int(frame_num),
+            'frequency':  self.frequency,
+            'lat':  float(lat),
+            'lon':  float(lon),
+            'alt':  float(alt),
+            'decoded_datetime': decoded_datetime,
+        }
 
-            # Example: "numSatsFix: 10  sAcc: 0.1  pDOP: 1.3"
-            sats_fix_match = re.search(r'\bnumSatsFix:\s*(\d+)', line)
-            if sats_fix_match:
-                sats_val = int(sats_fix_match.group(1))
-                updated['sats'] = sats_val
-                self.logger.debug(f"Parsed numSatsFix: {sats_val} from line: {line}")
+        # Optional fields – only include when present in this JSON frame
+        for src, dst, cast in [
+            ('vel_h',            'velocity_horizontal', float),
+            ('vel_v',            'velocity_vertical',   float),
+            ('heading',          'heading',             float),
+            ('sats',             'sats',                int),
+            ('batt',             'battery',             float),
+            ('bt',               'burst_timer',         int),
+            ('subtype',          'subtype',             str),
+            ('rs41_mainboard',   'rs41_mainboard',      str),
+            ('rs41_mainboard_fw','rs41_mainboard_fw',   int),
+            ('tx_frequency',     'tx_frequency',        int),
+            ('ref_datetime',     'ref_datetime',        str),
+            ('ref_position',     'ref_position',        str),
+            ('temp',             'temp',                float),
+            ('pressure',         'pressure',            float),
+            ('humidity',         'humidity',            float),
+        ]:
+            v = json_data.get(src)
+            if v is not None:
+                try:
+                    frame_data[dst] = cast(v)
+                except (TypeError, ValueError):
+                    pass
 
-            temp_match = re.search(r'\bT=\s*(-?\d+(?:\.\d+)?)C\b', line)
-            if temp_match:
-                updated['temp'] = float(temp_match.group(1))
-                self.logger.debug(f"[PTU] Parsed temp={updated['temp']}°C from aux line")
-
-            pressure_match = re.search(r'\bP=\s*(-?\d+(?:\.\d+)?)hPa\b', line)
-            if pressure_match:
-                updated['pressure'] = float(pressure_match.group(1))
-                self.logger.debug(f"[PTU] Parsed pressure={updated['pressure']}hPa from aux line")
-
-            humidity_match = re.search(r'\bRH\d*=\s*(-?\d+(?:\.\d+)?)%\b', line)
-            if humidity_match:
-                updated['humidity'] = float(humidity_match.group(1))
-                self.logger.debug(f"[PTU] Parsed humidity={updated['humidity']}% from aux line")
-
-            if updated:
-                old_sats = self._latest_fields.get('sats')
-                self._latest_fields.update(updated)
-                self._latest_fields_time = time.time()
-                if 'sats' in updated and updated['sats'] != old_sats:
-                    self.logger.info(f"[SATS_UPDATE] Updated sats: {old_sats} -> {updated['sats']}")
-        except Exception as e:
-            self.logger.debug(f"Could not parse auxiliary decoder line: {e}")
-
-    def _merge_latest_fields(self, frame_data: Optional[dict]) -> Optional[dict]:
-        """Merge recently-seen non-frame fields into a parsed frame."""
-        if not frame_data:
-            return frame_data
-
-        sonde_id = frame_data.get('sonde_id', '?')
-        
-        # Keep side-channel telemetry only while fresh to avoid stale carry-over.
-        if not self._latest_fields or not self._latest_fields_time:
-            self.logger.debug(f"[MERGE] {sonde_id}: No latest fields available")
-            return frame_data
-        age_s = time.time() - self._latest_fields_time
-        if age_s > 15:
-            self.logger.debug(f"[MERGE] {sonde_id}: latest fields too old ({age_s:.1f}s > 15s)")
-            return frame_data
-
-        merged_keys = []
-        for key, value in self._latest_fields.items():
-            if key not in frame_data and value is not None:
-                frame_data[key] = value
-                merged_keys.append(f"{key}={value}")
-
-        if merged_keys:
-            self.logger.info(f"[MERGE] {sonde_id}: Added fields: {', '.join(merged_keys)}")
-        
-        # Log if sats is missing
-        if 'sats' not in frame_data:
-            self.logger.debug(f"[MERGE] {sonde_id}: sats not available (fields: {list(self._latest_fields.keys())})")
-
+        self.logger.debug(
+            f"[JSON] {sonde_id} frame={frame_num} lat={lat:.5f} lon={lon:.5f} "
+            f"alt={float(alt):.1f} sats={frame_data.get('sats')} "
+            f"batt={frame_data.get('battery')} bt={frame_data.get('burst_timer')}"
+        )
         return frame_data

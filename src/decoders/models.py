@@ -26,13 +26,13 @@
 #  Shared data model definitions for OpenWX radiosonde telemetry.
 #
 #  Defines the canonical Python dataclasses used across the entire OpenWX
-#  pipeline — from decoder output parsing through output plugins to the
-#  web UI — ensuring a consistent, type-safe telemetry representation.
+#  pipeline - from decoder output parsing through output plugins to the
+#  web UI - ensuring a consistent, type-safe telemetry representation.
 #
 #  Dataclasses:
 #    SondePosition    : GPS fix (latitude, longitude, altitude MSL, datetime)
 #    SondeVelocity    : Horizontal speed (m/s), vertical speed (m/s), heading
-#    SondeEnvironment : Optional PTU sensor data (temp °C, humidity %, pressure hPa)
+#    SondeEnvironment : Optional PTU sensor data (temp C, humidity %, pressure hPa)
 #    SondeTelemetry   : Full frame container aggregating all of the above,
 #                       plus identity (type, serial, subtype), RF reception
 #                       metrics (frequency, SNR, RSSI, satellite count), and
@@ -92,6 +92,15 @@ class SondeTelemetry:
     snr: float = 0.0        # dB
     rssi: float = 0.0       # dBm
     satellites: Optional[int] = None  # GPS SVs used
+    battery: Optional[float] = None  # Battery voltage
+    
+    # RS41-specific fields
+    burst_timer: Optional[int] = None  # RS41 burst timer (seconds)
+    rs41_mainboard: Optional[str] = None  # RS41 mainboard type (e.g., "RSM424")
+    rs41_mainboard_fw: Optional[int] = None  # RS41 mainboard firmware version
+    ref_datetime: Optional[str] = None  # RS41 datetime reference (e.g., "GPS")
+    ref_position: Optional[str] = None  # RS41 position reference (e.g., "GPS")
+    tx_frequency: Optional[int] = None  # Transmit frequency in Hz (from decoder)
     
     # Metadata
     timestamp: datetime = field(default_factory=datetime.utcnow)
