@@ -1,7 +1,47 @@
 #!/usr/bin/env python3
 """
-OpenWXSDR - Main Entry Point
-Streamlined Radiosonde Decoder Framework
+# =============================================================================
+#  OpenWX -- Open Weather Radiosonde Telemetry System
+# =============================================================================
+#
+#  File   : openwxsdr.py - Main Entry Point
+#  Author : M.F. Guenther, DL2MF - DL2MF@darc.de
+#  License: GNU General Public License v2.0 (GPL-2.0)
+#
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; version 2 of the License.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program. If not, see <https://www.gnu.org/licenses/>.
+#
+# -----------------------------------------------------------------------------
+#  Description
+# -----------------------------------------------------------------------------
+#
+#  Main application entry point and top-level orchestrator for OpenWX.
+#
+#  The OpenWXSDR class initializes, wires together, and manages the lifecycle
+#  of all subsystems based on the active SDR backend type configured in
+#  config.yaml. Supported backends: rtlsdr, airspy, ka9q, flux242.
+#
+#  Component lifecycle:
+#    initialize() ? start() ? _main_loop() / _flux242_main_loop() ? stop()
+#
+#  Subsystems managed:
+#    SDR backends    : RTLSDRDeviceManager, AirspyReceiver, KA9QReceiver,
+#                      Flux242Receiver
+#    Decoder backend : DecoderManager (rs1729)
+#    Output plugins  : UDPOutput, MQTTOutput, HttpOutput,
+#                      SondeHubOutput / SondeHubQueueOutput
+#    Web interface   : WebUI (Flask + Leaflet map)
+#
+# =============================================================================
 """
 
 import sys
@@ -37,6 +77,11 @@ def setup_logging(config: dict):
             logging.StreamHandler(sys.stdout)
         ]
     )
+
+    # Suppress MQTTOutput DEBUG messages unless debug_mqtt is explicitly enabled.
+    # PINGREQ/PINGRESP and other protocol noise is hidden by default.
+    if not log_config.get('debug_mqtt', False):
+        logging.getLogger('MQTTOutput').setLevel(logging.INFO)
 
 
 def load_config(config_path: str = 'config.yaml') -> dict:
@@ -111,7 +156,7 @@ Examples:
     parser.add_argument(
         '--version',
         action='version',
-        version='OpenWXSDR v1.0.45'
+        version='OpenWXSDR v1.0.46'
     )
     
     args = parser.parse_args()
@@ -126,7 +171,7 @@ Examples:
     # Print banner
     print("=" * 60)
     print("  OpenWXSDR - Streamlined Radiosonde Decoder Framework")
-    print("  Version 1.0.45")
+    print("  Version 1.0.46")
     print("=" * 60)
     print()
     
