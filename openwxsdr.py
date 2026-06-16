@@ -156,7 +156,7 @@ Examples:
     parser.add_argument(
         '--version',
         action='version',
-        version='OpenWXSDR v1.0.46'
+        version='OpenWXSDR v1.0.50'
     )
     
     args = parser.parse_args()
@@ -171,7 +171,7 @@ Examples:
     # Print banner
     print("=" * 60)
     print("  OpenWXSDR - Streamlined Radiosonde Decoder Framework")
-    print("  Version 1.0.46")
+    print("  Version 1.0.50")
     print("=" * 60)
     print()
     
