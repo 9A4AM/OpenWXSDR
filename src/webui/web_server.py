@@ -48,11 +48,14 @@ import os
 import platform
 import socket
 import subprocess
+
+# Import version info from package
+from .. import __version__, __build_date__
 import logging
 import threading
 import math
 import re
-from flask import Flask, render_template, jsonify, request, send_file
+from flask import Flask, render_template, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 from typing import Dict, List, Set
 from datetime import datetime
@@ -115,6 +118,7 @@ class WebUI:
         webui_config = config.get('webui', {})
         self.external_url_provider = str(webui_config.get('external_url_provider', 'openwx'))
         self.external_url_custom = str(webui_config.get('external_url_custom', ''))
+        self.enable_config = bool(webui_config.get('enable_config', True))
         
         # References to other components for health monitoring
         self.spectrum_analyzer = None
@@ -129,6 +133,7 @@ class WebUI:
         project_root = os.path.abspath(os.path.join(current_dir, '../..'))
         templates_dir = os.path.join(project_root, 'templates')
         static_dir = os.path.join(project_root, 'static')
+        self.assets_dir = os.path.join(project_root, 'assets')  # Store assets path for route
         
         # Create Flask app with absolute paths
         self.app = Flask(__name__, 
@@ -145,6 +150,11 @@ class WebUI:
     def _setup_routes(self):
         """Setup Flask routes"""
         
+        @self.app.route('/assets/<path:filename>')
+        def serve_assets(filename):
+            """Serve files from assets directory"""
+            return send_from_directory(self.assets_dir, filename)
+        
         @self.app.route('/')
         def index():
             """Main map page"""
@@ -156,7 +166,9 @@ class WebUI:
                                  default_zoom=map_config['default_zoom'],
                                  tile_server=map_config['tile_server'],
                                  callsign=station_cfg.get('callsign', ''),
-                                 version='1.0.46')
+                                 version=__version__,
+                                 build_date=__build_date__,
+                                 enable_config=self.enable_config)
         
         @self.app.route('/api/sondes')
         def get_sondes():
@@ -192,7 +204,8 @@ class WebUI:
                         'pressure': latest.get('pressure'),
                         'frame': latest.get('frame', 0),
                         'path': [[p.get('lat'), p.get('lon')] for p in data if p.get('lat') and p.get('lon')],
-                        'timestamp': latest.get('timestamp')
+                        'timestamp': latest.get('timestamp'),
+                        'reception_time': latest.get('reception_time', latest.get('timestamp'))  # Use reception_time for active detection
                     }
                     sondes.append(sonde_info)
                 
@@ -211,6 +224,45 @@ class WebUI:
                 return jsonify({
                     'serial': serial,
                     'telemetry': data
+                })
+        
+        @self.app.route('/api/sonde/<serial>/history')
+        def get_sonde_history(serial):
+            """Get historical telemetry data for sonde statistics charts"""
+            with self.lock:
+                data = self.sondes.get(serial, [])
+                
+                if not data:
+                    return jsonify({
+                        'error': 'No data available for this sonde',
+                        'serial': serial
+                    }), 404
+                
+                # Extract relevant fields for charting
+                frames = []
+                for point in data:
+                    if not point.get('timestamp'):
+                        continue
+                    
+                    frame = {
+                        'timestamp': point['timestamp'],
+                        'alt': point.get('alt'),
+                        'vel_v': point.get('vel_v'),
+                        'vel_h': point.get('vel_h'),
+                        'rssi': point.get('rssi'),
+                        'snr': point.get('snr'),
+                        'sats': point.get('sats'),
+                        'battery': point.get('batt')  # API uses 'batt' key, charts expect 'battery'
+                    }
+                    
+                    # Only include frames with at least some data
+                    if any(v is not None for k, v in frame.items() if k != 'timestamp'):
+                        frames.append(frame)
+                
+                return jsonify({
+                    'serial': serial,
+                    'frames': frames,
+                    'count': len(frames)
                 })
         
         @self.app.route('/api/status')
@@ -233,6 +285,8 @@ class WebUI:
                 'memory_percent': system_metrics['memory_percent'],
                 'memory_used_mb': system_metrics['memory_used_mb'],
                 'memory_total_mb': system_metrics['memory_total_mb'],
+                'software_version': __version__,
+                'build_date': __build_date__,
                 'timestamp': datetime.utcnow().isoformat() + 'Z'
             })
         
@@ -988,6 +1042,142 @@ class WebUI:
                 self.logger.error(f"Error reading logfile: {e}")
                 return str(e), 500
         
+        @self.app.route('/api/logfile/<filename>/history')
+        def get_logfile_history(filename):
+            """Parse logfile and return historical telemetry data for statistics charts"""
+            try:
+                log_dir = 'data/logs'
+                # Security: prevent directory traversal
+                if '..' in filename or '/' in filename or '\\' in filename:
+                    return jsonify({'error': 'Invalid filename'}), 400
+                
+                filepath = os.path.join(log_dir, filename)
+                if not os.path.exists(filepath):
+                    return jsonify({'error': 'File not found'}), 404
+                
+                # Extract serial from filename: SERIAL-YYYYMMDD-HHMMSS.log
+                match = re.match(r'^(.+?)-(\d{8})-(\d{6})\.log$', filename)
+                if not match:
+                    return jsonify({'error': 'Invalid logfile format'}), 400
+                
+                serial = match.group(1)
+                
+                # Parse logfile
+                frames = []
+                with open(filepath, 'r') as f:
+                    lines = f.readlines()
+                
+                current_frame = {}
+                for line in lines:
+                    line = line.strip()
+                    
+                    # New frame starts with "Frame X - timestamp"
+                    if line.startswith('Frame '):
+                        # Save previous frame if it has data
+                        if current_frame and current_frame.get('timestamp'):
+                            frames.append(current_frame)
+                        
+                        # Start new frame
+                        parts = line.split(' - ', 1)
+                        if len(parts) == 2:
+                            current_frame = {'timestamp': parts[1]}
+                        else:
+                            current_frame = {}
+                    
+                    # Parse telemetry fields
+                    elif line.startswith('Position:'):
+                        # Position: 48.12345, 11.67890
+                        try:
+                            coords = line.split(':', 1)[1].strip()
+                            lat, lon = coords.split(',')
+                            current_frame['lat'] = float(lat.strip())
+                            current_frame['lon'] = float(lon.strip())
+                        except:
+                            pass
+                    
+                    elif line.startswith('Altitude:'):
+                        # Altitude: 12345.0 m
+                        try:
+                            alt_str = line.split(':', 1)[1].strip().replace(' m', '')
+                            current_frame['alt'] = float(alt_str)
+                        except:
+                            pass
+                    
+                    elif line.startswith('Velocity H/V:'):
+                        # Velocity H/V: 5.2/3.4 m/s
+                        try:
+                            vel_str = line.split(':', 1)[1].strip().replace(' m/s', '')
+                            vel_h, vel_v = vel_str.split('/')
+                            current_frame['vel_h'] = float(vel_h.strip())
+                            current_frame['vel_v'] = float(vel_v.strip())
+                        except:
+                            pass
+                    
+                    elif line.startswith('SNR:'):
+                        # SNR: 15.3 dB
+                        try:
+                            snr_str = line.split(':', 1)[1].strip().replace(' dB', '')
+                            current_frame['snr'] = float(snr_str)
+                        except:
+                            pass
+                    
+                    elif line.startswith('Frequency:'):
+                        # Frequency: 405.700 MHz
+                        try:
+                            freq_str = line.split(':', 1)[1].strip().replace(' MHz', '')
+                            current_frame['frequency'] = float(freq_str)
+                        except:
+                            pass
+                    
+                    elif line.startswith('RSSI:'):
+                        # RSSI: -92.5 dB
+                        try:
+                            rssi_str = line.split(':', 1)[1].strip().replace(' dB', '')
+                            current_frame['rssi'] = float(rssi_str)
+                        except:
+                            pass
+                    
+                    elif line.startswith('Satellites:'):
+                        # Satellites: 8
+                        try:
+                            sat_str = line.split(':', 1)[1].strip()
+                            current_frame['sats'] = int(sat_str)
+                        except:
+                            pass
+                    
+                    elif line.startswith('Battery:'):
+                        # Battery: 3.45 V
+                        try:
+                            batt_str = line.split(':', 1)[1].strip().replace(' V', '')
+                            current_frame['battery'] = float(batt_str)
+                        except:
+                            pass
+                
+                # Don't forget the last frame
+                if current_frame and current_frame.get('timestamp'):
+                    frames.append(current_frame)
+                
+                # Ensure all frames have the expected fields (with None if missing)
+                for frame in frames:
+                    frame.setdefault('alt', None)
+                    frame.setdefault('vel_v', None)
+                    frame.setdefault('vel_h', None)
+                    frame.setdefault('rssi', None)
+                    frame.setdefault('snr', None)
+                    frame.setdefault('sats', None)
+                    frame.setdefault('battery', None)
+                
+                return jsonify({
+                    'serial': serial,
+                    'filename': filename,
+                    'frames': frames,
+                    'count': len(frames)
+                })
+                
+            except Exception as e:
+                self.logger.error(f"Error parsing logfile history: {e}")
+                return jsonify({'error': str(e)}), 500
+        
         @self.app.route('/api/export_action_log')
         def export_action_log():
             """Export the structured action log for download"""
@@ -1264,6 +1454,9 @@ class WebUI:
             
             # Convert to dict and validate position continuity before storing.
             data = telemetry.to_dict()
+            # Add reception time (current system time) for retention logic
+            # This is separate from 'timestamp' which is the decoded GPS time from the sonde
+            data['reception_time'] = datetime.utcnow().isoformat() + 'Z'
             self._sanitize_position_jump(serial, data)
             self.sondes[serial].append(data)
             
@@ -1283,8 +1476,14 @@ class WebUI:
                             f.write(f"  Heading: {data['heading']:.0f}°\n")
                         if data.get('frequency'):
                             f.write(f"  Frequency: {data['frequency']:.3f} MHz\n")
+                        if data.get('rssi') is not None:
+                            f.write(f"  RSSI: {data['rssi']:.1f} dB\n")
                         if data.get('snr') is not None:
                             f.write(f"  SNR: {data['snr']:.1f} dB\n")
+                        if data.get('sats') is not None:
+                            f.write(f"  Satellites: {data['sats']}\n")
+                        if data.get('batt') is not None:
+                            f.write(f"  Battery: {data['batt']:.2f} V\n")
                         if data.get('temp') is not None:
                             f.write(f"  Temperature: {data['temp']:.1f}°C\n")
                         if data.get('humidity') is not None:
@@ -1344,11 +1543,14 @@ class WebUI:
                 to_remove.append(serial)
                 continue
             
-            # Check last update time
+            # Check last update time using reception_time (system time when received)
+            # NOT timestamp (decoded GPS time from sonde, which may be from archive)
             last_frame = data[-1]
-            if 'timestamp' in last_frame:
+            time_field = 'reception_time' if 'reception_time' in last_frame else 'timestamp'
+            
+            if time_field in last_frame:
                 try:
-                    last_time = datetime.fromisoformat(last_frame['timestamp'].replace('Z', '+00:00'))
+                    last_time = datetime.fromisoformat(last_frame[time_field].replace('Z', '+00:00'))
                     age_seconds = (current_time - last_time.replace(tzinfo=None)).total_seconds()
                     
                     # Use configured retention time instead of hardcoded value
@@ -1639,6 +1841,12 @@ class WebUI:
 
             if current.get('lat') is not None and current.get('lon') is not None:
                 history.append(dict(current))
+            
+            # Add reception_time to all historical frames (set to current time when loaded)
+            # This prevents immediate cleanup of archive data with old GPS timestamps
+            load_time = datetime.utcnow().isoformat() + 'Z'
+            for frame in history:
+                frame['reception_time'] = load_time
 
             if len(history) > self.max_track_points:
                 history = history[-self.max_track_points:]
