@@ -197,6 +197,8 @@ class SpectrumAnalyzer:
         # Find peaks above threshold
         threshold = noise_floor + self.detection_threshold
         
+        self.logger.debug(f"Noise floor: {noise_floor:.1f} dB, Detection threshold: {threshold:.1f} dB")
+        
         # Use scipy peak detection
         peaks, properties = scipy_signal.find_peaks(
             power_db,
@@ -224,12 +226,19 @@ class SpectrumAnalyzer:
             
             # Filter by radiosonde typical bandwidth (4-20 kHz)
             if 2000 < bandwidth < 30000:
+                self.logger.info(
+                    f"Found signal: {freq/1e6:.4f} MHz, SNR: {strength:.1f} dB, BW: {bandwidth/1e3:.1f} kHz"
+                )
                 detected.append(DetectedSignal(
                     frequency=freq,
                     strength=strength,
                     bandwidth=bandwidth,
                     timestamp=time.time()
                 ))
+            else:
+                self.logger.debug(
+                    f"Rejected signal (bandwidth): {freq/1e6:.4f} MHz, BW: {bandwidth/1e3:.1f} kHz"
+                )
         
         return detected
     

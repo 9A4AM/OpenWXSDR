@@ -488,36 +488,44 @@ class DeviceWorker:
 
     def _scan_cycle(self):
         """Open the RTL-SDR, capture one spectrum, look for new signals."""
-        # CRITICAL: Try to acquire device lock (non-blocking)
-        # If manual decoder is setting up, skip this scan cycle
-        if not self._device_lock.acquire(blocking=False):
-            self.logger.debug(f"Device lock held (manual decoder active), skipping scan cycle")
+        # CRITICAL: Acquire device lock only for state changes and analyzer init
+        # Do NOT hold lock during spectrum capture or signal processing
+        
+        # Check if manual decode is pending before doing any work
+        if self._manual_decode_pending.is_set():
             time.sleep(0.5)
             return
         
-        try:
-            # Abort early if manual decode was requested while we were waiting
-            if self._manual_decode_pending.is_set():
+        # Initialize analyzer if needed (with lock protection)
+        if self._analyzer is None:
+            # If we just transitioned from DECODING, wait for USB device to be fully released
+            # Conservative 3-second delay for USB hub stability
+            if self._last_state == self.STATE_DECODING:
+                self.logger.debug("Waiting 3s for USB device to settle after DECODING")
+                time.sleep(3.0)
+            
+            # CRITICAL: Stagger first USB device open to prevent simultaneous access
+            # This prevents "[R82XX] PLL not locked!" errors from USB bus contention
+            # Increased to 2.5s per device (was 1.0s) for better stability
+            if self._first_usb_init and self.device_index > 0:
+                stagger_delay = self.device_index * 2.5  # 2.5 seconds per device for USB stability
+                self.logger.info(f"First USB init: waiting {stagger_delay:.1f}s to prevent conflicts")
+                time.sleep(stagger_delay)
+                self._first_usb_init = False
+            
+            # Acquire lock for analyzer initialization
+            if not self._device_lock.acquire(blocking=False):
+                self.logger.debug(f"Device lock held (manual decoder active), skipping scan cycle")
+                time.sleep(0.5)
                 return
-
-            if self._analyzer is None:
-                # If we just transitioned from DECODING, wait for USB device to be fully released
-                # Conservative 3-second delay for USB hub stability
-                if self._last_state == self.STATE_DECODING:
-                    time.sleep(3.0)
-                
-                # CRITICAL: Stagger first USB device open to prevent simultaneous access
-                # This prevents "[R82XX] PLL not locked!" errors from USB bus contention
-                if self._first_usb_init and self.device_index > 0:
-                    stagger_delay = self.device_index * 1.0  # 1 second per device
-                    self.logger.info(f"First USB init: waiting {stagger_delay:.1f}s to prevent conflicts")
-                    time.sleep(stagger_delay)
-                    self._first_usb_init = False
-                
+            
+            try:
                 self._analyzer = SpectrumAnalyzer(self.app_config, self.device_config)
                 if not self._analyzer.initialize():
                     self.logger.error("Cannot open RTL-SDR — retrying in 15 s")
                     self._analyzer = None
+                    # Release lock BEFORE long sleep
+                    self._device_lock.release()
                     time.sleep(15)
                     return
                 self._state = self.STATE_SCANNING
@@ -525,45 +533,56 @@ class DeviceWorker:
                     f"Scanning {self.device_config['center_freq']/1e6:.1f} MHz "
                     f"±{self.device_config['sample_rate']/2e6:.1f} MHz"
                 )
+            finally:
+                # Release lock after analyzer init
+                if self._device_lock.locked():
+                    self._device_lock.release()
 
-            try:
-                freqs, power_db = self._analyzer.capture_spectrum()
-                signals = self._analyzer.detect_signals(freqs, power_db)
-                signals = self._analyzer.filter_signals_in_ranges(signals)
-                self._update_spectrum_snapshot(freqs, power_db, signals)
-            except Exception as exc:
-                self.logger.warning(f"Spectrum capture failed: {exc}")
+        # Capture spectrum WITHOUT holding the lock - this can take several seconds
+        # Manual decode can interrupt by setting _manual_decode_pending flag
+        try:
+            freqs, power_db = self._analyzer.capture_spectrum()
+            signals = self._analyzer.detect_signals(freqs, power_db)
+            signals = self._analyzer.filter_signals_in_ranges(signals)
+            self._update_spectrum_snapshot(freqs, power_db, signals)
+        except Exception as exc:
+            self.logger.warning(f"Spectrum capture failed: {exc}")
+            # Acquire lock to tear down scanner
+            with self._device_lock:
                 self._teardown_scan()
-                time.sleep(5)
-                return
+            time.sleep(5)
+            return
 
-            # Abort if manual decode was requested during spectrum capture
+        # Abort if manual decode was requested during spectrum capture
+        if self._manual_decode_pending.is_set():
+            return
+
+        # Process signals WITHOUT holding the lock
+        # Sort by strength descending; skip blacklisted / already-decoded freqs
+        for sig in sorted(signals, key=lambda s: s.strength, reverse=True):
+            if self._is_blacklisted(sig.frequency):
+                continue
+            if self.registry.is_active(sig.frequency):
+                continue
+            
+            # CRITICAL: Skip signals that are assigned to fixed_channels
+            # Let fixed_channels start them with the correct type, not auto-detection
+            if self._is_fixed_channel_frequency(sig.frequency):
+                self.logger.debug(
+                    f"Skipping {sig.frequency/1e6:.4f} MHz - reserved for fixed_channel with specified type"
+                )
+                continue
+            
+            # Check one more time before starting decode
             if self._manual_decode_pending.is_set():
                 return
-
-            # Sort by strength descending; skip blacklisted / already-decoded freqs
-            for sig in sorted(signals, key=lambda s: s.strength, reverse=True):
-                if self._is_blacklisted(sig.frequency):
-                    continue
-                if self.registry.is_active(sig.frequency):
-                    continue
-                
-                # CRITICAL: Skip signals that are assigned to fixed_channels
-                # Let fixed_channels start them with the correct type, not auto-detection
-                if self._is_fixed_channel_frequency(sig.frequency):
-                    self.logger.debug(
-                        f"Skipping {sig.frequency/1e6:.4f} MHz - reserved for fixed_channel with specified type"
-                    )
-                    continue
-                
-                self.logger.info(
-                    f"New signal at {sig.frequency/1e6:.4f} MHz "
-                    f"(SNR {sig.strength:.1f} dB, BW {sig.bandwidth/1e3:.1f} kHz)"
-                )
-                self._start_decode(sig)
-                return   # worker will re-enter loop in DECODING state
-        finally:
-            self._device_lock.release()
+            
+            self.logger.info(
+                f"New signal at {sig.frequency/1e6:.4f} MHz "
+                f"(SNR {sig.strength:.1f} dB, BW {sig.bandwidth/1e3:.1f} kHz)"
+            )
+            self._start_decode(sig)
+            return   # worker will re-enter loop in DECODING state
 
         time.sleep(self._scan_interval)
 

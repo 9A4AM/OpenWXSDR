@@ -83,6 +83,7 @@ class DftDetector:
         'RS92': 0.54,
         'DFM': 0.62,
         'M10': 0.75,
+        'M20': 0.75,
         'iMet': 0.65  # Estimated threshold for iMet
     }
     
@@ -97,6 +98,7 @@ class DftDetector:
         self.dft_detect_path = dft_detect_path
         self.sample_duration = sample_duration
         self.logger = logging.getLogger('DftDetector')
+        self.debug_mode = False  # Can be enabled for detailed correlation parsing logs
         
         # Check if dft_detect is available
         self.available = self._check_availability()
@@ -215,7 +217,7 @@ class DftDetector:
 
         # rtl_fm parameters:
         # -d serial  : device by serial number (no index lookup needed)
-        # -M fm      : FM demodulation — produces signed 16-bit audio
+        # -M raw      : FM demodulation — produces signed 16-bit audio
         # -s rate    : output sample rate (48 kHz works with rtl_fm internal decimation)
         # -f freq    : tune frequency
         # -g gain    : gain (40 dB typical)
@@ -224,7 +226,7 @@ class DftDetector:
         cmd = [
             'rtl_fm',
             '-d', device_serial,
-            '-M', 'fm',
+            '-M', 'raw',
             '-s', str(sample_rate),
             '-f', str(int(frequency)),
             '-g', '40',
@@ -304,7 +306,7 @@ class DftDetector:
                 pass
             return None
     
-    def _run_dft_detect(self, iq_file: str, sample_rate: int) -> Dict[str, float]:
+    def _run_dft_detect(self, iq_file: str, sample_rate: int) -> Dict[str, Tuple[float, float]]:
         """
         Run dft_detect on captured IQ samples.
         
@@ -316,15 +318,16 @@ class DftDetector:
             Dictionary of {sonde_type: correlation_score}
         """
         try:
-            # dft_detect command:
-            # -s: sample rate
-            # -b: bandwidth (20 kHz standard, or 64 kHz for wideband)
-            # input: IQ file
+            # dft_detect command (rs1729/RS format):
+            # Positional args FIRST: input_file sample_rate bits
+            # Options LAST: --iq 0.0 --dc
             cmd = [
                 self.dft_detect_path,
-                '-s', str(sample_rate),
-                '-b', '20000',  # 20 kHz bandwidth (standard detection)
-                iq_file
+                iq_file,          # Input file (MUST be first positional arg)
+                str(sample_rate), # Sample rate (48000 Hz)
+                '16',             # Bit depth (16-bit signed)
+                '--iq', '0.0',    # IQ mode with offset (options come AFTER positional args)
+                '--dc'            # DC offset removal
             ]
             
             self.logger.debug(f"Running dft_detect: {' '.join(cmd)}")
@@ -354,10 +357,11 @@ class DftDetector:
             # Parse output for correlation results
             # Expected format: "RS41: 0.653" or "DFM: 0.701"
             output = result.stdout + result.stderr
+            self.logger.info(f"Correlation output: {output}")
             results = self._parse_dft_output(output)
             
             if results:
-                self.logger.debug(f"Correlation results: {results}")
+                self.logger.info(f"Correlation results: {results}")
             
             return results
             
@@ -368,65 +372,87 @@ class DftDetector:
             self.logger.error(f"Failed to run dft_detect: {e}")
             return {}
     
-    def _parse_dft_output(self, output: str) -> Dict[str, float]:
+    def _parse_dft_output(self, output: str) -> Dict[str, Tuple[float, float]]:
         """
-        Parse dft_detect output for correlation scores.
-        
-        Example output:
+        Parse all dft_detect output lines and keep the strongest result per sonde type.
+
+        Accepts variants like:
             RS41: 0.653
-            RS92: 0.412
-            DFM: 0.701
-            M10: 0.302
-        
-        Args:
-            output: dft_detect stdout/stderr
-            
-        Returns:
-            Dictionary of {sonde_type: correlation_score}
+            RS41: 0.653, -1250
+            RS41: 0.653, -1250Hz
+            RS41: 0.653, -1250.0 Hz
         """
-        results = {}
-        
-        # Pattern: "TYPE: 0.XXX"
-        pattern = r'(RS41|RS92|DFM|M10|M20|iMet|LMS6):\s*(\d+\.\d+)'
-        
-        for match in re.finditer(pattern, output):
-            sonde_type = match.group(1)
-            correlation = float(match.group(2))
-            results[sonde_type] = correlation
-        
-        return results
-    
-    def _select_best_match(self, results: Dict[str, float]) -> Optional[CorrelationResult]:
-        """
-        Select best sonde type match from correlation results.
-        
-        Rules:
-        1. Correlation must exceed type-specific threshold
-        2. Select type with highest correlation among matches
-        3. RS41 and DFM are most common, prefer these if close
-        
-        Args:
-            results: Dictionary of {sonde_type: correlation_score}
-            
-        Returns:
-            CorrelationResult for best match, or None if no match
-        """
-        # Filter by threshold
-        matches = {}
-        for sonde_type, correlation in results.items():
-            threshold = self.THRESHOLDS.get(sonde_type, 0.6)
-            if correlation >= threshold:
-                matches[sonde_type] = correlation
-        
-        if not matches:
-            return None
-        
-        # Find highest correlation
-        best_type = max(matches.items(), key=lambda x: x[1])
-        
-        return CorrelationResult(
-            sonde_type=best_type[0],
-            correlation=best_type[1],
-            frequency=0.0,  # Not used in this context
-            bandwidth=0.0   # Not used in this context
+        results: Dict[str, Tuple[float, float]] = {}
+        line_pattern = re.compile(
+            r'^\s*(RS41|RS92|DFM|M10|M20|iMet|LMS6)\s*:\s*'
+            r'([+-]?\d+(?:\.\d+)?)'
+            r'(?:\s*[,;]\s*([+-]?\d+(?:\.\d+)?)(?:\s*Hz)?)?\s*$',
+            re.IGNORECASE,
         )
+
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = line_pattern.match(line)
+            if not match:
+                if self.debug_mode:
+                    self.logger.debug(f"Ignoring unparsed dft_detect line: {line}")
+                continue
+
+            sonde_type = match.group(1)
+            if sonde_type.lower() == 'imet':
+                sonde_type = 'iMet'
+            correlation = float(match.group(2))
+            freq_offset = float(match.group(3)) if match.group(3) is not None else 0.0
+
+            current = results.get(sonde_type)
+            if current is None or correlation > current[0]:
+                results[sonde_type] = (correlation, freq_offset)
+                if self.debug_mode:
+                    self.logger.debug(
+                        f"Parsed candidate {sonde_type}: corr={correlation:.3f}, offset={freq_offset:.1f} Hz"
+                    )
+            elif self.debug_mode:
+                self.logger.debug(
+                    f"Discarded weaker {sonde_type}: corr={correlation:.3f}, offset={freq_offset:.1f} Hz"
+                )
+
+        return results
+
+    def _select_best_match(self, results: Dict[str, Tuple[float, float]]) -> Optional[CorrelationResult]:
+        """Select the strongest match above the per-type threshold."""
+        best_match: Optional[CorrelationResult] = None
+
+        for sonde_type, (correlation, freq_offset) in results.items():
+            threshold = self.THRESHOLDS.get(sonde_type, 0.6)
+            if correlation < threshold:
+                if self.debug_mode:
+                    self.logger.debug(
+                        f"Rejecting {sonde_type}: corr={correlation:.3f} < threshold={threshold:.3f}, offset={freq_offset:.1f} Hz"
+                    )
+                continue
+
+            candidate = CorrelationResult(
+                sonde_type=sonde_type,
+                correlation=correlation,
+                frequency=freq_offset,
+                bandwidth=0.0,
+            )
+
+            if self.debug_mode:
+                self.logger.debug(
+                    f"Acceptable candidate {sonde_type}: corr={correlation:.3f}, threshold={threshold:.3f}, offset={freq_offset:.1f} Hz"
+                )
+
+            if best_match is None or candidate.correlation > best_match.correlation:
+                best_match = candidate
+
+        if best_match:
+            self.logger.info(
+                f"select_best_match best={best_match.sonde_type} corr={best_match.correlation:.3f} offset={best_match.frequency:.1f} Hz"
+            )
+        elif self.debug_mode and results:
+            self.logger.debug(f"No candidate passed thresholds. Raw results: {results}")
+
+        return best_match
