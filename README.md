@@ -317,7 +317,7 @@ Grafana dashboard from Sondehub will show your receiver in the statistics includ
 
 ## License
 
-GNU GPL2 License - See LICENSE file
+GNU GPLv3 License - See [(https://github.com/DL2MF/OpenWXSDR/blob/main/LICENSE)](LICENSE) file
 
 ## Credits
 
