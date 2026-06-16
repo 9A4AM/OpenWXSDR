@@ -44,12 +44,12 @@
 
 import shutil
 import subprocess
-import json
 import logging
 import threading
 import time
-import os
+import json
 import re
+import os
 from typing import Optional, Callable
 from datetime import datetime
 
@@ -58,6 +58,7 @@ class RS1729Decoder:
     """
     Manages rs1729 decoder processes for various radiosonde types
     Decodes raw IQ data from stdin (48 kHz, 16-bit signed)
+    Detects --softin support and uses appropriate decoder flags
     """
     
     # Mapping of sonde types to decoder binaries
@@ -71,6 +72,40 @@ class RS1729Decoder:
         'LMS6': 'lms6mod',
         'MRZ': 'mrzmod'
     }
+    
+    # Class-level cache for decoder capabilities
+    _decoder_caps = {}
+    
+    @classmethod
+    def _detect_softin_support(cls, decoder_path: str) -> bool:
+        """
+        Detect if decoder supports --softin flag
+        
+        Args:
+            decoder_path: Path to decoder binary
+            
+        Returns:
+            True if --softin is supported
+        """
+        # Check cache first
+        if decoder_path in cls._decoder_caps:
+            return cls._decoder_caps[decoder_path]
+        
+        try:
+            # Run decoder with --help and check for --softin
+            result = subprocess.run(
+                [decoder_path, '--help'],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            has_softin = '--softin' in result.stdout or '--softin' in result.stderr
+            cls._decoder_caps[decoder_path] = has_softin
+            return has_softin
+        except Exception:
+            # If we can't detect, assume not available
+            cls._decoder_caps[decoder_path] = False
+            return False
     
     def __init__(self, frequency: float, sonde_type: str = 'RS41', decoder_path: str = None):
         """
@@ -110,12 +145,23 @@ class RS1729Decoder:
         self.decoder_path = decoder_path
         self.logger = logging.getLogger(f'{self.sonde_type}Decoder.{frequency/1e6:.3f}')
         
+        # Detect decoder capabilities
+        self.has_softin = self._detect_softin_support(self.decoder_path)
+        if not self.has_softin and self.sonde_type in ['RS41', 'DFM']:
+            self.logger.warning(f"{decoder_binary} does not support --softin flag. "
+                              f"Using IQ mode with text PTU fallback. "
+                              f"For full PTU support, install Auto_RX-compatible decoders from rs1729/RS.")
+        
         self.process: Optional[subprocess.Popen] = None
         self.running = False
         self.frame_callback: Optional[Callable] = None
         self.last_frame_time: Optional[datetime] = None
         self.frame_count = 0
         self._start_time: Optional[float] = None
+        #self.debug_json_ptu = os.environ.get("OPENWX_JSON_PTU_DEBUG", "0").lower() in ("1", "true", "yes", "on")
+        self.debug_json_ptu = 1
+        self.ptu_cache = {}  # Cache PTU data from text lines (recency-based merge)
+        self.ptu_cache_timestamps = {}  # Track PTU data timestamps for recency matching
     
     def set_frame_callback(self, callback: Callable[[dict], None]):
         """Set callback for decoded frames"""
@@ -143,33 +189,41 @@ class RS1729Decoder:
             
             # Add decoder-specific flags
             if self.sonde_type == 'RS41':
-                # RS41: rs41mod (from RS/demod/mod) supports --json output
-                # -v: verbose, --ptu2: PTU sensor data, --sat: satellite count
-                # --json: JSON output with full telemetry
-                cmd.extend(['-v', '--ptu2', '--sat', '--json', '--IQ', '0.0', '-', '48000', '16'])
+                # RS41: rs41mod with --json and --ptu2 for full telemetry including PTU
+                # -vv: VERY verbose (needed to get PTU in text when using --json)
+                # --ptu2: PTU sensor data, --sat: satellite count
+                # --json: JSON output with position/velocity
+                # PTU data appears in verbose text lines, not in JSON (with --IQ mode)
+                cmd.extend(['-vv', '--ptu2', '--sat', '--json', '--IQ', '0.0', '-', '48000', '16'])
             elif self.sonde_type == 'DFM':
                 # DFM: dfm09mod -i -vv --IQ 0.0 --ecc --json --dist --ptu - 48000 16
                 # DFM decoder reliably supports --json with full telemetry
                 # -ID flag shows actual serial (without it, serial is masked as "xxxxxxxx")
                 cmd.extend(['-i', '-vv', '-ID', '--IQ', '0.0', '--ecc', '--json', '--dist', '--ptu', '-', '48000', '16'])
             elif self.sonde_type == 'M10':
-                cmd.extend(['-v', '--json', '--IQ', '0.0', '-', '48000', '16'])
+                # M10: m10mod -v --IQ 0.0 - 48000 16
+                cmd.extend(['-v', '--IQ', '0.0', '-', '48000', '16'])
             elif self.sonde_type == 'RS92':
-                cmd.extend(['-v', '--json', '--IQ', '0.0', '-', '48000', '16'])
+                # RS92: rs92mod -v --IQ 0.0 - 48000 16
+                cmd.extend(['-v', '--IQ', '0.0', '-', '48000', '16'])
             elif self.sonde_type == 'M20':
-                cmd.extend(['-v', '--json', '--IQ', '0.0', '-', '48000', '16'])
+                # M20: m20mod -v --IQ 0.0 - 48000 16
+                cmd.extend(['-v', '--IQ', '0.0', '-', '48000', '16'])
             elif self.sonde_type == 'iMet':
-                cmd.extend(['-v', '--json', '--IQ', '0.0', '-', '48000', '16'])
+                # iMet: imet54mod -v --IQ 0.0 - 48000 16
+                cmd.extend(['-v', '--IQ', '0.0', '-', '48000', '16'])
             else:
-                cmd.extend(['-v', '--json', '--IQ', '0.0', '-', '48000', '16'])
+                # Default: assume RS41-like syntax
+                cmd.extend(['-vv', '--ptu2', '--sat', '--json', '--IQ', '0.0', '-', '48000', '16'])
             
-            # Wrap with stdbuf (if available) to force line-buffered stdout on the
-            # child process.  Without this, libc switches to 8 KB block-buffering
-            # when stdout is a pipe → first decoded frames only appear after
-            # ~80 seconds (8192 bytes / ~100 bytes per frame / 1 frame/s).
+            # Wrap with stdbuf (if available) to force line-buffered stdout AND stderr
+            # on the child process.  Without this, libc switches to block-buffering
+            # when stdout/stderr are pipes → PTU data on stderr arrives too late!
+            # -oL: line-buffered stdout (for JSON frames)
+            # -eL: line-buffered stderr (for PTU text lines - CRITICAL!)
             stdbuf = shutil.which('stdbuf')
             if stdbuf:
-                cmd = [stdbuf, '-oL'] + cmd
+                cmd = [stdbuf, '-oL', '-eL'] + cmd
 
             self.logger.info(f"Starting decoder: {' '.join(cmd)}")
 
@@ -212,6 +266,16 @@ class RS1729Decoder:
             self.stderr_thread.start()
             
             self.logger.info(f"Decoder started - processing {self.frequency/1e6:.4f} MHz")
+            
+            # Monitor for early crashes
+            time.sleep(2.0)
+            if self.process.poll() is not None:
+                exit_code = self.process.poll()
+                self.logger.error(f"Decoder crashed early with exit code {exit_code}")
+                return False
+            else:
+                self.logger.info(f"Decoder still running after 2s, PID={self.process.pid}")
+            
             return True
             
         except FileNotFoundError:
@@ -271,153 +335,269 @@ class RS1729Decoder:
         }
     
     def _monitor_stdout(self):
-        """Monitor decoder stdout for frame data.
-
-        All supported decoders are started with --json, so every decoded frame
-        arrives as a single JSON object on stdout.  TEXT lines (e.g. the verbose
-        copy that rs41mod also writes) are logged for diagnostics only.
-        """
+        """Monitor decoder stdout. Prefer JSON frames, use text lines only as PTU fallback/debug."""
         if not self.process or not self.process.stdout:
+            self.logger.error("stdout monitoring: no process or stdout available")
             return
 
+        line_count = 0
         try:
             for raw_line in self.process.stdout:
                 if not self.running:
+                    self.logger.info(f"stdout monitoring: stopped (running=False) after {line_count} lines")
                     break
 
-                if isinstance(raw_line, bytes):
-                    line = raw_line.decode('utf-8', errors='replace').strip()
-                else:
-                    line = raw_line.strip()
-                if not line:
-                    continue
-
-                if line.startswith('{'):
-                    # Primary frame source: JSON output from --json flag
-                    self.logger.debug(f"Decoder JSON: {line}")
-                    try:
-                        json_data = json.loads(line)
-                        frame_data = self._parse_json_frame(json_data)
-                        if frame_data and self.frame_callback:
-                            self.frame_count += 1
-                            self.last_frame_time = datetime.now()
-                            self.frame_callback(frame_data)
-                    except (json.JSONDecodeError, Exception) as e:
-                        self.logger.debug(f"Could not parse JSON decoder line: {e}")
-                else:
-                    # TEXT / verbose lines – log for diagnostics, not used for frame data
-                    if line.startswith('[') and ']' in line:
-                        self.logger.info(f"Decoder: {line}")
-                    else:
-                        self.logger.debug(f"Decoder: {line}")
-
-        except Exception as e:
-            if self.running:
-                self.logger.error(f"Error monitoring decoder stdout: {e}")
-    
-    def _monitor_stderr(self):
-        """Monitor decoder stderr for errors"""
-        if not self.process or not self.process.stderr:
-            return
-
-        try:
-            for raw_line in self.process.stderr:
-                if not self.running:
-                    break
-
-                if isinstance(raw_line, bytes):
-                    line = raw_line.decode('utf-8', errors='replace').strip()
-                else:
-                    line = raw_line.strip()
+                line = raw_line.decode('utf-8', errors='replace').strip() if isinstance(raw_line, bytes) else raw_line.strip()
                 if not line:
                     continue
                 
-                # Log all decoder stderr at INFO — even startup/debug messages
-                # are valuable when diagnosing decode failures.
-                self.logger.info(f"Decoder stderr: {line}")
-        
+                line_count += 1
+
+                if line.startswith('{') and line.endswith('}'):
+                    try:
+                        json_data = json.loads(line)
+                        frame = self._parse_json_frame(json_data)
+                        if frame and self.frame_callback:
+                            self.frame_count += 1
+                            self.last_frame_time = datetime.now()
+                            self.frame_callback(frame)
+                    except Exception as e:
+                        self.logger.error(f"Could not parse decoder JSON line: {e}")
+                    continue
+
+                # Non-JSON lines: extract PTU data
+                try:
+                    self._extract_ptu_from_text(line)
+                except Exception as e:
+                    self.logger.debug(f"PTU text fallback parse failed: {e}")
         except Exception as e:
             if self.running:
-                self.logger.error(f"Error monitoring decoder stderr: {e}")
-    
-    def _parse_json_frame(self, json_data: dict) -> Optional[dict]:
-        """Build a normalised frame_data dict from a decoder JSON object.
-
-        Validates the required fields (id, lat, lon, alt, frame) and maps
-        the decoder's key names to the internal names expected by
-        decoder_manager._on_frame_decoded().
-
-        Returns None if any required field is missing or invalid.
-        """
-        sonde_id = str(json_data.get('id') or json_data.get('serial') or '').strip()
-        if not sonde_id:
-            self.logger.debug("Skipping JSON frame: missing 'id' field")
-            return None
-
-        lat = json_data.get('lat')
-        lon = json_data.get('lon')
-        alt = json_data.get('alt')
-        frame_num = json_data.get('frame')
-        if lat is None or lon is None or alt is None or frame_num is None:
-            self.logger.debug(f"Skipping JSON frame for {sonde_id}: missing lat/lon/alt/frame")
-            return None
-
-        sonde_type = str(json_data.get('type') or self.sonde_type).strip().upper()
-
-        # DFM serials arrive as plain digits – normalise to "DFM-<serial>"
-        if 'DFM' in sonde_type and sonde_id.lstrip('D').isdigit():
-            sonde_id = f"DFM-{sonde_id.lstrip('D')}"
-
-        # GPS datetime from decoder (naive UTC)
-        decoded_datetime = None
-        dt_raw = json_data.get('datetime')
-        if dt_raw:
-            try:
-                dt_str = dt_raw.rstrip('Z')
-                fmt = '%Y-%m-%dT%H:%M:%S.%f' if '.' in dt_str else '%Y-%m-%dT%H:%M:%S'
-                decoded_datetime = datetime.strptime(dt_str, fmt)
-            except Exception:
-                pass
-
-        frame_data: dict = {
-            'sonde_id':   sonde_id,
-            'sonde_type': sonde_type,
-            'frame_number': int(frame_num),
-            'frequency':  self.frequency,
-            'lat':  float(lat),
-            'lon':  float(lon),
-            'alt':  float(alt),
-            'decoded_datetime': decoded_datetime,
-        }
-
-        # Optional fields – only include when present in this JSON frame
-        for src, dst, cast in [
-            ('vel_h',            'velocity_horizontal', float),
-            ('vel_v',            'velocity_vertical',   float),
-            ('heading',          'heading',             float),
-            ('sats',             'sats',                int),
-            ('batt',             'battery',             float),
-            ('bt',               'burst_timer',         int),
-            ('subtype',          'subtype',             str),
-            ('rs41_mainboard',   'rs41_mainboard',      str),
-            ('rs41_mainboard_fw','rs41_mainboard_fw',   int),
-            ('tx_frequency',     'tx_frequency',        int),
-            ('ref_datetime',     'ref_datetime',        str),
-            ('ref_position',     'ref_position',        str),
-            ('temp',             'temp',                float),
-            ('pressure',         'pressure',            float),
-            ('humidity',         'humidity',            float),
-        ]:
-            v = json_data.get(src)
-            if v is not None:
+                self.logger.error(f"Error monitoring decoder stdout: {e}")
+    def _monitor_stderr(self):
+        """Monitor decoder stderr mainly for debug and legacy PTU text fallback."""
+        if not self.process or not self.process.stderr:
+            self.logger.warning("stderr monitoring: no process or stderr available")
+            return
+        
+        stderr_line_count = 0
+        try:
+            for raw_line in self.process.stderr:
+                if not self.running:
+                    self.logger.info(f"stderr monitoring stopped after {stderr_line_count} lines")
+                    break
+                
+                line = raw_line.decode('utf-8', errors='replace').strip() if isinstance(raw_line, bytes) else raw_line.strip()
+                if not line:
+                    continue
+                
+                stderr_line_count += 1
+                
+                # Always log the first 10 stderr lines for debugging
+                if stderr_line_count <= 10:
+                    self.logger.info(f"Decoder stderr [{stderr_line_count}]: {line}")
+                
+                # Try to extract PTU data from this line
                 try:
-                    frame_data[dst] = cast(v)
-                except (TypeError, ValueError):
+                    self._extract_ptu_from_text(line)
+                except Exception as e:
+                    if self.debug_json_ptu:
+                        self.logger.debug(f"PTU extraction failed: {e}")
+                
+                # Log all stderr lines when debug mode is on
+                if self.debug_json_ptu and stderr_line_count > 10:
+                    self.logger.info(f"Decoder stderr: {line}")
+        
+        except Exception as e:
+            self.logger.error(f"Error monitoring decoder stderr: {e}", exc_info=True)
+
+    def _extract_ptu_from_text(self, line: str):
+        """Legacy PTU fallback from verbose text output, cached with timestamps for recency-based merging.
+        
+        RS41 text format with -vv --ptu2:
+        [ 5644] (W4060809)  Mon 2026-06-08 05:06:05.997  lat: 52.89519 lon: 7.89611 alt: 24350.9  vH: 10.4 D: 294.0 vV: 6.3  T=-47.6°C RH=5.8% P=24.38hPa
+        
+        Uses recency-based caching instead of exact frame number matching,
+        because frame numbers from text and JSON may not align perfectly.
+        """
+        frame_match = re.search(r'\[\s*(\d+)\]', line)
+        if not frame_match:
+            return
+        frame_num = int(frame_match.group(1))
+        ptu = {}
+
+        # Match T=-47.6°C or T=-47.6
+        m = re.search(r'T=([+-]?\d+(?:\.\d+)?)', line)
+        if m:
+            ptu['temp'] = float(m.group(1))
+        # Match RH=5.8% or RH=5.8
+        m = re.search(r'RH=(\d+(?:\.\d+)?)', line)
+        if m:
+            ptu['humidity'] = float(m.group(1))
+        # Match P=24.38hPa or P=24.38
+        m = re.search(r'P=(\d+(?:\.\d+)?)', line)
+        if m:
+            ptu['pressure'] = float(m.group(1))
+
+        if ptu:
+            # Store with current timestamp for recency-based matching
+            now = time.time()
+            self.ptu_cache[frame_num] = ptu
+            self.ptu_cache_timestamps[frame_num] = now
+            
+            # Cleanup old cache entries (keep last 100)
+            if len(self.ptu_cache) > 200:
+                # Remove oldest by timestamp
+                sorted_by_time = sorted(self.ptu_cache_timestamps.items(), key=lambda x: x[1])
+                for k, _ in sorted_by_time[:-100]:
+                    self.ptu_cache.pop(k, None)
+                    self.ptu_cache_timestamps.pop(k, None)
+                    
+            if self.debug_json_ptu:
+                self.logger.info(f"Cached fallback PTU for frame {frame_num}: {ptu}")
+    def _parse_json_frame(self, json_data: dict) -> Optional[dict]:
+        """Parse decoder JSON output. JSON is the primary source for PTU and navigation data."""
+        try:
+            sonde_id = str(json_data.get('id') or json_data.get('serial') or '').strip()
+            if not sonde_id:
+                return None
+
+            lat = json_data.get('lat')
+            lon = json_data.get('lon')
+            alt = json_data.get('alt')
+            frame_num = json_data.get('frame')
+            if lat is None or lon is None or alt is None or frame_num is None:
+                return None
+
+            sonde_type = str(json_data.get('type') or self.sonde_type).strip()
+            if sonde_type.startswith('0x'):
+                sonde_type = self.sonde_type
+            if 'DFM' in sonde_type and sonde_id.lstrip('D').isdigit():
+                sonde_id = f"DFM-{sonde_id.lstrip('D')}"
+
+            decoded_datetime = None
+            dt_raw = json_data.get('datetime')
+            if dt_raw:
+                try:
+                    dt_str = dt_raw.rstrip('Z')
+                    fmt = '%Y-%m-%dT%H:%M:%S.%f' if '.' in dt_str else '%Y-%m-%dT%H:%M:%S'
+                    decoded_datetime = datetime.strptime(dt_str, fmt)
+                except Exception:
                     pass
 
-        self.logger.debug(
-            f"[JSON] {sonde_id} frame={frame_num} lat={lat:.5f} lon={lon:.5f} "
-            f"alt={float(alt):.1f} sats={frame_data.get('sats')} "
-            f"batt={frame_data.get('battery')} bt={frame_data.get('burst_timer')}"
-        )
-        return frame_data
+            frame = {
+                'sonde_id': sonde_id,
+                'sonde_type': sonde_type,
+                'frame_number': int(frame_num),
+                'frequency': self.frequency,
+                'lat': float(lat),
+                'lon': float(lon),
+                'alt': float(alt),
+                'decoded_datetime': decoded_datetime,
+            }
+
+            # Optional fields – only include when present in this JSON frame
+            for src, dst, cast in [
+                ('vel_h', 'velocity_horizontal', float),
+                ('vel_v', 'velocity_vertical', float),
+                ('heading', 'heading', float),
+                ('sats', 'sats', int),
+                ('batt', 'battery', float),
+                ('bt', 'burst_timer', int),
+                ('subtype', 'subtype', str),
+                ('rs41_mainboard', 'rs41_mainboard', str),
+                ('rs41_mainboard_fw', 'rs41_mainboard_fw', int),
+                ('tx_frequency', 'tx_frequency', float),
+                ('ref_datetime', 'ref_datetime', str),
+                ('ref_position', 'ref_position', str),
+            ]:
+                value = json_data.get(src)
+                if value is not None:
+                    try:
+                        frame[dst] = cast(value)
+                    except (TypeError, ValueError):
+                        pass
+
+            for field in ('temp', 'tempc', 'temperature', 'T'):
+                if json_data.get(field) is not None:
+                    try:
+                        frame['temp'] = float(json_data.get(field))
+                        break
+                    except (TypeError, ValueError):
+                        pass
+            for field in ('humidity', 'humidityrh', 'rh', 'RH'):
+                if json_data.get(field) is not None:
+                    try:
+                        frame['humidity'] = float(json_data.get(field))
+                        break
+                    except (TypeError, ValueError):
+                        pass
+            for field in ('pressure', 'pressurehpa', 'pres', 'P'):
+                if json_data.get(field) is not None:
+                    try:
+                        frame['pressure'] = float(json_data.get(field))
+                        break
+                    except (TypeError, ValueError):
+                        pass
+
+            # Recency-based PTU fallback merge: match by proximity instead of exact frame number
+            # because text and JSON frame numbers may not align perfectly
+            if not all(frame.get(k) for k in ('temp', 'humidity', 'pressure')):
+                # Look for recent PTU data within +/- 5 frames
+                current_frame = frame['frame_number']
+                best_match = None
+                best_distance = 999999
+                
+                for cached_frame, timestamp in self.ptu_cache_timestamps.items():
+                    frame_distance = abs(cached_frame - current_frame)
+                    if frame_distance <= 5 and frame_distance < best_distance:
+                        best_match = cached_frame
+                        best_distance = frame_distance
+                
+                if best_match is not None:
+                    cached = self.ptu_cache[best_match]
+                    frame.setdefault('temp', cached.get('temp'))
+                    frame.setdefault('humidity', cached.get('humidity'))
+                    frame.setdefault('pressure', cached.get('pressure'))
+                    if self.debug_json_ptu:
+                        self.logger.info(f"[PTU Merged by recency] Frame {current_frame} matched with text frame {best_match} (distance={best_distance}): T={frame.get('temp')}°C RH={frame.get('humidity')}% P={frame.get('pressure')}hPa")
+
+            if self.debug_json_ptu:
+                ptu_keys = {k: json_data.get(k) for k in ('temp', 'tempc', 'temperature', 'T', 'humidity', 'humidityrh', 'rh', 'RH', 'pressure', 'pressurehpa', 'pres', 'P') if k in json_data}
+                # self.logger.info(f"JSON frame keys={sorted(json_data.keys())}")
+                # self.logger.info(f"JSON PTU candidate fields for {sonde_id}: {ptu_keys}")
+                final_ptu = {k: frame.get(k) for k in ('temp', 'humidity', 'pressure') if frame.get(k) is not None}
+                # self.logger.info(f"Final frame PTU for {sonde_id} frame {frame['frame_number']}: {final_ptu}")
+
+            return frame
+        except Exception as e:
+            self.logger.error(f"Error parsing JSON frame: {e}")
+            return None
+
+    def _parse_frame(self, line: str) -> Optional[dict]:
+        """Legacy text-frame parser retained as fallback/debug helper."""
+        try:
+            frame = {}
+            if '(' in line and ')' in line:
+                start = line.find('(') + 1
+                end = line.find(')', start)
+                sonde_id = line[start:end]
+                if ',' not in sonde_id:
+                    frame['sonde_id'] = sonde_id
+            parts = line.split()
+            for i, part in enumerate(parts):
+                if part == 'lat:' and i + 1 < len(parts):
+                    frame['lat'] = float(parts[i + 1])
+                elif part == 'lon:' and i + 1 < len(parts):
+                    frame['lon'] = float(parts[i + 1])
+                elif part == 'alt:' and i + 1 < len(parts):
+                    frame['alt'] = float(parts[i + 1])
+                elif part == 'vH:' and i + 1 < len(parts):
+                    frame['velocity_horizontal'] = float(parts[i + 1])
+                elif part == 'vV:' and i + 1 < len(parts):
+                    frame['velocity_vertical'] = float(parts[i + 1])
+                elif part == 'D:' and i + 1 < len(parts):
+                    frame['heading'] = float(parts[i + 1])
+            return frame or None
+        except Exception as e:
+            self.logger.debug(f"Could not parse legacy text frame: {e}")
+            return None

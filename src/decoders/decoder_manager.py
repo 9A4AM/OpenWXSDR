@@ -756,18 +756,23 @@ class DecoderManager:
                     heading=frame_data.get('heading', 0.0)  # Use heading from frame data (D: field or JSON heading)
                 )
 
-            # Create environment block when PTU data exists.
+            # Create environment block ONLY when PTU data actually exists (not just None values).
+            # This ensures MQTT/SondeHub only carry PTU when we have real measurements.
             environment = None
-            if any(k in frame_data for k in ('temp', 'temperature', 'humidity', 'pressure')):
-                temp = frame_data.get('temp', frame_data.get('temperature'))
-                hum = frame_data.get('humidity')
-                pres = frame_data.get('pressure')
+            temp = frame_data.get('temp', frame_data.get('temperature'))
+            hum = frame_data.get('humidity')
+            pres = frame_data.get('pressure')
+            
+            # Only create environment if at least one PTU field has a real value
+            if temp is not None or hum is not None or pres is not None:
                 self.logger.info(f"[PTU] {sonde_id}: Creating environment temp={temp}, hum={hum}, pres={pres}")
                 environment = SondeEnvironment(
                     temperature=temp,
                     humidity=hum,
                     pressure=pres
                 )
+            else:
+                self.logger.debug(f"[PTU] {sonde_id}: No PTU data in frame_data keys: {list(frame_data.keys())}")
             
             # Create telemetry object
             telemetry = SondeTelemetry(
@@ -792,6 +797,14 @@ class DecoderManager:
                 timestamp=datetime.utcnow(),  # Use UTC to match web UI expectations
                 decoder_name='rs41mod',
                 decoder_version='rs1729'
+            )
+            
+            # Log telemetry summary for debugging
+            self.logger.debug(
+                f"[TELEMETRY] {sonde_id}: Created telemetry frame={frame_number}, "
+                f"has_position={position is not None}, has_velocity={velocity is not None}, "
+                f"has_environment={environment is not None}, sats={frame_data.get('sats')}, "
+                f"batt={frame_data.get('battery')}"
             )
             
             # Forward to telemetry handler

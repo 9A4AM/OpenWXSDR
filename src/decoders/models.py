@@ -123,6 +123,8 @@ class SondeTelemetry:
             data['subtype'] = self.subtype
         if self.satellites is not None:
             data['sats'] = self.satellites
+        if self.battery is not None:
+            data['batt'] = self.battery
         
         if self.position:
             data.update({
@@ -146,5 +148,19 @@ class SondeTelemetry:
                 data['humidity'] = self.environment.humidity
             if self.environment.pressure is not None:
                 data['pressure'] = self.environment.pressure
+        
+        # RS41-specific fields
+        if self.burst_timer is not None:
+            data['burst_timer'] = self.burst_timer
+        if self.rs41_mainboard is not None:
+            data['rs41_mainboard'] = self.rs41_mainboard
+        if self.rs41_mainboard_fw is not None:
+            data['rs41_mainboard_fw'] = self.rs41_mainboard_fw
+        if self.ref_datetime is not None:
+            data['ref_datetime'] = self.ref_datetime
+        if self.ref_position is not None:
+            data['ref_position'] = self.ref_position
+        if self.tx_frequency is not None:
+            data['tx_frequency'] = self.tx_frequency / 1e6  # Convert Hz to MHz
         
         return data
