@@ -3,10 +3,60 @@
 A lightweight, efficient radiosonde decoder for Raspberry Pi, designed to work with RTL-SDR, Airspy and KA9Q radio receivers. 
 Using the excellent rs1729/RS decoders embedded into this framework.
 
-## Updated V1.0.46 available:
+## Current Version:** 1.0.50 (June 15, 2026) available:
 
-⚠ <u>Important notice:</u> With update to version 1.0.46 the adressed issues of radiosonde telemetry to sondehub.org has been fixed.
-We are looking forward that the ban / blocking of OpenWXSDR uploads will be suspended after review of the submitted telemetry data.
+⚠ <u>Important notice:</u> With update to version 1.0.50 several further adressed issues of radiosonde telemetry to sondehub.org has been fixed.
+We are looking forward that the ban / blocking of OpenWXSDR uploads will be suspended after review of the submitted telemetry data
+
+✨ What's New in v1.0.50
+
+#### 🔧 PTU Data Improvements
+
+- **Recency-Based PTU Merging**: Improved text fallback matching handles frame number misalignment
+- **--softin Detection**: Auto-detects decoder capabilities at startup with clear warnings
+- **Conditional Environment**: Only populates PTU when actual measurements exist
+- **Smarter Cache Management**: Timestamp-based cleanup maintains last 100 entries
+
+#### 🎯 Interactive Sonde Analysis
+
+- **Context Menu**: Right-click any active sonde for quick access to statistics and predictions
+- **Advanced Statistics Modal**: 7 interactive Chart.js graphs showing:
+  - Altitude profile
+  - Vertical velocity
+  - Horizontal velocity
+  - RSSI (signal strength)
+  - SNR (signal-to-noise ratio)
+  - GPS satellites count
+  - Battery voltage
+- **Historical Data Viewer**: Load and analyze logfiles from past flights with dropdown selector
+- **24-Hour Time Format**: All charts use UTC time in HH:mm format for professional meteorological analysis
+- **Gap Visualization**: Charts correctly show data gaps where telemetry was unavailable
+
+#### 🗺️ Enhanced Map Features
+
+- **Launch & Landing Markers**: Visual PNG icons mark takeoff and touchdown locations
+- **Flight Path Overlay**: Display historical tracks from logfiles on the map
+- **Inactive Sondes Management**: Track and manage previously decoded sondes with easy removal
+- **Position Details**: Lat/Lon coordinates displayed in landing marker popups
+
+#### 🔮 Flight Path Prediction
+
+- **Tawhiri Integration**: Real-time flight path prediction using Sondehub's Tawhiri API
+- **Intelligent Burst Altitude**: Automatic burst height estimation based on sonde type:
+  - RS41: 30,000m (Bergen: 33,500m, Meppen: 25,000m)
+  - DFM: 17,500m
+  - Others: 25,000m
+- **Drag Compensation**: Physics-based descent rate calculation accounting for air density
+- **Visual Prediction**: Purple dashed line showing predicted trajectory
+- **Landing Details**: Interactive popup with landing time, coordinates, and flight parameters
+- **Burst Marker**: Shows estimated balloon burst location for ascending sondes
+
+#### 📊 Data Improvements
+
+- **Battery Tracking**: Complete battery voltage history now recorded and displayed
+- **Satellite Data**: GPS satellite count tracking throughout flight
+- **Enhanced Logfile Format**: All telemetry fields properly logged with timestamps
+- **Live Data API**: Real-time statistics for active sondes via REST API
 
 ## Features
 
