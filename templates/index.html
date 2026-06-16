@@ -42,6 +42,8 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
 
     <!-- Chart.js for spectrum plot -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <!-- Chart.js date adapter for time-based charts -->
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
     
     <style>
         * {
@@ -59,6 +61,59 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
             display: flex;
             flex-direction: column;
             border-top: 5px solid #3f84dd;
+        }
+        
+        /* Ensure modals display correctly */
+        .modal-backdrop {
+            z-index: 1040 !important;
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+        }
+        
+        .modal {
+            z-index: 1050 !important;
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
+            overflow-x: hidden !important;
+            overflow-y: auto !important;
+        }
+        
+        .modal.show {
+            display: block !important;
+        }
+        
+        .modal-dialog {
+            z-index: 1050 !important;
+            position: relative !important;
+            margin: 1.75rem auto !important;
+        }
+        
+        #sondeStatisticsModal .modal-dialog,
+        #sondePredictionModal .modal-dialog {
+            max-width: 80vw !important;
+        }
+        
+        #sondeStatisticsModal .modal-body {
+            min-height: 500px !important;
+        }
+        
+        /* Loading modal should always be on top */
+        #loadingModal {
+            z-index: 2100 !important;
+        }
+        
+        #loadingModal .modal-dialog {
+            z-index: 2100 !important;
+        }
+        
+        #loadingModal + .modal-backdrop {
+            z-index: 2090 !important;
         }
         
         .navbar {
@@ -180,6 +235,95 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
             margin-bottom: 10px;
             cursor: pointer;
             transition: all 0.2s ease;
+        }
+        
+        .sonde-card.active-decode {
+            background: #d4edda;
+            border-color: #c3e6cb;
+        }
+        
+        /* Statistics chart maximize styles */
+        .chart-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .chart-maximize-btn {
+            padding: 2px 6px;
+            font-size: 14px;
+            cursor: pointer;
+            background: transparent;
+            border: none;
+            color: #6c757d;
+            transition: color 0.2s;
+        }
+        
+        .chart-maximize-btn:hover {
+            color: #007bff;
+        }
+        
+        .stats-chart-container.maximized {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 2000;
+            background: rgba(248, 249, 250, 0.98);
+            display: flex;
+            flex-direction: column;
+            padding: 40px 60px;
+            box-sizing: border-box;
+            overflow: hidden;
+        }
+        
+        .stats-chart-container.maximized .card {
+            height: calc(100vh - 80px);
+            display: flex;
+            flex-direction: column;
+            margin: 0;
+            background: #ffffff;
+            color: #212529;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+        
+        .stats-chart-container.maximized .card-body {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 30px;
+            overflow: hidden;
+        }
+        
+        .stats-chart-container.maximized canvas {
+            width: 100% !important;
+            height: calc(100vh - 200px) !important;
+            max-height: none !important;
+            min-height: 0 !important;
+        }
+        
+        .chart-close-btn {
+            position: absolute;
+            top: 50px;
+            right: 70px;
+            background: #dc3545;
+            border: none;
+            color: white;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
+            z-index: 2001;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+        }
+        
+        .chart-close-btn:hover {
+            background: #c82333;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
         }
         
         .sonde-card:hover {
@@ -419,7 +563,7 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                         <i class="bi bi-gear-wide-connected"></i> System
                     </button>
                     <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="systemDropdown">
-                        <li><a class="dropdown-item" href="#" onclick="showConfigurationModal(); return false;"><i class="bi bi-sliders"></i> Configuration</a></li>
+                        <li><a class="dropdown-item{% if not enable_config %} disabled{% endif %}" href="#"{% if enable_config %} onclick="showConfigurationModal(); return false;"{% endif %}><i class="bi bi-sliders"></i> Configuration</a></li>
                         <li><a class="dropdown-item" href="#" onclick="showDecoderSettingsModal(); return false;"><i class="bi bi-usb-plug"></i> Receiver</a></li>
                         <li><a class="dropdown-item" href="#" onclick="showLogfilesModal(); return false;"><i class="bi bi-file-text"></i> Logfile</a></li>                        
                         <li><a class="dropdown-item" href="#" onclick="showServiceStatusModal(); return false;"><i class="bi bi-hdd-network"></i> Service</a></li>
@@ -476,14 +620,28 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
             </div>
             
             <!-- Active Sondes Section -->
-            <div class="section-header">
-                <i class="bi bi-broadcast"></i> Active Radiosondes
+            <div class="section-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-broadcast"></i> Active Radiosondes</span>
+                <button class="btn btn-sm btn-outline-info" onclick="testStatisticsModal()" style="font-size: 11px; padding: 2px 8px;">
+                    <i class="bi bi-graph-up"></i> Show Statistics
+                </button>
             </div>
             <div class="sonde-list" id="sondesList">
                 <div class="no-sondes">
                     <i class="bi bi-search"></i>
                     <p>No active radiosondes detected</p>
                     <small>Scanning frequencies...</small>
+                </div>
+            </div>
+            
+            <!-- Inactive Sondes Section -->
+            <div class="section-header" id="inactiveSondesHeader" style="display: none;">
+                <i class="bi bi-archive"></i> Inactive Radiosondes
+            </div>
+            <div class="sonde-list" id="inactiveSondesList" style="display: none;">
+                <div class="no-sondes" style="padding: 20px;">
+                    <i class="bi bi-inbox"></i>
+                    <p style="font-size: 13px; margin: 10px 0 0 0;">No inactive sondes</p>
                 </div>
             </div>
             
@@ -607,10 +765,32 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
         // Storage for markers and paths
         const sondeMarkers = {};
         const sondePaths = {};
+        const inactiveSondeLaunchMarkers = {};  // Track launch markers for inactive sondes
+        const inactiveSondeLandingMarkers = {};  // Track landing markers for inactive sondes
         let latestDebugData = [];
         let currentSdrType = 'rtlsdr';  // Track current SDR type (rtlsdr, flux242, ka9q)
         let fixedChannelsEnabled = false;
         let activeSondeSerials = [];  // Track active sonde serials for logfile highlighting
+        
+        // Tawhiri prediction storage
+        const sondePredictions = {};  // Store prediction polylines and markers
+        const predictionInProgress = {};  // Prevent duplicate prediction requests
+        const lastPredictionTime = {};  // Track last prediction time for auto-updates
+        
+        // Leaflet icons for predictions
+        const targetIcon = L.icon({
+            iconUrl: '/static/img/target-red.png',
+            iconSize: [24, 24],
+            iconAnchor: [12, 12],
+            popupAnchor: [0, -12]
+        });
+        
+        const burstIcon = L.icon({
+            iconUrl: '/static/img/pop-marker.png',
+            iconSize: [24, 24],
+            iconAnchor: [12, 12],
+            popupAnchor: [0, -12]
+        });
         
         // Update data from API
         async function updateData() {
@@ -818,15 +998,33 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                     const cleanSubtype = sonde.subtype.includes(':') ? sonde.subtype.split(':').pop() : sonde.subtype;
                     typeLabel = cleanSubtype;  // Show only subtype when available
                 }
+                
+                // Check if sonde is actively decoding (last frame within 60 seconds)
+                // Use reception_time (system time when received) not timestamp (decoded GPS time from sonde)
+                const checkTime = sonde.reception_time || sonde.timestamp;
+                const isActiveDecoding = checkTime && 
+                    (new Date() - new Date(checkTime)) < 60000;
+                const activeClass = isActiveDecoding ? ' active-decode' : '';
+                
+                // Format display for long serial numbers (>10 chars)
+                const isLongSerial = sonde.serial.length > 10;
+                const dashPrefix = isLongSerial ? '' : '&ndash; ';
+                const frameDisplay = sonde.frame !== undefined && sonde.frame !== null ? 
+                    (isLongSerial ? ' - #' + String(sonde.frame).slice(-5) : ' - #' + sonde.frame) : '';
+                
                 return `
-                    <div class="sonde-card" onclick="focusSonde('${sonde.serial}')">
+                    <div class="sonde-card${activeClass}" onclick="focusSonde('${sonde.serial}')">
                         <div class="sonde-header">
                             <div style="display:flex; align-items:baseline; gap:4px;">
                                 <span class="sonde-serial">${sonde.serial}</span>
-                                <span style="font-size:0.72em; color:#999; white-space:nowrap;">&ndash; ${sonde.timestamp ? new Date(sonde.timestamp).toISOString().slice(11,19) + ' UTC' : ''}${sonde.frame !== undefined && sonde.frame !== null ? ' - #' + sonde.frame : ''}</span>
+                                <span style="font-size:0.72em; color:#999; white-space:nowrap;">${dashPrefix}${sonde.timestamp ? new Date(sonde.timestamp).toISOString().slice(11,19) + ' UTC' : ''}${frameDisplay}</span>
                             </div>
                             <div style="display:flex; align-items:center; gap:8px;">
-                                <button class="btn btn-sm btn-outline-primary" style="padding:2px 6px; line-height:1;" onclick="openExternalUrl('${sonde.serial}'); event.stopPropagation();" title="View on external site">
+                                <button class="btn btn-sm btn-outline-primary sonde-external-link" 
+                                        style="padding:2px 6px; line-height:1;" 
+                                        onclick="openExternalUrl('${sonde.serial}'); event.stopPropagation();" 
+                                        oncontextmenu="showSondeContextMenu(event, '${sonde.serial}'); return false;"
+                                        title="Left-click: Open external site | Right-click: Statistics & Prediction">
                                     <i class="bi bi-box-arrow-up-right"></i>
                                 </button>
                                 <span class="sonde-type" style="background: ${color}">${typeLabel}</span>
@@ -1045,7 +1243,7 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
         }
         
         // Focus on specific sonde
-        function focusSonde(serial) {
+        window.focusSonde = function focusSonde(serial) {
             if (sondeMarkers[serial]) {
                 const marker = sondeMarkers[serial];
                 map.setView(marker.getLatLng(), 12);
@@ -1275,7 +1473,7 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
         let externalUrlProvider = 'openwx';
         let externalUrlCustom = '';
         
-        function openExternalUrl(sondeId) {
+        window.openExternalUrl = function openExternalUrl(sondeId) {
             let url = '';
             if (externalUrlProvider === 'openwx') {
                 url = `https://map.openwx.de/index.html?sondeid=${sondeId}`;
@@ -1296,8 +1494,9 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                 return { filename, type: 'Activity', date: '', timestamp: 0 };
             }
             
-            // Sonde log: SERIAL-YYYYMMDD-HHMMSS.log
-            const match = filename.match(/^([A-Z0-9]+)-(\d{8})-(\d{6})\.log$/);
+            // Sonde log: SERIAL-YYYYMMDD-HHMMSS.log (serial may contain dashes for M10/M20)
+            // Match pattern: anything up to the last two dash-separated 8-digit and 6-digit numbers
+            const match = filename.match(/^(.+?)-(\d{8})-(\d{6})\.log$/);
             if (match) {
                 const serial = match[1];
                 const dateStr = match[2]; // YYYYMMDD
@@ -1317,8 +1516,11 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                 let type = 'Sonde';
                 if (serial.match(/^[A-Z]\d{7}/)) type = 'RS41';
                 else if (serial.match(/^[A-Z]\d{6}/)) type = 'RS92';
-                else if (serial.match(/^\d{8}/)) type = 'DFM';
-                else if (serial.match(/^M\d+/)) type = serial.match(/^M10/) ? 'M10' : 'M20';
+                else if (serial.match(/^DFM/i)) type = 'DFM';  // DFM- prefix
+                else if (serial.match(/^\d{8}/)) type = 'DFM';  // Plain 8-digit
+                else if (serial.match(/^M10/i)) type = 'M10';  // M10- prefix
+                else if (serial.match(/^M20/i)) type = 'M20';  // M20- prefix
+                else if (serial.match(/^M\d+/)) type = 'M10';  // Fallback M-number
                 else if (serial.match(/^W\d+/)) type = 'iMet';
                 else if (serial.match(/^L\d+/)) type = 'LMS6';
                 else if (serial.match(/^ME\d+/)) type = 'MRZ';
@@ -1501,11 +1703,17 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                     
                     // Determine file type and show/hide appropriate buttons
                     const isActivityLog = filename.startsWith('openwxsdr_');
-                    const isSondeLog = filename.match(/^[A-Z0-9]+-\d{8}-\d{6}\.log$/);
+                    const isSondeLog = filename.match(/^.+-\d{8}-\d{6}\.log$/);
                     
                     const exportGpxBtn = document.getElementById('exportGpxBtn');
                     const exportActivityBtn = document.getElementById('exportActivityBtn');
                     const showMapBtn = document.getElementById('showMapBtn');
+                    const downloadBtn = document.getElementById('downloadLogBtn');
+                    
+                    // Store current filename for download
+                    downloadBtn.onclick = () => {
+                        window.location.href = `/api/logfile/${encodeURIComponent(filename)}`;
+                    };
                     
                     if (isActivityLog) {
                         // Activity log: show Export Activity Log button only
@@ -1521,7 +1729,8 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                         if (exportActivityBtn) exportActivityBtn.style.display = 'none';
                         
                         // Show "Show on Map" button only if sonde is NOT currently active
-                        const sondeSerial = filename.split('-')[0];
+                        // Extract serial by removing date/time suffix
+                        const sondeSerial = filename.replace(/-\d{8}-\d{6}\.log$/, '');
                         const isActive = activeSondeSerials.includes(sondeSerial);
                         if (showMapBtn) {
                             showMapBtn.style.display = isActive ? 'none' : 'inline-block';
@@ -1862,7 +2071,7 @@ ${trkSegs}
                                 <tr><th style="width:35%">Application</th><td>OpenWX.de Radiosonde Tracking System (SDR Gateway)</td></tr>
                                 <tr><th>Version</th><td>V{{ version }} (Release)</td></tr>
                                 <tr><th>Station</th><td>{{ callsign }}</td></tr>
-                                <tr><th>Build Date</th><td>2026-05-06</td></tr>
+                                <tr><th>Build Date</th><td>{{ build_date }}</td></tr>
                             </tbody>
                         </table>
 
@@ -1901,7 +2110,7 @@ ${trkSegs}
                                 <tr><th style="width:35%">Anwendung</th><td>OpenWX.de Radiosonden-Tracking-System (SDR Gateway)</td></tr>
                                 <tr><th>Version</th><td>V{{ version }} (Release)</td></tr>
                                 <tr><th>Station</th><td>{{ callsign }}</td></tr>
-                                <tr><th>Build-Datum</th><td>2026-05-06</td></tr>
+                                <tr><th>Build-Datum</th><td>{{ build_date }}</td></tr>
                             </tbody>
                         </table>
 
@@ -1984,6 +2193,9 @@ ${trkSegs}
                                     </button>
                                     <button id="exportActivityBtn" class="btn btn-outline-primary" onclick="exportActionLog()" style="display: none;">
                                         <i class="bi bi-file-earmark-arrow-down"></i> Export Activity Log
+                                    </button>
+                                    <button id="downloadLogBtn" class="btn btn-outline-secondary">
+                                        <i class="bi bi-file-earmark-arrow-down"></i> Download
                                     </button>
                                 </div>
                             </div>
@@ -2494,6 +2706,20 @@ ${trkSegs}
         </div>
     </div>
 
+    <!-- Loading Modal -->
+    <div class="modal fade" id="loadingModal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
+        <div class="modal-dialog modal-dialog-centered modal-sm">
+            <div class="modal-content">
+                <div class="modal-body text-center py-4">
+                    <div class="spinner-border text-primary mb-3" role="status" style="width: 3rem; height: 3rem;">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <h5 id="loadingModalText" class="mb-0">Loading logfile data...</h5>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Spectrum Modal -->
     <div class="modal fade" id="spectrumModal" tabindex="-1">
         <div class="modal-dialog" style="max-width: min(95vw, 1368px); height: 90vh;">
@@ -2541,7 +2767,1557 @@ ${trkSegs}
         </div>
     </div>
 
+    <!-- Sonde Statistics Modal -->
+    <div class="modal fade" id="sondeStatisticsModal" tabindex="-1">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">
+                        <i class="bi bi-graph-up"></i> Sonde Statistics
+                        <span id="statsSondeSerial" style="font-weight: normal; color: #6c757d;"></span>
+                    </h5>
+                    <div class="d-flex align-items-center gap-2">
+                        <span style="font-size: 0.85rem; color: #6c757d;">
+                            <strong>Serial:</strong> <span id="statsDisplaySerial">-</span>
+                            <span class="ms-2"><strong>Type:</strong> <span id="statsDisplayType">-</span></span>
+                            <span class="ms-2"><strong>Freq:</strong> <span id="statsDisplayFreq">-</span></span>
+                            <span class="ms-2">-</span>
+                            <span class="ms-2"><strong>Frames:</strong> <span id="statsFrameCount">0</span></span>
+                        </span>
+                        <select class="form-select form-select-sm" id="statsLogfileSelector" style="width: auto; max-width: 300px;" onchange="if(this.value) loadStatsFromLogfile(this.value)">
+                            <option value="">Select logfile...</option>
+                        </select>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                </div>
+                <div class="modal-body" style="background: #f8f9fa;">
+                    <div class="row g-3">
+                        <div class="col-md-6 stats-chart-container" id="altitudeContainer">
+                            <div class="card">
+                                <div class="card-body">
+                                    <div class="chart-card-header">
+                                        <h6 class="card-title mb-0"><i class="bi bi-geo-alt"></i> Altitude</h6>
+                                        <button class="chart-maximize-btn" onclick="maximizeChart('altitude')" title="Maximize view">
+                                            <i class="bi bi-three-dots-vertical"></i>
+                                        </button>
+                                    </div>
+                                    <canvas id="altitudeChart" style="max-height: 200px;"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-6 stats-chart-container" id="velVContainer">
+                            <div class="card">
+                                <div class="card-body">
+                                    <div class="chart-card-header">
+                                        <h6 class="card-title mb-0"><i class="bi bi-arrows-vertical"></i> Vertical Velocity</h6>
+                                        <button class="chart-maximize-btn" onclick="maximizeChart('velV')" title="Maximize view">
+                                            <i class="bi bi-three-dots-vertical"></i>
+                                        </button>
+                                    </div>
+                                    <canvas id="velVChart" style="max-height: 200px;"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-6 stats-chart-container" id="velHContainer">
+                            <div class="card">
+                                <div class="card-body">
+                                    <div class="chart-card-header">
+                                        <h6 class="card-title mb-0"><i class="bi bi-speedometer2"></i> Horizontal Velocity</h6>
+                                        <button class="chart-maximize-btn" onclick="maximizeChart('velH')" title="Maximize view">
+                                            <i class="bi bi-three-dots-vertical"></i>
+                                        </button>
+                                    </div>
+                                    <canvas id="velHChart" style="max-height: 200px;"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-6 stats-chart-container" id="rssiContainer">
+                            <div class="card">
+                                <div class="card-body">
+                                    <div class="chart-card-header">
+                                        <h6 class="card-title mb-0"><i class="bi bi-reception-4"></i> RSSI</h6>
+                                        <button class="chart-maximize-btn" onclick="maximizeChart('rssi')" title="Maximize view">
+                                            <i class="bi bi-three-dots-vertical"></i>
+                                        </button>
+                                    </div>
+                                    <canvas id="rssiChart" style="max-height: 200px;"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-6 stats-chart-container" id="satContainer">
+                            <div class="card">
+                                <div class="card-body">
+                                    <div class="chart-card-header">
+                                        <h6 class="card-title mb-0"><i class="bi bi-broadcast-pin"></i> Satellites</h6>
+                                        <button class="chart-maximize-btn" onclick="maximizeChart('sat')" title="Maximize view">
+                                            <i class="bi bi-three-dots-vertical"></i>
+                                        </button>
+                                    </div>
+                                    <canvas id="satChart" style="max-height: 200px;"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-6 stats-chart-container" id="battContainer">
+                            <div class="card">
+                                <div class="card-body">
+                                    <div class="chart-card-header">
+                                        <h6 class="card-title mb-0"><i class="bi bi-battery-half"></i> Battery</h6>
+                                        <button class="chart-maximize-btn" onclick="maximizeChart('batt')" title="Maximize view">
+                                            <i class="bi bi-three-dots-vertical"></i>
+                                        </button>
+                                    </div>
+                                    <canvas id="battChart" style="max-height: 200px;"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-12 stats-chart-container" id="snrContainer">
+                            <div class="card">
+                                <div class="card-body">
+                                    <div class="chart-card-header">
+                                        <h6 class="card-title mb-0"><i class="bi bi-graph-up-arrow"></i> SNR</h6>
+                                        <button class="chart-maximize-btn" onclick="maximizeChart('snr')" title="Maximize view">
+                                            <i class="bi bi-three-dots-vertical"></i>
+                                        </button>
+                                    </div>
+                                    <canvas id="snrChart" style="max-height: 200px;"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-success" onclick="showSondeOnMap()">
+                        <i class="bi bi-pin-map"></i> Show on Map
+                    </button>
+                    <div class="ms-auto"></div>
+                    <button type="button" class="btn btn-primary" onclick="refreshSondeStatistics()">
+                        <i class="bi bi-arrow-clockwise"></i> Refresh
+                    </button>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sonde Prediction Modal -->
+    <div class="modal fade" id="sondePredictionModal" tabindex="-1">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-pin-map"></i> Landing Prediction - <span id="predSondeSerial"></span></h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" style="background: #f8f9fa;">
+                    <div class="alert alert-warning">
+                        <i class="bi bi-exclamation-triangle"></i> <strong>Coming soon:</strong> Tawhiri landing prediction will be integrated in the next update.
+                    </div>
+                    <div id="predictionMapContainer" style="height: 500px; border-radius: 8px; overflow: hidden;">
+                        <!-- Prediction map will be rendered here -->
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Context Menu for Sonde Actions -->
+    <div id="sondeContextMenu" style="display: none; position: fixed; z-index: 1060; background: white; border: 1px solid #ccc; border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); padding: 4px 0; min-width: 180px;">
+        <div class="context-menu-item" onclick="showSondeStatistics()" style="padding: 8px 16px; cursor: pointer; transition: background 0.2s;">
+            <i class="bi bi-graph-up"></i> Sonde Statistics
+        </div>
+        <div class="context-menu-item" onclick="showSondePrediction()" style="padding: 8px 16px; cursor: pointer; transition: background 0.2s;">
+            <i class="bi bi-pin-map"></i> Sonde Prediction
+        </div>
+    </div>
+
+
+
     <script>
+        // ---- Context menu script v1.0.50 - 2026-06-15 ----
+        // ---- Context menu state ----
+        console.log('[OPENWXSDR] Context menu script v1.0.50 loaded');
+        let contextMenuSondeSerial = null;
+        let sondeStatisticsCharts = {};
+        let currentStatsSonde = { serial: null, type: null, frequency: null, filename: null };
+        let inactiveSondes = [];  // Track sondes viewed from logfiles and shown on map
+        
+        // Test function availability
+        window.addEventListener('DOMContentLoaded', function() {
+            console.log('[OPENWXSDR] DOM loaded, testing modal elements...');
+            console.log('[OPENWXSDR] Statistics modal exists:', !!document.getElementById('sondeStatisticsModal'));
+            console.log('[OPENWXSDR] Context menu exists:', !!document.getElementById('sondeContextMenu'));
+            console.log('[OPENWXSDR] Bootstrap Modal available:', typeof bootstrap !== 'undefined' && typeof bootstrap.Modal !== 'undefined');
+            
+            // Add event listener to clean up backdrop when modal is closed
+            const statsModal = document.getElementById('sondeStatisticsModal');
+            if (statsModal) {
+                statsModal.addEventListener('hidden.bs.modal', function() {
+                    // Clean up any remaining backdrop elements
+                    setTimeout(() => {
+                        document.querySelectorAll('.modal-backdrop').forEach(el => el.remove());
+                        document.body.classList.remove('modal-open');
+                        document.body.style.overflow = '';
+                        document.body.style.paddingRight = '';
+                    }, 100);
+                });
+            }
+        });
+        
+        // ---- Expose functions to global scope for inline event handlers ----
+        // These functions are called from onclick/oncontextmenu attributes in dynamically generated HTML
+        window.testStatisticsModal = function testStatisticsModal() {
+            console.log('[OPENWXSDR] Show Statistics button clicked');
+            // Populate logfile selector
+            populateLogfileSelector();
+            // Show modal
+            const modal = new bootstrap.Modal(document.getElementById('sondeStatisticsModal'));
+            modal.show();
+        }
+        
+        // Populate logfile selector dropdown
+        window.populateLogfileSelector = async function populateLogfileSelector() {
+            try {
+                const response = await fetch('/api/logfiles');
+                const data = await response.json();
+                
+                const selector = document.getElementById('statsLogfileSelector');
+                selector.innerHTML = '<option value="">Select logfile...</option>';
+                
+                // Filter to only sonde logfiles and parse
+                const logfiles = (data.files || [])
+                    .filter(f => !f.startsWith('openwxsdr_') && f.endsWith('.log'))
+                    .map(parseLogfileName)
+                    .filter(item => item.type !== 'Unknown' && item.type !== 'Activity')
+                    .sort((a, b) => b.timestamp - a.timestamp); // Sort by date descending
+                
+                logfiles.forEach(item => {
+                    const opt = document.createElement('option');
+                    opt.value = item.filename;
+                    const serial = item.filename.split('-')[0];
+                    opt.textContent = `${serial} (${item.type}) - ${item.date}`;
+                    selector.appendChild(opt);
+                });
+            } catch (error) {
+                console.error('[OPENWXSDR] Error loading logfiles:', error);
+            }
+        }
+
+        // Load statistics from selected logfile
+        window.loadStatsFromLogfile = async function loadStatsFromLogfile(filename) {
+            console.log('=== STEP 1: Showing loading modal ===');
+            
+            // STEP 1: Show loading modal
+            const loadingModalEl = document.getElementById('loadingModal');
+            const loadingModal = new bootstrap.Modal(loadingModalEl, { backdrop: 'static', keyboard: false });
+            document.getElementById('loadingModalText').textContent = 'Loading logfile data...';
+            
+            await new Promise((resolve) => {
+                loadingModalEl.addEventListener('shown.bs.modal', resolve, { once: true });
+                loadingModal.show();
+            });
+            console.log('=== Modal is now visible ===');
+            
+            try {
+                console.log('=== STEP 2: Loading file ===');
+                
+                // Clear any previous error messages
+                const existingErrors = document.querySelectorAll('#sondeStatisticsModal .alert-danger');
+                existingErrors.forEach(err => err.remove());
+                
+                // Fetch data
+                const response = await fetch(`/api/logfile/${encodeURIComponent(filename)}/history`);
+                console.log('Fetch complete, status:', response.status);
+                if (!response.ok) throw new Error('Failed to fetch logfile history');
+                
+                const data = await response.json();
+                console.log('Parse complete, frames:', data.frames?.length);
+                
+                if (!data || !data.frames || data.frames.length === 0) {
+                    throw new Error('No historical data available in logfile');
+                }
+                
+                console.log('Data fetched, processing...');
+                
+                const serial = data.serial;  // Extract serial from response
+                
+                // Update current sonde info
+                currentStatsSonde.serial = serial;
+                currentStatsSonde.filename = filename;
+                
+                // Determine sonde type and frequency from frames
+                const framesWithFreq = data.frames.filter(f => f.frequency);
+                currentStatsSonde.frequency = framesWithFreq.length > 0 ? framesWithFreq[0].frequency : null;
+                
+                // Parse type from filename
+                const match = filename.match(/^(.+?)-(\d{8})-(\d{6})\.log$/);
+                if (match) {
+                    const serialPart = match[1];
+                    if (serialPart.match(/^[A-Z]\d{7}/)) currentStatsSonde.type = 'RS41';
+                    else if (serialPart.match(/^[A-Z]\d{6}/)) currentStatsSonde.type = 'RS92';
+                    else if (serialPart.match(/^(DFM|D)/i)) currentStatsSonde.type = 'DFM';
+                    else if (serialPart.match(/^M10/i)) currentStatsSonde.type = 'M10';
+                    else if (serialPart.match(/^M20/i)) currentStatsSonde.type = 'M20';
+                    else if (serialPart.match(/^W\d+/)) currentStatsSonde.type = 'iMet';
+                    else if (serialPart.match(/^L\d+/)) currentStatsSonde.type = 'LMS6';
+                    else if (serialPart.match(/^ME\d+/)) currentStatsSonde.type = 'MRZ';
+                    else currentStatsSonde.type = 'Unknown';
+                }
+                
+                // Update header display
+                document.getElementById('statsDisplaySerial').textContent = serial;
+                document.getElementById('statsDisplayType').textContent = currentStatsSonde.type || '-';
+                document.getElementById('statsDisplayFreq').textContent = currentStatsSonde.frequency ? 
+                    currentStatsSonde.frequency.toFixed(3) + ' MHz' : '-';
+                
+                // Update dropdown selector
+                const selector = document.getElementById('statsLogfileSelector');
+                if (selector) selector.value = filename;
+                
+                document.getElementById('statsFrameCount').textContent = data.frames.length;
+                
+                // Prepare data for charts - keep all frames with nulls creating gaps
+                const frames = data.frames;
+                const timestamps = frames.map(f => new Date(f.timestamp));
+                const altitudes = frames.map(f => f.alt);
+                const velVs = frames.map(f => f.vel_v);
+                const velHs = frames.map(f => f.vel_h);
+                const rssis = frames.map(f => f.rssi);
+                const snrs = frames.map(f => f.snr);
+                const sats = frames.map(f => f.sats);
+                const batteries = frames.map(f => f.battery);
+                
+                console.log('Destroying existing charts');
+                // Destroy existing charts from tracking object
+                Object.values(sondeStatisticsCharts).forEach(chart => chart && chart.destroy());
+                sondeStatisticsCharts = {};
+                
+                // Also destroy any orphaned charts directly from canvases
+                ['altitudeChart', 'velVChart', 'velHChart', 'rssiChart', 'snrChart', 'satChart', 'battChart'].forEach(canvasId => {
+                    const existingChart = Chart.getChart(canvasId);
+                    if (existingChart) existingChart.destroy();
+                });
+                
+                console.log('Creating charts with 24-hour time format');
+                // Create charts
+                const commonOptions = {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false
+                    },
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            enabled: true,
+                            backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                            titleColor: '#fff',
+                            bodyColor: '#fff',
+                            borderColor: 'rgba(255, 255, 255, 0.3)',
+                            borderWidth: 1,
+                            padding: 12,
+                            displayColors: false,
+                            callbacks: {
+                                title: function(context) {
+                                    if (context[0].parsed.x) {
+                                        const date = new Date(context[0].parsed.x);
+                                        return date.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+                                    }
+                                    return '';
+                                },
+                                label: function(context) {
+                                    let label = context.dataset.label || '';
+                                    if (label) {
+                                        label += ': ';
+                                    }
+                                    if (context.parsed.y !== null) {
+                                        label += context.parsed.y.toFixed(2);
+                                    }
+                                    return label;
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                unit: 'minute',
+                                displayFormats: {
+                                    minute: 'HH:mm',
+                                    hour: 'HH:mm'
+                                },
+                                tooltipFormat: 'yyyy-MM-dd HH:mm:ss'
+                            },
+                            title: { display: true, text: 'Time (UTC)' }
+                        }
+                    },
+                    spanGaps: false  // Show gaps where data is null
+                };
+                
+                // Altitude chart
+                sondeStatisticsCharts.altitude = new Chart(document.getElementById('altitudeChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'Altitude (m)',
+                            data: altitudes,
+                            borderColor: '#4DA6FF',
+                            backgroundColor: 'rgba(77, 166, 255, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { title: { display: true, text: 'Altitude (m)' } }
+                        }
+                    }
+                });
+                
+                // Vertical velocity chart
+                sondeStatisticsCharts.velV = new Chart(document.getElementById('velVChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'Vertical Velocity (m/s)',
+                            data: velVs,
+                            borderColor: '#28a745',
+                            backgroundColor: 'rgba(40, 167, 69, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { title: { display: true, text: 'Velocity (m/s)' } }
+                        }
+                    }
+                });
+                
+                // Horizontal velocity chart
+                sondeStatisticsCharts.velH = new Chart(document.getElementById('velHChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'Horizontal Velocity (m/s)',
+                            data: velHs,
+                            borderColor: '#ffc107',
+                            backgroundColor: 'rgba(255, 193, 7, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { title: { display: true, text: 'Velocity (m/s)' } }
+                        }
+                    }
+                });
+                
+                // RSSI chart
+                sondeStatisticsCharts.rssi = new Chart(document.getElementById('rssiChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'RSSI (dBm)',
+                            data: rssis,
+                            borderColor: '#dc3545',
+                            backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { title: { display: true, text: 'RSSI (dBm)' } }
+                        }
+                    }
+                });
+                
+                // SNR chart
+                sondeStatisticsCharts.snr = new Chart(document.getElementById('snrChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'SNR (dB)',
+                            data: snrs,
+                            borderColor: '#6f42c1',
+                            backgroundColor: 'rgba(111, 66, 193, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { title: { display: true, text: 'SNR (dB)' } }
+                        }
+                    }
+                });
+                
+                // Satellites chart
+                sondeStatisticsCharts.sat = new Chart(document.getElementById('satChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'Satellites',
+                            data: sats,
+                            borderColor: '#20c997',
+                            backgroundColor: 'rgba(32, 201, 151, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { 
+                                title: { display: true, text: 'Satellites' },
+                                ticks: { stepSize: 1 }
+                            }
+                        }
+                    }
+                });
+                
+                // Battery chart
+                sondeStatisticsCharts.batt = new Chart(document.getElementById('battChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'Battery (V)',
+                            data: batteries,
+                            borderColor: '#fd7e14',
+                            backgroundColor: 'rgba(253, 126, 20, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { title: { display: true, text: 'Battery (V)' } }
+                        }
+                    }
+                });
+                
+                console.log('Charts created, data loaded successfully');
+                
+                console.log('=== STEP 3: Hiding loading modal ===');
+                
+                // STEP 3: Hide loading modal
+                await new Promise((resolve) => {
+                    loadingModalEl.addEventListener('hidden.bs.modal', resolve, { once: true });
+                    loadingModal.hide();
+                });
+                
+                console.log('=== Modal is now hidden, showing statistics ===');
+                
+                // Show statistics modal
+                const statsModal = new bootstrap.Modal(document.getElementById('sondeStatisticsModal'));
+                statsModal.show();
+                
+            } catch (error) {
+                console.error('Error loading logfile:', error);
+                
+                // Hide loading modal on error
+                await new Promise((resolve) => {
+                    loadingModalEl.addEventListener('hidden.bs.modal', resolve, { once: true });
+                    loadingModal.hide();
+                });
+                
+                // Clean up any stuck backdrops
+                setTimeout(() => {
+                    document.querySelectorAll('.modal-backdrop').forEach(el => el.remove());
+                    document.body.classList.remove('modal-open');
+                    document.body.style.overflow = '';
+                    document.body.style.paddingRight = '';
+                }, 100);
+                
+                alert('Error loading logfile: ' + error.message);
+            }
+        }
+
+        // Show sonde on map
+        window.showSondeOnMap = async function showSondeOnMap() {
+            if (!currentStatsSonde.filename) {
+                alert('No logfile loaded');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/api/logfile/${encodeURIComponent(currentStatsSonde.filename)}/history`);
+                if (!response.ok) throw new Error('Failed to fetch history');
+                
+                const data = await response.json();
+                const frames = data.frames || [];
+                
+                // Filter frames with valid position
+                const validFrames = frames.filter(f => f.lat && f.lon);
+                if (validFrames.length === 0) {
+                    alert('No position data available in logfile');
+                    return;
+                }
+                
+                // Create path coordinates
+                const pathCoords = validFrames.map(f => [f.lat, f.lon]);
+                
+                // Remove existing path for this sonde if any
+                if (sondePaths[currentStatsSonde.serial]) {
+                    map.removeLayer(sondePaths[currentStatsSonde.serial]);
+                }
+                
+                // Draw path
+                const color = sondeColors[currentStatsSonde.type] || '#6c757d';
+                const path = L.polyline(pathCoords, {
+                    color: color,
+                    weight: 3,
+                    opacity: 0.6
+                }).addTo(map);
+                
+                sondePaths[currentStatsSonde.serial] = path;
+                
+                // Remove existing markers for this sonde if any
+                if (inactiveSondeLaunchMarkers[currentStatsSonde.serial]) {
+                    map.removeLayer(inactiveSondeLaunchMarkers[currentStatsSonde.serial]);
+                }
+                if (inactiveSondeLandingMarkers[currentStatsSonde.serial]) {
+                    map.removeLayer(inactiveSondeLandingMarkers[currentStatsSonde.serial]);
+                }
+                
+                // Add launch marker at first position
+                if (validFrames.length > 0) {
+                    const firstFrame = validFrames[0];
+                    const launchIcon = L.icon({
+                        iconUrl: '/assets/img/launch-marker.png',
+                        iconSize: [16, 16],
+                        iconAnchor: [8, 8],
+                        popupAnchor: [0, -11]
+                    });
+                    const launchMarker = L.marker([firstFrame.lat, firstFrame.lon], { icon: launchIcon })
+                        .bindPopup(`<strong>Launch:</strong> ${currentStatsSonde.serial}<br>${firstFrame.timestamp}`)
+                        .addTo(map);
+                    inactiveSondeLaunchMarkers[currentStatsSonde.serial] = launchMarker;
+                }
+                
+                // Add landing/last position marker
+                const lastFrame = validFrames[validFrames.length - 1];
+                const landingIcon = L.icon({
+                    iconUrl: '/assets/img/chute_grey.png',
+                    iconSize: [16, 28],
+                    iconAnchor: [8, 28],                    
+                    popupAnchor: [0, -28]
+                });
+                const landingMarker = L.marker([lastFrame.lat, lastFrame.lon], { icon: landingIcon })
+                    .bindPopup(`<strong>Last Position:</strong> ${currentStatsSonde.serial}<br>${lastFrame.timestamp}<br>Lat/Lon: ${lastFrame.lat.toFixed(5)}, ${lastFrame.lon.toFixed(5)}<br>Alt: ${lastFrame.alt ? Math.round(lastFrame.alt) + ' m' : 'N/A'}`)
+                    .addTo(map);
+                inactiveSondeLandingMarkers[currentStatsSonde.serial] = landingMarker;
+                
+                // Fit map to path bounds
+                map.fitBounds(path.getBounds().pad(0.1));
+                
+                // Close modal and remove backdrop
+                const modal = bootstrap.Modal.getInstance(document.getElementById('sondeStatisticsModal'));
+                if (modal) {
+                    modal.hide();
+                    // Ensure backdrop is removed
+                    setTimeout(() => {
+                        document.querySelectorAll('.modal-backdrop').forEach(el => el.remove());
+                        document.body.classList.remove('modal-open');
+                        document.body.style.overflow = '';
+                        document.body.style.paddingRight = '';
+                    }, 300);
+                }
+                
+                // Add to inactive sondes list if not already there
+                if (!inactiveSondes.find(s => s.serial === currentStatsSonde.serial)) {
+                    inactiveSondes.push({
+                        serial: currentStatsSonde.serial,
+                        type: currentStatsSonde.type,
+                        frequency: currentStatsSonde.frequency,
+                        filename: currentStatsSonde.filename
+                    });
+                    updateInactiveSondesList();
+                }
+                
+            } catch (error) {
+                console.error('Error showing sonde on map:', error);
+                alert('Failed to load track data: ' + error.message);
+            }
+        }
+
+        // Update inactive sondes list
+        function updateInactiveSondesList() {
+            const list = document.getElementById('inactiveSondesList');
+            const header = document.getElementById('inactiveSondesHeader');
+            
+            if (inactiveSondes.length === 0) {
+                // Hide the entire section when empty
+                list.style.display = 'none';
+                header.style.display = 'none';
+                return;
+            }
+            
+            // Show the section when there are inactive sondes
+            list.style.display = 'block';
+            header.style.display = 'block';
+            
+            list.innerHTML = inactiveSondes.map(sonde => {
+                const color = sondeColors[sonde.type] || '#6c757d';
+                return `
+                    <div class="sonde-card" style="background: #f8f9fa; opacity: 0.85;" onclick="loadStatsFromLogfile('${sonde.filename}')">
+                        <div class="sonde-header">
+                            <div style="display:flex; align-items:baseline; gap:4px;">
+                                <span class="sonde-serial">${sonde.serial}</span>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:8px;">
+                                <span class="sonde-type" style="background: ${color};">${sonde.type}</span>
+                                <button class="btn btn-sm btn-outline-danger" style="padding: 2px 6px; font-size: 11px;" onclick="event.stopPropagation(); removeInactiveSonde('${sonde.serial}')">
+                                    <i class="bi bi-x"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="sonde-data">
+                            <div class="data-item">
+                                <i class="bi bi-broadcast"></i> <span class="data-value">${sonde.frequency ? sonde.frequency.toFixed(3) + ' MHz' : 'N/A'}</span>
+                            </div>
+                            <div class="data-item">
+                                <i class="bi bi-file-text"></i> <span class="data-value">From log</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // Remove inactive sonde from list
+        window.removeInactiveSonde = function removeInactiveSonde(serial) {
+            inactiveSondes = inactiveSondes.filter(s => s.serial !== serial);
+            updateInactiveSondesList();
+            
+            // Remove path from map if exists
+            if (sondePaths[serial]) {
+                map.removeLayer(sondePaths[serial]);
+                delete sondePaths[serial];
+            }
+            
+            // Remove launch marker if exists
+            if (inactiveSondeLaunchMarkers[serial]) {
+                map.removeLayer(inactiveSondeLaunchMarkers[serial]);
+                delete inactiveSondeLaunchMarkers[serial];
+            }
+            
+            // Remove landing marker if exists
+            if (inactiveSondeLandingMarkers[serial]) {
+                map.removeLayer(inactiveSondeLandingMarkers[serial]);
+                delete inactiveSondeLandingMarkers[serial];
+            }
+        }
+
+        // Maximize/minimize chart functions
+        let maximizedChart = null;
+        let isResizing = false;  // Guard against repeated resize calls
+        
+        window.maximizeChart = function maximizeChart(chartId) {
+            const container = document.getElementById(chartId + 'Container');
+            if (!container || maximizedChart === chartId) return;
+            
+            // Store reference to maximized chart
+            maximizedChart = chartId;
+            
+            // Add maximized class
+            container.classList.add('maximized');
+            
+            // Create close button if it doesn't exist
+            let closeBtn = container.querySelector('.chart-close-btn');
+            if (!closeBtn) {
+                closeBtn = document.createElement('button');
+                closeBtn.className = 'chart-close-btn';
+                closeBtn.innerHTML = '<i class="bi bi-x-lg"></i> Close';
+                closeBtn.onclick = function() { minimizeChart(chartId); };
+                container.appendChild(closeBtn);
+            }
+            
+            // Resize chart to fit new container (once)
+            if (!isResizing) {
+                isResizing = true;
+                setTimeout(() => {
+                    if (sondeStatisticsCharts[chartId]) {
+                        // Disable responsive to prevent automatic resizing
+                        sondeStatisticsCharts[chartId].options.responsive = false;
+                        sondeStatisticsCharts[chartId].resize();
+                    }
+                    isResizing = false;
+                }, 150);
+            }
+        }
+        
+        window.minimizeChart = function minimizeChart(chartId) {
+            const container = document.getElementById(chartId + 'Container');
+            if (!container) return;
+            
+            // Remove maximized class
+            container.classList.remove('maximized');
+            
+            // Remove close button
+            const closeBtn = container.querySelector('.chart-close-btn');
+            if (closeBtn) closeBtn.remove();
+            
+            // Clear maximized reference
+            maximizedChart = null;
+            
+            // Resize chart to fit original container (once)
+            if (!isResizing) {
+                isResizing = true;
+                setTimeout(() => {
+                    if (sondeStatisticsCharts[chartId]) {
+                        // Re-enable responsive behavior
+                        sondeStatisticsCharts[chartId].options.responsive = true;
+                        sondeStatisticsCharts[chartId].resize();
+                    }
+                    isResizing = false;
+                }, 150);
+            }
+        }
+        
+        // Show context menu on right-click
+        window.showSondeContextMenu = function showSondeContextMenu(event, sondeSerial) {
+            console.log('[OPENWXSDR] showSondeContextMenu called for:', sondeSerial);
+            event.preventDefault();
+            event.stopPropagation();
+            
+            contextMenuSondeSerial = sondeSerial;
+            const menu = document.getElementById('sondeContextMenu');
+            menu.style.display = 'block';
+            
+            // Position menu, but check for viewport overflow
+            let left = event.pageX;
+            let top = event.pageY;
+            
+            // Get menu dimensions after making it visible
+            const menuWidth = menu.offsetWidth;
+            const menuHeight = menu.offsetHeight;
+            
+            // Get viewport dimensions
+            const viewportWidth = window.innerWidth + window.pageXOffset;
+            const viewportHeight = window.innerHeight + window.pageYOffset;
+            
+            // Check right edge overflow
+            if (left + menuWidth > viewportWidth) {
+                left = viewportWidth - menuWidth - 10; // 10px margin
+            }
+            
+            // Check bottom edge overflow
+            if (top + menuHeight > viewportHeight) {
+                top = viewportHeight - menuHeight - 10; // 10px margin
+            }
+            
+            // Ensure menu stays within left and top bounds
+            left = Math.max(10, left);
+            top = Math.max(10, top);
+            
+            menu.style.left = left + 'px';
+            menu.style.top = top + 'px';
+        }
+
+        // Hide context menu
+        function hideSondeContextMenu() {
+            document.getElementById('sondeContextMenu').style.display = 'none';
+            contextMenuSondeSerial = null;
+        }
+
+        // Close context menu when clicking elsewhere
+        document.addEventListener('click', function() {
+            hideSondeContextMenu();
+        });
+
+        // Add hover effects to context menu items
+        document.querySelectorAll('.context-menu-item').forEach(item => {
+            item.addEventListener('mouseenter', function() {
+                this.style.background = '#f0f0f0';
+            });
+            item.addEventListener('mouseleave', function() {
+                this.style.background = 'transparent';
+            });
+        });
+
+        // Show sonde statistics modal
+        window.showSondeStatistics = async function showSondeStatistics() {
+            const serial = contextMenuSondeSerial;
+            console.log('showSondeStatistics called for:', serial);
+            hideSondeContextMenu();
+            if (!serial) {
+                console.error('No sonde serial selected');
+                return;
+            }
+            
+            // Get modal element and ensure it's in the DOM
+            const modalElement = document.getElementById('sondeStatisticsModal');
+            if (!modalElement) {
+                console.error('Modal element not found');
+                alert('Error: Statistics modal not found');
+                return;
+            }
+            
+            console.log('Creating Bootstrap modal instance');
+            // Show modal first (empty)
+            const modal = new bootstrap.Modal(modalElement, {
+                backdrop: true,
+                keyboard: true,
+                focus: true
+            });
+            modal.show();
+            
+            console.log('Modal shown, fetching data for', serial);
+            
+            // Fetch historical data from in-memory
+            try {
+                const response = await fetch(`/api/sonde/${serial}/history`);
+                console.log('API response status:', response.status);
+                
+                if (!response.ok) throw new Error('Failed to fetch sonde history');
+                
+                const data = await response.json();
+                console.log('Received data:', data);
+                
+                if (!data || !data.frames || data.frames.length === 0) {
+                    throw new Error('No historical data available');
+                }
+                
+                // Update current sonde info
+                currentStatsSonde.serial = serial;
+                currentStatsSonde.filename = null; // In-memory, no logfile
+                
+                // Extract type and frequency from first frame
+                const framesWithFreq = data.frames.filter(f => f.frequency);
+                currentStatsSonde.frequency = framesWithFreq.length > 0 ? framesWithFreq[0].frequency : null;
+                
+                // Try to determine type from active sondes list
+                const activeSondesResponse = await fetch('/api/sondes');
+                const activeSondesData = await activeSondesResponse.json();
+                const activeSonde = (activeSondesData.sondes || []).find(s => s.serial === serial);
+                currentStatsSonde.type = activeSonde ? activeSonde.type : 'Unknown';
+                
+                // Update header display
+                document.getElementById('statsDisplaySerial').textContent = serial;
+                document.getElementById('statsDisplayType').textContent = currentStatsSonde.type;
+                document.getElementById('statsDisplayFreq').textContent = currentStatsSonde.frequency ? 
+                    currentStatsSonde.frequency.toFixed(3) + ' MHz' : '-';
+                
+                document.getElementById('statsFrameCount').textContent = data.frames.length;
+                
+                // Prepare data for charts - keep all frames with nulls creating gaps
+                const frames = data.frames;
+                const timestamps = frames.map(f => new Date(f.timestamp));
+                const altitudes = frames.map(f => f.alt);
+                const velVs = frames.map(f => f.vel_v);
+                const velHs = frames.map(f => f.vel_h);
+                const rssis = frames.map(f => f.rssi);
+                const snrs = frames.map(f => f.snr);
+                const sats = frames.map(f => f.sats);
+                const batteries = frames.map(f => f.battery);
+                
+                console.log('Destroying existing charts');
+                // Destroy existing charts from tracking object
+                Object.values(sondeStatisticsCharts).forEach(chart => chart && chart.destroy());
+                sondeStatisticsCharts = {};
+                
+                // Also destroy any orphaned charts directly from canvases
+                ['altitudeChart', 'velVChart', 'velHChart', 'rssiChart', 'snrChart', 'satChart', 'battChart'].forEach(canvasId => {
+                    const existingChart = Chart.getChart(canvasId);
+                    if (existingChart) existingChart.destroy();
+                });
+                
+                console.log('Creating charts');
+                // Create charts with 24-hour time format
+                const commonOptions = {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false
+                    },
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            enabled: true,
+                            backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                            titleColor: '#fff',
+                            bodyColor: '#fff',
+                            borderColor: 'rgba(255, 255, 255, 0.3)',
+                            borderWidth: 1,
+                            padding: 12,
+                            displayColors: false,
+                            callbacks: {
+                                title: function(context) {
+                                    if (context[0].parsed.x) {
+                                        const date = new Date(context[0].parsed.x);
+                                        return date.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+                                    }
+                                    return '';
+                                },
+                                label: function(context) {
+                                    let label = context.dataset.label || '';
+                                    if (label) {
+                                        label += ': ';
+                                    }
+                                    if (context.parsed.y !== null) {
+                                        label += context.parsed.y.toFixed(2);
+                                    }
+                                    return label;
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                unit: 'minute',
+                                displayFormats: {
+                                    minute: 'HH:mm',
+                                    hour: 'HH:mm'
+                                },
+                                tooltipFormat: 'yyyy-MM-dd HH:mm:ss'
+                            },
+                            title: { display: true, text: 'Time (UTC)' }
+                        }
+                    },
+                    spanGaps: false  // Show gaps where data is null
+                };
+                
+                // Altitude chart
+                sondeStatisticsCharts.altitude = new Chart(document.getElementById('altitudeChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'Altitude (m)',
+                            data: altitudes,
+                            borderColor: '#4DA6FF',
+                            backgroundColor: 'rgba(77, 166, 255, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { title: { display: true, text: 'Altitude (m)' } }
+                        }
+                    }
+                });
+                
+                // Vertical velocity chart
+                sondeStatisticsCharts.velV = new Chart(document.getElementById('velVChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'Vertical Velocity (m/s)',
+                            data: velVs,
+                            borderColor: '#28a745',
+                            backgroundColor: 'rgba(40, 167, 69, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { title: { display: true, text: 'Velocity (m/s)' } }
+                        }
+                    }
+                });
+                
+                // Horizontal velocity chart
+                sondeStatisticsCharts.velH = new Chart(document.getElementById('velHChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'Horizontal Velocity (m/s)',
+                            data: velHs,
+                            borderColor: '#ffc107',
+                            backgroundColor: 'rgba(255, 193, 7, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { title: { display: true, text: 'Velocity (m/s)' } }
+                        }
+                    }
+                });
+                
+                // RSSI chart
+                sondeStatisticsCharts.rssi = new Chart(document.getElementById('rssiChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'RSSI (dBm)',
+                            data: rssis,
+                            borderColor: '#dc3545',
+                            backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { title: { display: true, text: 'RSSI (dBm)' } }
+                        }
+                    }
+                });
+                
+                // SNR chart
+                sondeStatisticsCharts.snr = new Chart(document.getElementById('snrChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'SNR (dB)',
+                            data: snrs,
+                            borderColor: '#6f42c1',
+                            backgroundColor: 'rgba(111, 66, 193, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { title: { display: true, text: 'SNR (dB)' } }
+                        }
+                    }
+                });
+                
+                // Satellites chart
+                sondeStatisticsCharts.sat = new Chart(document.getElementById('satChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'Satellites',
+                            data: sats,
+                            borderColor: '#20c997',
+                            backgroundColor: 'rgba(32, 201, 151, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { 
+                                title: { display: true, text: 'Satellites' },
+                                ticks: { stepSize: 1 }
+                            }
+                        }
+                    }
+                });
+                
+                // Battery chart
+                sondeStatisticsCharts.batt = new Chart(document.getElementById('battChart'), {
+                    type: 'line',
+                    data: {
+                        labels: timestamps,
+                        datasets: [{
+                            label: 'Battery (V)',
+                            data: batteries,
+                            borderColor: '#fd7e14',
+                            backgroundColor: 'rgba(253, 126, 20, 0.1)',
+                            fill: true,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        ...commonOptions,
+                        scales: {
+                            ...commonOptions.scales,
+                            y: { title: { display: true, text: 'Battery (V)' } }
+                        }
+                    }
+                });
+                
+            } catch (error) {
+                console.error('Error loading sonde statistics:', error);
+                // Show error in modal instead of hiding it
+                const errorMsg = document.createElement('div');
+                errorMsg.className = 'alert alert-danger m-3';
+                errorMsg.innerHTML = `<i class="bi bi-exclamation-triangle"></i> <strong>Error:</strong> ${error.message}`;
+                document.querySelector('#sondeStatisticsModal .modal-body').prepend(errorMsg);
+            }
+        }
+
+        // Refresh sonde statistics - reload data without closing modal
+        window.refreshSondeStatistics = async function refreshSondeStatistics() {
+            const serial = currentStatsSonde.serial;
+            const filename = currentStatsSonde.filename;
+            
+            if (!serial) {
+                console.error('No sonde loaded for refresh');
+                return;
+            }
+            
+            console.log('Refreshing statistics for:', serial);
+            
+            // Clear any previous error messages
+            const existingErrors = document.querySelectorAll('#sondeStatisticsModal .alert-danger');
+            existingErrors.forEach(err => err.remove());
+            
+            // Determine if we're refreshing from logfile or in-memory
+            const endpoint = filename ? 
+                `/api/logfile/${encodeURIComponent(filename)}/history` : 
+                `/api/sonde/${serial}/history`;
+            
+            // Fetch and update charts
+            try {
+                const response = await fetch(endpoint);
+                console.log('API response status:', response.status);
+                
+                if (!response.ok) throw new Error('Failed to fetch sonde history');
+                
+                const data = await response.json();
+                console.log('Received data:', data);
+                
+                if (!data || !data.frames || data.frames.length === 0) {
+                    throw new Error('No historical data available');
+                }
+                
+                document.getElementById('statsFrameCount').textContent = data.frames.length;
+                
+                // Prepare data for charts - keep all frames with nulls creating gaps
+                const frames = data.frames;
+                const timestamps = frames.map(f => new Date(f.timestamp));
+                const altitudes = frames.map(f => f.alt);
+                const velVs = frames.map(f => f.vel_v);
+                const velHs = frames.map(f => f.vel_h);
+                const rssis = frames.map(f => f.rssi);
+                const snrs = frames.map(f => f.snr);
+                const sats = frames.map(f => f.sats);
+                const batteries = frames.map(f => f.battery);
+                
+                // Update existing charts
+                sondeStatisticsCharts.altitude.data.labels = timestamps;
+                sondeStatisticsCharts.altitude.data.datasets[0].data = altitudes;
+                sondeStatisticsCharts.altitude.update();
+                
+                sondeStatisticsCharts.velV.data.labels = timestamps;
+                sondeStatisticsCharts.velV.data.datasets[0].data = velVs;
+                sondeStatisticsCharts.velV.update();
+                
+                sondeStatisticsCharts.velH.data.labels = timestamps;
+                sondeStatisticsCharts.velH.data.datasets[0].data = velHs;
+                sondeStatisticsCharts.velH.update();
+                
+                sondeStatisticsCharts.rssi.data.labels = timestamps;
+                sondeStatisticsCharts.rssi.data.datasets[0].data = rssis;
+                sondeStatisticsCharts.rssi.update();
+                
+                sondeStatisticsCharts.snr.data.labels = timestamps;
+                sondeStatisticsCharts.snr.data.datasets[0].data = snrs;
+                sondeStatisticsCharts.snr.update();
+                
+                sondeStatisticsCharts.sat.data.labels = timestamps;
+                sondeStatisticsCharts.sat.data.datasets[0].data = sats;
+                sondeStatisticsCharts.sat.update();
+                
+                sondeStatisticsCharts.batt.data.labels = timestamps;
+                sondeStatisticsCharts.batt.data.datasets[0].data = batteries;
+                sondeStatisticsCharts.batt.update();
+                
+                console.log('Charts refreshed successfully');
+            } catch (error) {
+                console.error('Error refreshing sonde statistics:', error);
+                const errorMsg = document.createElement('div');
+                errorMsg.className = 'alert alert-danger m-3';
+                errorMsg.innerHTML = `<i class="bi bi-exclamation-triangle"></i> <strong>Error:</strong> ${error.message}`;
+                document.querySelector('#sondeStatisticsModal .modal-body').prepend(errorMsg);
+            }
+        }
+
+        // Helper function: Format URL parameters
+        function formatParams(params) {
+            return '?' + Object.keys(params).map(key => 
+                key + '=' + encodeURIComponent(params[key])
+            ).join('&');
+        }
+        
+        // Helper function: Calculate drag-adjusted descent rate
+        function calc_drag(current_desc, altitude, default_desc) {
+            // Density ratio calculation based on altitude
+            const rho = Math.exp(-altitude / 10400.0);  // Scale height ~10.4km
+            if (rho <= 0) return default_desc;
+            
+            // Adjust descent rate based on air density
+            const adjusted = current_desc * Math.sqrt(rho);
+            return adjusted > 0 ? adjusted : default_desc;
+        }
+        
+        // Remove prediction from map
+        window.removePrediction = function removePrediction(sondeid) {
+            console.log('Removing prediction for:', sondeid);
+            if (sondePredictions[sondeid]) {
+                const pred = sondePredictions[sondeid];
+                if (pred.pred) { map.removeLayer(pred.pred); }
+                if (pred.land) { map.removeLayer(pred.land); }
+                if (pred.burst) { map.removeLayer(pred.burst); }
+                delete sondePredictions[sondeid];
+            }
+        }
+        
+        // Get Tawhiri prediction and display on map
+        function getPrediction(sondeid, lat, lon, alt, vs, sondetype, freq, sitename) {
+            const TAWHIRI = 'https://api.v2.sondehub.org/tawhiri';
+            
+            // Check if prediction already in progress
+            if (predictionInProgress[sondeid]) {
+                console.log('Prediction already in progress for ' + sondeid + ', skipping...');
+                return;
+            }
+            
+            // Mark prediction as in progress
+            predictionInProgress[sondeid] = true;
+            
+            // Remove old prediction if exists
+            removePrediction(sondeid);
+            
+            // Determine default burst height based on sonde type
+            let defaultBurst = 25000;  // Default for all other types
+            if (sondetype && sondetype.startsWith('RS41')) {
+                if (sitename && sitename.includes('Bergen')) {
+                    defaultBurst = 33500;
+                } else if (sitename && sitename.includes('Meppen')) {
+                    defaultBurst = 25000;
+                } else {
+                    defaultBurst = 30000;
+                }
+            } else if (sondetype && sondetype.startsWith('DFM')) {
+                defaultBurst = 17500;
+            }
+            
+            // Use default burst altitude
+            let burst = defaultBurst;
+            let asc = 5.0;  // Default ascent rate
+            let desc = 5.0;  // Default descent rate
+            
+            if (alt > burst) burst = alt + 100;
+            
+            const tParams = {
+                'launch_latitude': lat,
+                'launch_longitude': lon,
+                'launch_altitude': alt - 10,
+                'launch_datetime': new Date().toISOString().split('.')[0] + 'Z',
+                'ascent_rate': asc,
+                'descent_rate': desc,
+                'burst_altitude': alt + 2,
+                'profile': 'standard_profile'
+            };
+            
+            // Determine if ascending or descending
+            if (vs > 0) {
+                // Still climbing
+                tParams['ascent_rate'] = vs;
+                tParams['burst_altitude'] = burst;
+            } else {
+                // Descending - use drag calculation
+                tParams['descent_rate'] = calc_drag(-vs, alt, desc);
+            }
+            
+            console.log('Tawhiri request for ' + sondeid + ':', tParams);
+            
+            const xhr = new XMLHttpRequest();
+            const url = TAWHIRI + formatParams(tParams);
+            
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState === 4) {
+                    // Clear in-progress flag
+                    delete predictionInProgress[sondeid];
+                    
+                    if (xhr.status != 200) {
+                        console.error('Tawhiri request failed: ' + xhr.statusText);
+                        alert('Prediction failed: ' + xhr.statusText + '\nPlease try again.');
+                        return;
+                    }
+                    
+                    try {
+                        const pred = JSON.parse(xhr.response);
+                        const traj0 = pred.prediction[0].trajectory;  // ascent
+                        const traj1 = pred.prediction[1].trajectory;  // descent
+                        const latlons = [];
+                        
+                        traj0.forEach(function(p) {
+                            latlons.push([p.latitude.toFixed(5), p.longitude.toFixed(5)]);
+                        });
+                        traj1.forEach(function(p) {
+                            latlons.push([p.latitude.toFixed(5), p.longitude.toFixed(5)]);
+                        });
+                        
+                        // Create prediction polyline
+                        const poly = L.polyline(latlons, {
+                            opacity: 0.6,
+                            color: '#9900FF',
+                            weight: 3,
+                            dashArray: '5, 10'
+                        });
+                        poly.addTo(map);
+                        
+                        // Create landing marker
+                        const landMarker = new L.marker(latlons.slice(-1)[0], {
+                            icon: targetIcon
+                        });
+                        
+                        // Create burst marker if still ascending
+                        let burstMarker = null;
+                        if (vs > 0) {
+                            const b = traj0.slice(-1)[0];
+                            burstMarker = new L.marker([b.latitude, b.longitude], {
+                                icon: burstIcon
+                            });
+                            burstMarker.addTo(map);
+                        }
+                        
+                        landMarker.addTo(map);
+                        
+                        // Create popup for landing marker
+                        const lastpt = traj1.slice(-1)[0];
+                        lastpt.datetime = new Date(lastpt.datetime).toISOString().split('.')[0] + 'Z';
+                        const landingTime = new Date(lastpt.datetime).toLocaleString().split(' (')[0];
+                        
+                        const displayName = sitename || sondeid;
+                        
+                        const popup = `<div style="min-width: 250px;">
+                            <h6><strong>&nbsp;${displayName} - ${sondetype} - Prediction</strong></h6>
+                            <table class="table table-sm">
+                                <tr><td><strong>Landing:</strong></td><td><strong>${landingTime}</strong></td></tr>
+                                <tr><td>Freq:</td><td>${freq} MHz</td></tr>
+                                <tr><td>Lat/Lon:</td><td>${latlons.slice(-1)[0]}</td></tr>
+                                <tr><td>Alt ASL:</td><td><strong>${lastpt.altitude.toFixed(1)} m</strong></td></tr>
+                                <tr><td>Ascent:</td><td>${tParams['ascent_rate'].toFixed(1)} m/s</td></tr>
+                                <tr><td>Descent:</td><td>${tParams['descent_rate'].toFixed(1)} m/s</td></tr>
+                                <tr><td>Burst:</td><td>${tParams['burst_altitude']} m</td></tr>
+                            </table>
+                            <button class="btn btn-sm btn-danger" onclick="removePrediction('${sondeid}')">Remove Prediction</button>
+                        </div>`;
+                        
+                        landMarker.bindPopup(popup, {
+                            closeButton: true,
+                            autoClose: false,
+                            maxWidth: 300
+                        });
+                        
+                        // Store prediction
+                        sondePredictions[sondeid] = {
+                            pred: poly,
+                            land: landMarker,
+                            burst: burstMarker,
+                            lastUpdate: new Date()
+                        };
+                        
+                        console.log('Prediction created for ' + sondeid + ' Burst Alt: ' + tParams['burst_altitude'] + ' m');
+                        
+                        // Open the popup automatically
+                        landMarker.openPopup();
+                        
+                        // Pan to landing marker
+                        map.setView(latlons.slice(-1)[0], map.getZoom());
+                        
+                    } catch (error) {
+                        console.error('Error parsing Tawhiri response:', error);
+                        alert('Error parsing prediction data: ' + error.message);
+                    }
+                }
+            };
+            
+            xhr.open('GET', url, true);
+            xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+            xhr.send();
+        }
+        
+        // Show sonde prediction (called from context menu)
+        window.showSondePrediction = function showSondePrediction() {
+            const serial = contextMenuSondeSerial;
+            console.log('showSondePrediction called for:', serial);
+            hideSondeContextMenu();
+            if (!serial) {
+                console.error('No sonde serial selected');
+                return;
+            }
+            
+            // Get current sonde data from the latest update
+            fetch('/api/sondes')
+                .then(response => response.json())
+                .then(data => {
+                    const sonde = data.sondes.find(s => s.serial === serial);
+                    if (!sonde) {
+                        console.error('Sonde not found:', serial);
+                        alert('Sonde ' + serial + ' not found in active sondes');
+                        return;
+                    }
+                    
+                    // Extract sonde data
+                    const lat = sonde.lat;
+                    const lon = sonde.lon;
+                    const alt = sonde.alt || 0;
+                    const vs = sonde.vel_v || 0;
+                    const sondetype = sonde.type || 'Unknown';
+                    const freq = sonde.frequency ? sonde.frequency.toFixed(3) : '---';
+                    const sitename = sonde.launchsite || '';
+                    
+                    console.log('Requesting prediction for:', serial, 'at', lat, lon, alt, 'm, vs:', vs, 'm/s');
+                    
+                    // Call Tawhiri prediction
+                    getPrediction(serial, lat, lon, alt, vs, sondetype, freq, sitename);
+                })
+                .catch(error => {
+                    console.error('Error fetching sonde data:', error);
+                    alert('Error fetching sonde data: ' + error.message);
+                });
+            
+            console.log('Creating Bootstrap prediction modal instance');
+            // Show modal
+            const modal = new bootstrap.Modal(modalElement, {
+                backdrop: true,
+                keyboard: true,
+                focus: true
+            });
+            modal.show();
+            
+            // TODO: Integrate Tawhiri prediction in next step
+            console.log('Prediction modal shown for sonde:', serial);
+        }
+
         // ---- Configuration modal ----
         let _cfgSections = null;   // cached config sections from API
         let _rtlsdrDevices = [];   // cached RTL-SDR device list
@@ -3188,6 +4964,23 @@ ${trkSegs}
                     const ts = document.getElementById('spectrumTimestamp');
                     ts.textContent = 'No spectrum data yet - wait for next scan cycle.';
                     ts.style.color = '#ff6b6b';
+                    
+                    // Clear existing spectrum chart
+                    if (_spectrumChart) {
+                        _spectrumChart.destroy();
+                        _spectrumChart = null;
+                    }
+                    
+                    // Clear waterfall history
+                    _waterfallHistory = [];
+                    
+                    // Clear waterfall canvas
+                    const waterfallCanvas = document.getElementById('waterfallCanvas');
+                    if (waterfallCanvas) {
+                        const ctx = waterfallCanvas.getContext('2d');
+                        ctx.clearRect(0, 0, waterfallCanvas.width, waterfallCanvas.height);
+                    }
+                    
                     return;
                 }
 
