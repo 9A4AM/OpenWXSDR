@@ -76,6 +76,10 @@ class MQTTOutput:
         self._lock = threading.Lock()
         self._connected_event = threading.Event()
 
+        # Read debug_mqtt flag – suppresses keep-alive PING noise unless enabled
+        log_cfg = config.get('logging', {})
+        self._debug_mqtt = bool(log_cfg.get('debug_mqtt', False))
+
         if self.enabled:
             self._initialize()
 
@@ -108,7 +112,6 @@ class MQTTOutput:
             except AttributeError:
                 self._client = mqtt.Client(client_id=self.client_id, transport=self.transport)
 
-            self._client.enable_logger(self.logger)
             self._client.reconnect_delay_set(min_delay=2, max_delay=30)
 
             if self.username:
@@ -195,6 +198,9 @@ class MQTTOutput:
             )
 
     def _on_log(self, client, userdata, level, buf):
+        # Suppress keep-alive noise (PINGREQ / PINGRESP) unless debug_mqtt is on
+        if not self._debug_mqtt and ('PINGREQ' in buf or 'PINGRESP' in buf):
+            return
         if level == 16:
             self.logger.debug(f"MQTT: {buf}")
         elif level >= 8:
@@ -209,10 +215,11 @@ class MQTTOutput:
         if not self.enabled or self._client is None:
             return
 
-        self.logger.info(
-            f"MQTT send_telemetry: serial={telemetry.serial}, "
-            f"connected={self._connected}, server={self.server}:{self.port}"
-        )
+        if self._debug_mqtt:
+            self.logger.info(
+                f"MQTT send_telemetry: serial={telemetry.serial}, "
+                f"connected={self._connected}, server={self.server}:{self.port}"
+            )
 
         if not self._connected:
             try:
@@ -236,16 +243,18 @@ class MQTTOutput:
             topic = self.topic_prefix.strip() or 'openwxsdr/'
             json_data = json.dumps(payload, separators=(',', ':'))
 
-            self.logger.info(
-                f"MQTT publishing to topic '{topic}': {json_data[:200]}"
-            )
+            if self._debug_mqtt:
+                self.logger.info(
+                    f"MQTT publishing to topic '{topic}': {json_data[:200]}"
+                )
 
             result = self._client.publish(topic, json_data, qos=0, retain=False)
 
             if result.rc == 0:
-                self.logger.info(
-                    f"MQTT published OK: {telemetry.serial} → {topic}"
-                )
+                if self._debug_mqtt:
+                    self.logger.info(
+                        f"MQTT published OK: {telemetry.serial} → {topic}"
+                    )
             else:
                 self.logger.warning(f"MQTT publish failed (rc={result.rc})")
 
@@ -396,7 +405,7 @@ class MQTTOutput:
         if hasattr(telemetry, 'ref_position') and telemetry.ref_position is not None:
             payload['ref_position'] = str(telemetry.ref_position)
         if hasattr(telemetry, 'tx_frequency') and telemetry.tx_frequency is not None:
-            payload['tx_frequency'] = int(telemetry.tx_frequency)
+            payload['tx_frequency'] = round(float(telemetry.tx_frequency) / 1e6, 3)  # Convert Hz to MHz
 
         return payload
 

@@ -435,9 +435,9 @@ class SondeHubOutput:
 
         if telemetry.environment:
             if telemetry.environment.temperature is not None:
-                payload['temp'] = round(float(telemetry.environment.temperature), 2)
+                payload['temp'] = round(float(telemetry.environment.temperature), 1)
             if telemetry.environment.humidity is not None:
-                payload['humidity'] = round(float(telemetry.environment.humidity), 2)
+                payload['humidity'] = round(float(telemetry.environment.humidity), 1)
             if telemetry.environment.pressure is not None:
                 payload['pressure'] = round(float(telemetry.environment.pressure), 2)
             self.logger.debug(
@@ -462,12 +462,10 @@ class SondeHubOutput:
         if telemetry.ref_position is not None:
             payload['ref_position'] = str(telemetry.ref_position)
         if telemetry.tx_frequency is not None:
-            payload['tx_frequency'] = int(telemetry.tx_frequency)
+            # tx_frequency from rs41mod JSON is already in MHz format
+            payload['tx_frequency'] = round(float(telemetry.tx_frequency), 3)
 
-        if telemetry.snr is not None:
-            payload['snr'] = round(float(telemetry.snr), 2)
-        if telemetry.rssi is not None:
-            payload['rssi'] = round(float(telemetry.rssi), 2)
+        # SNR and RSSI removed per user request - not needed for SondeHub
 
         uploader_position = self._uploader_position()
         if uploader_position is not None:

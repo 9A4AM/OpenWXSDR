@@ -173,6 +173,8 @@ class HttpOutput:
             data['rs41_mainboard'] = str(telemetry.rs41_mainboard)
         if hasattr(telemetry, 'rs41_mainboard_fw') and telemetry.rs41_mainboard_fw is not None:
             data['rs41_mainboard_fw'] = int(telemetry.rs41_mainboard_fw)
+        if hasattr(telemetry, 'tx_frequency') and telemetry.tx_frequency is not None:
+            data['tx_frequency'] = round(float(telemetry.tx_frequency) / 1e6, 3)  # Convert Hz to MHz
         if hasattr(telemetry, 'ref_datetime') and telemetry.ref_datetime is not None:
             data['ref_datetime'] = str(telemetry.ref_datetime)
         if hasattr(telemetry, 'ref_position') and telemetry.ref_position is not None:

@@ -151,6 +151,10 @@ class UDPOutput:
             if telemetry.environment.pressure is not None:
                 payload['pressure'] = round(telemetry.environment.pressure, 2)
         
+        # Satellites
+        if hasattr(telemetry, 'satellites') and telemetry.satellites is not None:
+            payload['sats'] = int(telemetry.satellites)
+        
         # Battery
         if hasattr(telemetry, 'battery') and telemetry.battery is not None:
             payload['batt'] = round(telemetry.battery, 2)
@@ -162,6 +166,8 @@ class UDPOutput:
             payload['rs41_mainboard'] = str(telemetry.rs41_mainboard)
         if hasattr(telemetry, 'rs41_mainboard_fw') and telemetry.rs41_mainboard_fw is not None:
             payload['rs41_mainboard_fw'] = int(telemetry.rs41_mainboard_fw)
+        if hasattr(telemetry, 'tx_frequency') and telemetry.tx_frequency is not None:
+            payload['tx_frequency'] = round(float(telemetry.tx_frequency) / 1e6, 3)  # Convert Hz to MHz
         if hasattr(telemetry, 'ref_datetime') and telemetry.ref_datetime is not None:
             payload['ref_datetime'] = str(telemetry.ref_datetime)
         if hasattr(telemetry, 'ref_position') and telemetry.ref_position is not None:
