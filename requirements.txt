@@ -25,6 +25,10 @@ pytz>=2023.3
 # Required if openwx.mqtt.enabled = true or sondehub MQTT upload is used
 # paho-mqtt>=1.6.1
 
+# Optional: Kindle e-ink dashboard support (install with: pip install Pillow)
+# Required for /api/kindle/* dashboard image endpoints
+# Pillow>=10.0.0
+
 # Optional dependencies
 # For KA9Q support
 # socket (built-in)

@@ -55,6 +55,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.openwxsdr_app import OpenWXSDR
+from src import __version__
 
 
 def setup_logging(config: dict):
@@ -156,7 +157,7 @@ Examples:
     parser.add_argument(
         '--version',
         action='version',
-        version='OpenWXSDR v1.0.50'
+        version=f'OpenWXSDR v{__version__}'
     )
     
     args = parser.parse_args()
@@ -171,7 +172,7 @@ Examples:
     # Print banner
     print("=" * 60)
     print("  OpenWXSDR - Streamlined Radiosonde Decoder Framework")
-    print("  Version 1.0.50")
+    print(f"  Version {__version__}")
     print("=" * 60)
     print()
     
