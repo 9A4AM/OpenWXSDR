@@ -9,13 +9,13 @@ Using the excellent rs1729/RS decoders embedded into this framework.
 
 ✨ What's New in v1.0.52
 
-## 🐛 Crash & Race-Condition Fixes
+#### 🐛 Crash & Race-Condition Fixes
 
-## ⚙️ Self-Healing & Device Status
+#### ⚙️ Self-Healing & Device Status
 
-## 🎯 Detection Accuracy
+#### 🎯 Detection Accuracy
 
-## 📡 SondeHub Upload Correctness
+#### 📡 SondeHub Upload Correctness
 
 Following feedback from a SondeHub maintainer, both upload paths
 (`sondehub_queue.py` and `sondehub_output.py`) were brought in line with
@@ -30,18 +30,20 @@ Following feedback from a SondeHub maintainer, both upload paths
   ≤ ‑9999, and negative battery voltage are all now dropped rather than sent as-is.
 - `dfmcode` is now only attached to DFM uploads (previously a global check).
 
-## 🖥️ Web UI
+#### 🖥️ Web UI
 
-## 🔧 Maintenance & Code Quality
+#### 🔧 Maintenance & Code Quality
 
-## 🔒 Repository Updates & Changes
+#### 🔒 Repository Updates & Changes
+
+## 
 
 
-
-⚠ <u>Important notice:</u> With update to version 1.0.50 several further adressed issues of radiosonde telemetry to sondehub.org has been fixed.
+## ⚠ <u>Important notice:</u> With update to version 1.0.50 several further adressed issues of radiosonde telemetry to sondehub.org has been fixed.
 We are looking forward that the ban / blocking of OpenWXSDR uploads will be suspended after review of the submitted telemetry data
 
-✨ What's New in v1.0.50
+
+## ✨ What's New in v1.0.50
 
 #### 🔧 PTU Data Improvements
 
