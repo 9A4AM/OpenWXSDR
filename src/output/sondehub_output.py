@@ -237,9 +237,36 @@ class SondeHubOutput:
         return sonde_type
 
     def _effective_subtype(self, telemetry: SondeTelemetry, serial: str) -> str:
-        """Return best subtype for SondeHub, with per-serial continuity."""
-        subtype = (telemetry.subtype or '').strip()
+        """Return best subtype for SondeHub, with per-serial continuity — but
+        only for sonde types where radiosonde_auto_rx's own uploader
+        (sondehub.py reformat_data) would upload a subtype at all.
+
+        Previously this passed through whatever a decoder put in
+        telemetry.subtype for ANY sonde type. A SondeHub maintainer flagged
+        that e.g. the M20 decoder emits a 'subtype' field that isn't
+        meaningful for uploads and can cause weird tracker behaviour — auto_rx
+        never uploads a subtype for M10/M20 at all. Mirror auto_rx's per-type
+        policy (same fix already applied in sondehub_queue.py) instead of a
+        blanket "if present, upload it" rule.
+        """
+        raw_subtype = (telemetry.subtype or '').strip()
         sonde_type = (telemetry.sonde_type or '').strip()
+        base = self._effective_type(telemetry).upper()
+
+        if base not in ('RS41', 'RS92', 'DFM', 'LMS6', 'MRZ', 'WXR301'):
+            # auto_rx never uploads a subtype for these types (e.g. M10/M20) —
+            # omit it rather than passing through whatever the decoder produced.
+            return ''
+
+        if base == 'WXR301':
+            # auto_rx only sets a subtype for the PN9 variant, nothing else.
+            with self._lock:
+                if raw_subtype == 'WXR_PN9':
+                    self._last_subtype_by_serial[serial] = 'WxR-301D-5k'
+                    return 'WxR-301D-5k'
+                return self._last_subtype_by_serial.get(serial, '')
+
+        subtype = raw_subtype
 
         # If decoder only provides RS41-SGP as type, map it into subtype too.
         if not subtype and '-' in sonde_type:
@@ -247,11 +274,11 @@ class SondeHubOutput:
 
         # Heuristic for RS41 where decoder doesn't emit subtype on every line.
         # V-prefixed serials are commonly RS41-SGP.
-        if not subtype and sonde_type.upper() == 'RS41' and serial.upper().startswith('V'):
+        if not subtype and base == 'RS41' and serial.upper().startswith('V'):
             subtype = 'RS41-SGP'
 
         # Some decoders only emit base type for RS41; still provide subtype for consistency.
-        if not subtype and sonde_type.upper() == 'RS41':
+        if not subtype and base == 'RS41':
             subtype = 'RS41'
 
         with self._lock:
@@ -428,18 +455,34 @@ class SondeHubOutput:
         if telemetry.frequency:
             payload['frequency'] = round(float(telemetry.frequency) / 1e6, 3)
 
+        # CRITICAL: decoders use sentinel values to mean "no data" (e.g. -9999.0
+        # for velocity/heading, -273.0 for temp, -1.0 for humidity/pressure/batt —
+        # see DECODER_OPTIONAL_FIELDS defaults in the reference auto_rx decoder).
+        # auto_rx's own uploader explicitly checks against these sentinels before
+        # including a field; we previously only checked "is not None" (or nothing
+        # at all for heading), which lets literal sentinel garbage through as if
+        # it were a real reading.
         if telemetry.velocity:
-            payload['vel_h'] = round(float(telemetry.velocity.horizontal_speed), 2)
-            payload['vel_v'] = round(float(telemetry.velocity.vertical_speed), 2)
-            payload['heading'] = round(float(telemetry.velocity.heading), 1)
+            vel_h = telemetry.velocity.horizontal_speed
+            vel_v = telemetry.velocity.vertical_speed
+            heading = telemetry.velocity.heading
+            if vel_h is not None and vel_h > -9999.0:
+                payload['vel_h'] = round(float(vel_h), 2)
+            if vel_v is not None and vel_v > -9999.0:
+                payload['vel_v'] = round(float(vel_v), 2)
+            if heading is not None and heading > -9999.0:
+                payload['heading'] = round(float(heading), 1)
 
         if telemetry.environment:
-            if telemetry.environment.temperature is not None:
-                payload['temp'] = round(float(telemetry.environment.temperature), 1)
-            if telemetry.environment.humidity is not None:
-                payload['humidity'] = round(float(telemetry.environment.humidity), 1)
-            if telemetry.environment.pressure is not None:
-                payload['pressure'] = round(float(telemetry.environment.pressure), 2)
+            temp = telemetry.environment.temperature
+            humidity = telemetry.environment.humidity
+            pressure = telemetry.environment.pressure
+            if temp is not None and temp > -273.0:
+                payload['temp'] = round(float(temp), 1)
+            if humidity is not None and humidity >= 0.0:
+                payload['humidity'] = round(float(humidity), 1)
+            if pressure is not None and pressure >= 0.0:
+                payload['pressure'] = round(float(pressure), 2)
             self.logger.debug(
                 f"[SONDEHUB-PTU] {serial}: Added environment to payload: "
                 f"temp={payload.get('temp')}, hum={payload.get('humidity')}, pres={payload.get('pressure')}"
@@ -447,7 +490,7 @@ class SondeHubOutput:
         else:
             self.logger.debug(f"[SONDEHUB-PTU] {serial}: No environment data in telemetry object")
 
-        if telemetry.battery is not None:
+        if telemetry.battery is not None and telemetry.battery >= 0.0:
             payload['batt'] = round(float(telemetry.battery), 2)
 
         # RS41-specific fields

@@ -330,11 +330,41 @@ class SondeHubQueueOutput:
         return sonde_type
 
     def _effective_subtype(self, telemetry: SondeTelemetry, serial: str) -> str:
-        subtype = (telemetry.subtype or '').strip()
+        """Only include a 'subtype' field when radiosonde_auto_rx's own SondeHub
+        uploader (sondehub.py reformat_data) would upload one for this sonde type.
+
+        Previously this blindly passed through whatever a decoder happened to put
+        in telemetry.subtype for ANY sonde type. A SondeHub maintainer flagged
+        that e.g. the M20 decoder emits a 'subtype' field that isn't meaningful
+        for uploads and can cause weird tracker behaviour — auto_rx never uploads
+        a subtype for M10/M20 at all. Mirror auto_rx's per-type policy instead of
+        a blanket "if present, upload it" rule.
+        """
+        raw_subtype = (telemetry.subtype or '').strip()
         sonde_type = self._effective_type(telemetry)
-        if not subtype and sonde_type.upper() == 'RS41':
-            subtype = 'RS41-SGP' if serial.upper().startswith('V') else 'RS41'
-        return subtype
+        base = sonde_type.upper()
+
+        if base == 'RS41':
+            # auto_rx passes the decoder-provided subtype through as-is; if the
+            # decoder didn't supply one, guess RS41-SGP vs RS41 from the serial
+            # prefix (common convention, kept from prior behavior).
+            if raw_subtype:
+                return raw_subtype
+            return 'RS41-SGP' if serial.upper().startswith('V') else 'RS41'
+
+        if base in ('RS92', 'DFM', 'LMS6', 'MRZ'):
+            # auto_rx passes these through as-is (for DFM this carries the
+            # DFM06/DFM09/DFM17 subtype string, which IS meaningful for uploads).
+            return raw_subtype
+
+        if base == 'WXR301':
+            # auto_rx only sets a subtype for the PN9 variant, nothing else.
+            return 'WxR-301D-5k' if raw_subtype == 'WXR_PN9' else ''
+
+        # M10, M20, and anything else not explicitly handled above: auto_rx
+        # never uploads a 'subtype' field for these — omit it rather than
+        # passing through whatever the decoder happens to produce.
+        return ''
 
     def _normalize_sats(self, value) -> Optional[int]:
         if value is None:
@@ -363,12 +393,14 @@ class SondeHubQueueOutput:
         """
         Validate sonde serial format according to SondeHub requirements.
         
+        NOTE: Serial IDs now have prefixes removed (no M10-, M20-, DFM-, iMet- prefix).
+        
         RS41/RS92: Must start with A-Z followed by 7-8 digits (e.g., V1220530, S12345678)
-        DFM: Must start with 'DFM-' followed by 8 digits (e.g., DFM-21065615)
-        M10/M20: Must start with 'M' followed by 8-10 characters
-        iMet: Must start with 'iMet' or 'IMET'
-        LMS6: Starts with 'LMS'
-        MRZ: Starts with 'MRZ'
+        DFM: 8 digits without prefix (e.g., 21065615)
+        M10/M20: Variable format, typically numeric or alphanumeric (e.g., 310-2-02647, 123456)
+        iMet: Variable format, often numeric (e.g., 54-12345, 1234567)
+        LMS6: Alphanumeric, typically starts with number
+        MRZ: Alphanumeric, typically starts with number
         
         Returns False for partial/malformed serials like '-+', 'UNKNOWN', etc.
         """
@@ -384,25 +416,34 @@ class SondeHubQueueOutput:
         if sonde_type_upper in ('RS41', 'RS92'):
             return bool(re.match(r'^[A-Z][0-9]{7,8}$', serial))
         
-        # DFM: DFM-[0-9]{8} (e.g., DFM-21065615)
+        # DFM: 8 digits without DFM- prefix (e.g., 21065615)
         elif sonde_type_upper == 'DFM':
-            return bool(re.match(r'^DFM-[0-9]{8}$', serial))
+            return bool(re.match(r'^[0-9]{8}$', serial))
         
-        # M10/M20: M[0-9A-Z]{8,10}
+        # M10/M20: Variable format - allow alphanumeric with hyphens (e.g., 310-2-02647, M123456)
+        # Accept with or without leading M
         elif sonde_type_upper in ('M10', 'M20'):
-            return bool(re.match(r'^M[0-9A-Z]{8,10}$', serial, re.IGNORECASE))
+            return bool(re.match(r'^[M0-9][0-9A-Z\-]{4,15}$', serial, re.IGNORECASE))
         
-        # iMet: Starts with iMet or IMET
+        # iMet: Variable format - typically numeric with hyphens or alphanumeric
+        # Accept with or without iMet prefix for backwards compatibility
         elif sonde_type_upper == 'IMET':
-            return serial.upper().startswith('IMET') and len(serial) >= 4
+            if serial.upper().startswith('IMET'):
+                return len(serial) >= 4
+            # Without prefix: allow alphanumeric with hyphens
+            return bool(re.match(r'^[0-9A-Z][0-9A-Z\-]{2,}$', serial, re.IGNORECASE))
         
-        # LMS6: Starts with LMS
+        # LMS6: Alphanumeric, typically starts with number
         elif sonde_type_upper == 'LMS6':
-            return serial.upper().startswith('LMS') and len(serial) >= 4
+            if serial.upper().startswith('LMS'):
+                return len(serial) >= 4
+            return bool(re.match(r'^[0-9A-Z][0-9A-Z\-]{2,}$', serial, re.IGNORECASE))
         
-        # MRZ: Starts with MRZ
+        # MRZ: Alphanumeric, typically starts with number
         elif sonde_type_upper == 'MRZ':
-            return serial.upper().startswith('MRZ') and len(serial) >= 4
+            if serial.upper().startswith('MRZ'):
+                return len(serial) >= 4
+            return bool(re.match(r'^[0-9A-Z][0-9A-Z\-]{2,}$', serial, re.IGNORECASE))
         
         # Unknown type: reject if it contains common malformed patterns
         # Reject serials with only special characters, spaces, or very short
@@ -438,7 +479,7 @@ class SondeHubQueueOutput:
                 self.logger.warning(
                     f"[SONDEHUB-QUEUE] Invalid serial format: '{serial}' for {sonde_type}. "
                     f"Skipping upload (likely partial/corrupted decode). "
-                    f"Valid formats: RS41=[A-Z][0-9]{{7-8}}, DFM=DFM-[0-9]{{8}}"
+                    f"Valid formats: RS41=[A-Z][0-9]{{7-8}}, DFM=[0-9]{{8}}, M10/M20=[0-9A-Z\\-]{{5+}}"
                 )
                 return None
             if sonde_type.upper().startswith('DFM') and serial in ('UNKNOWN', ''):
@@ -465,25 +506,44 @@ class SondeHubQueueOutput:
         if subtype:
             payload['subtype'] = subtype
 
+        # Add DFM-specific type code if present (only meaningful for DFM uploads,
+        # matching auto_rx which only ever sets this inside its DFM/PS15 branches)
+        if sonde_type.upper() == 'DFM' and getattr(telemetry, 'dfmcode', None):
+            payload['dfmcode'] = telemetry.dfmcode
+
         if sats is not None:
             payload['sats'] = sats
 
         if telemetry.frequency:
             payload['frequency'] = round(float(telemetry.frequency) / 1e6, 3)
 
+        # CRITICAL: decoders use sentinel values to mean "no data" (e.g. -9999.0
+        # for velocity/heading, -273.0 for temp, -1.0 for humidity/pressure/batt —
+        # see DECODER_OPTIONAL_FIELDS defaults in the reference auto_rx decoder).
+        # auto_rx's own uploader explicitly checks against these sentinels before
+        # including a field; we previously only checked "is not None", which lets
+        # literal sentinel garbage through as if it were a real reading.
         if telemetry.velocity:
-            payload['vel_h'] = round(float(telemetry.velocity.horizontal_speed), 2)
-            payload['vel_v'] = round(float(telemetry.velocity.vertical_speed), 2)
-            if telemetry.velocity.heading is not None:
-                payload['heading'] = round(float(telemetry.velocity.heading), 1)
+            vel_h = telemetry.velocity.horizontal_speed
+            vel_v = telemetry.velocity.vertical_speed
+            heading = telemetry.velocity.heading
+            if vel_h is not None and vel_h > -9999.0:
+                payload['vel_h'] = round(float(vel_h), 2)
+            if vel_v is not None and vel_v > -9999.0:
+                payload['vel_v'] = round(float(vel_v), 2)
+            if heading is not None and heading > -9999.0:
+                payload['heading'] = round(float(heading), 1)
 
         if telemetry.environment:
-            if telemetry.environment.temperature is not None:
-                payload['temp'] = round(float(telemetry.environment.temperature), 1)
-            if telemetry.environment.humidity is not None:
-                payload['humidity'] = round(float(telemetry.environment.humidity), 1)
-            if telemetry.environment.pressure is not None:
-                payload['pressure'] = round(float(telemetry.environment.pressure), 2)
+            temp = telemetry.environment.temperature
+            humidity = telemetry.environment.humidity
+            pressure = telemetry.environment.pressure
+            if temp is not None and temp > -273.0:
+                payload['temp'] = round(float(temp), 1)
+            if humidity is not None and humidity >= 0.0:
+                payload['humidity'] = round(float(humidity), 1)
+            if pressure is not None and pressure >= 0.0:
+                payload['pressure'] = round(float(pressure), 2)
             self.logger.debug(
                 f"[SONDEHUB-QUEUE-PTU] {serial}: Added environment to payload: "
                 f"temp={payload.get('temp')}, hum={payload.get('humidity')}, pres={payload.get('pressure')}"
@@ -491,7 +551,7 @@ class SondeHubQueueOutput:
         else:
             self.logger.debug(f"[SONDEHUB-QUEUE-PTU] {serial}: No environment data in telemetry object")
 
-        if telemetry.battery is not None:
+        if telemetry.battery is not None and telemetry.battery >= 0.0:
             payload['batt'] = round(float(telemetry.battery), 2)
 
         # RS41-specific fields
