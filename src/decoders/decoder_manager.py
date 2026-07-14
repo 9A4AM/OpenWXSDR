@@ -76,10 +76,12 @@ class DecoderManager:
     Automatically starts/stops decoders based on detected signals
     """
     
-    def __init__(self, config: dict, telemetry_callback: Callable[[SondeTelemetry], None], spectrum_analyzer=None):
+    def __init__(self, config: dict, telemetry_callback: Callable[[SondeTelemetry], None], 
+                 spectrum_analyzer=None, ka9q_receiver=None):
         self.config = config
         self.telemetry_callback = telemetry_callback
         self.spectrum_analyzer = spectrum_analyzer  # Reference to pause/resume during decoding
+        self.ka9q_receiver = ka9q_receiver  # Reference to KA9Q receiver for status queries
         self.logger = logging.getLogger('DecoderManager')
         
         self.active_decoders: Dict[float, ActiveDecoder] = {}
@@ -98,22 +100,40 @@ class DecoderManager:
         # The config sample_rate is for RTL-SDR spectrum analyzer only
         RS41_SAMPLE_RATE = 48000
         
-        # Get RTL-SDR device configurations
-        rtlsdr_config = config.get('sdr', {}).get('rtlsdr', {})
+        # Get device configurations based on SDR type
+        sdr_type = config.get('sdr', {}).get('type', 'rtlsdr')
         device_configs = []
         
-        # Support both new (devices list) and old (single device) config formats
-        if 'devices' in rtlsdr_config:
-            device_configs = rtlsdr_config['devices']
-            self.logger.info(f"Loaded {len(device_configs)} RTL-SDR device configuration(s)")
-        else:
-            # Backward compatibility: create single device config from old format
+        if sdr_type == 'rtlsdr':
+            # Get RTL-SDR device configurations
+            rtlsdr_config = config.get('sdr', {}).get('rtlsdr', {})
+            
+            # Support both new (devices list) and old (single device) config formats
+            if 'devices' in rtlsdr_config:
+                device_configs = rtlsdr_config['devices']
+                self.logger.info(f"Loaded {len(device_configs)} RTL-SDR device configuration(s)")
+            else:
+                # Backward compatibility: create single device config from old format
+                device_configs = [{
+                    'serial': str(rtlsdr_config.get('device_index', 0)),
+                    'gain': rtlsdr_config.get('gain', 0),
+                    'ppm_error': rtlsdr_config.get('ppm_error', 0)
+                }]
+                self.logger.info("Using legacy single-device configuration")
+        
+        elif sdr_type == 'ka9q':
+            # KA9Q mode: create virtual device config for decoder manager
+            # No physical RTL-SDR devices, but decoder_manager needs at least one entry
             device_configs = [{
-                'serial': str(rtlsdr_config.get('device_index', 0)),
-                'gain': rtlsdr_config.get('gain', 0),
-                'ppm_error': rtlsdr_config.get('ppm_error', 0)
+                'serial': 'ka9q-radio',
+                'gain': 0,
+                'ppm_error': 0
             }]
-            self.logger.info("Using legacy single-device configuration")
+            self.logger.info("KA9Q mode: using virtual device configuration")
+        
+        else:
+            # Other SDR types (flux242, airspy) don't use decoder_manager device configs
+            self.logger.info(f"SDR type '{sdr_type}': skipping device configuration")
         
         self.device_configs = device_configs
         
@@ -780,6 +800,7 @@ class DecoderManager:
                 serial=sonde_id,
                 frame_number=frame_number,
                 subtype=frame_data.get('subtype'),  # DFM17, RS41-SGP, etc.
+                dfmcode=frame_data.get('dfmcode'),  # DFM type code (e.g., "0xC")
                 position=position,
                 velocity=velocity,
                 environment=environment,
@@ -890,3 +911,54 @@ class DecoderManager:
                 }
                 for freq, active in self.active_decoders.items()
             ]
+    
+    def get_worker_status(self) -> List[Dict]:
+        """Get receiver status for web UI (compatibility with DeviceManager API)"""
+        sdr_type = self.config.get('sdr', {}).get('type', 'rtlsdr')
+        
+        if sdr_type == 'ka9q':
+            # Return KA9Q receiver status with active stream info
+            if self.ka9q_receiver:
+                stream_count = self.ka9q_receiver.get_stream_count()
+                decoder_count = self.ka9q_receiver.get_decoder_count()
+                
+                if stream_count > 0:
+                    return [{
+                        'serial': 'ka9q-radio',
+                        'state': 'DECODING',
+                        'frequency': None,
+                        'freq_label': f'{stream_count} stream(s), {decoder_count} decoder(s) active',
+                        'sonde_type': 'RS41',
+                        'sonde_serial': None,
+                        'decoder_mode': 'legacy',
+                        'channelizer_active': decoder_count,
+                        'channelizer_max': 0
+                    }]
+                else:
+                    return [{
+                        'serial': 'ka9q-radio',
+                        'state': 'IDLE',
+                        'frequency': None,
+                        'freq_label': 'Listening for multicast (239.1.2.3:5004)',
+                        'sonde_type': None,
+                        'sonde_serial': None,
+                        'decoder_mode': 'legacy',
+                        'channelizer_active': 0,
+                        'channelizer_max': 0
+                    }]
+            else:
+                # Fallback if ka9q_receiver not available
+                return [{
+                    'serial': 'ka9q-radio',
+                    'state': 'IDLE',
+                    'frequency': None,
+                    'freq_label': 'KA9Q receiver not initialized',
+                    'sonde_type': None,
+                    'sonde_serial': None,
+                    'decoder_mode': 'legacy',
+                    'channelizer_active': 0,
+                    'channelizer_max': 0
+                }]
+        else:
+            # For other SDR types, return empty (device_manager handles status)
+            return []

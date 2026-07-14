@@ -75,11 +75,91 @@ class RS1729Decoder:
     
     # Class-level cache for decoder capabilities
     _decoder_caps = {}
+    _decoder_failures = {}  # Track failures per (path, type) for cooldown
+
+    @classmethod
+    def resolve_decoder_path(cls, decoder_binary: str) -> Optional[str]:
+        """Locate a decoder binary: relative to the working directory first
+        (matches the systemd unit's WorkingDirectory=<install dir>), then via
+        PATH. Single source of truth for decoder path resolution — previously
+        this list was duplicated (and had drifted slightly out of sync,
+        including host-specific absolute paths like /home/pi/OpenWXSDR/...)
+        between here and device_manager.py's own _get_decoder_path(); that one
+        now delegates here too."""
+        relative_path = f'decoders/rs1729/{decoder_binary}'
+        full_path = os.path.join(os.getcwd(), relative_path)
+        if os.path.isfile(full_path) or os.path.isfile(relative_path):
+            return relative_path
+
+        which_path = shutil.which(decoder_binary)
+        if which_path:
+            return which_path
+
+        return None
+
+    @classmethod
+    def _detect_decoder_capabilities(cls, decoder_path: str) -> dict:
+        """
+        Detect decoder binary capabilities by probing --help output
+        
+        Args:
+            decoder_path: Path to decoder binary
+            
+        Returns:
+            Dict with capability flags: softin, json, ID, ptu, ecc, dist, sat
+        """
+        # Check cache first
+        if decoder_path in cls._decoder_caps:
+            return cls._decoder_caps[decoder_path]
+        
+        caps = {
+            'softin': False,
+            'json': False,
+            'ID': False,
+            'ptu': False,
+            'ptu2': False,
+            'ecc': False,
+            'dist': False,
+            'sat': False,
+            'IQ': False,
+            'dc': False,
+            'lpIQ': False,
+        }
+        
+        try:
+            # Run decoder with --help and parse supported flags
+            result = subprocess.run(
+                [decoder_path, '--help'],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            help_text = result.stdout + result.stderr
+            
+            # Check for each capability
+            caps['softin'] = '--softin' in help_text
+            caps['json'] = '--json' in help_text
+            caps['ID'] = '-ID' in help_text
+            caps['ptu'] = '--ptu' in help_text
+            caps['ptu2'] = '--ptu2' in help_text
+            caps['ecc'] = '--ecc' in help_text
+            caps['dist'] = '--dist' in help_text
+            caps['sat'] = '--sat' in help_text
+            caps['IQ'] = '--IQ' in help_text
+            caps['dc'] = '--dc' in help_text
+            caps['lpIQ'] = '--lpIQ' in help_text
+            
+            cls._decoder_caps[decoder_path] = caps
+            return caps
+        except Exception:
+            # If probe fails, return minimal safe capabilities
+            cls._decoder_caps[decoder_path] = caps
+            return caps
     
     @classmethod
     def _detect_softin_support(cls, decoder_path: str) -> bool:
         """
-        Detect if decoder supports --softin flag
+        Detect if decoder supports --softin flag (legacy method)
         
         Args:
             decoder_path: Path to decoder binary
@@ -87,25 +167,8 @@ class RS1729Decoder:
         Returns:
             True if --softin is supported
         """
-        # Check cache first
-        if decoder_path in cls._decoder_caps:
-            return cls._decoder_caps[decoder_path]
-        
-        try:
-            # Run decoder with --help and check for --softin
-            result = subprocess.run(
-                [decoder_path, '--help'],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
-            has_softin = '--softin' in result.stdout or '--softin' in result.stderr
-            cls._decoder_caps[decoder_path] = has_softin
-            return has_softin
-        except Exception:
-            # If we can't detect, assume not available
-            cls._decoder_caps[decoder_path] = False
-            return False
+        caps = cls._detect_decoder_capabilities(decoder_path)
+        return caps.get('softin', False)
     
     def __init__(self, frequency: float, sonde_type: str = 'RS41', decoder_path: str = None):
         """
@@ -124,31 +187,22 @@ class RS1729Decoder:
         
         # Auto-detect decoder path if not specified
         if decoder_path is None:
-            # Try multiple locations
-            possible_paths = [
-                f'decoders/rs1729/{decoder_binary}',  # Relative to working directory
-                f'/home/pi/OpenWXSDR/decoders/rs1729/{decoder_binary}',  # Installed location
-                f'/home/pi/openwxsdr-1.0.21/decoders/rs1729/{decoder_binary}',  # Package directory
-                decoder_binary  # In PATH
-            ]
-            
-            for path in possible_paths:
-                full_path = os.path.join(os.getcwd(), path) if not os.path.isabs(path) else path
-                if os.path.isfile(full_path) or os.path.isfile(path):
-                    decoder_path = path
-                    break
-            
-            # Default fallback
-            if decoder_path is None:
-                decoder_path = decoder_binary
+            decoder_path = self.resolve_decoder_path(decoder_binary) or decoder_binary
         
         self.decoder_path = decoder_path
         self.logger = logging.getLogger(f'{self.sonde_type}Decoder.{frequency/1e6:.3f}')
         
-        # Detect decoder capabilities
-        self.has_softin = self._detect_softin_support(self.decoder_path)
+        # Detect decoder capabilities comprehensively
+        self.decoder_caps = self._detect_decoder_capabilities(self.decoder_path)
+        self.has_softin = self.decoder_caps.get('softin', False)
+        
+        # Log detected capabilities for debugging
+        caps_str = ', '.join(f"{k}={v}" for k, v in self.decoder_caps.items() if v)
+        if caps_str:
+            self.logger.info(f"Detected decoder capabilities: {caps_str}")
+        
         if not self.has_softin and self.sonde_type in ['RS41', 'DFM']:
-            self.logger.warning(f"{decoder_binary} does not support --softin flag. "
+            self.logger.warning(f"{self.DECODER_MAP.get(self.sonde_type)} does not support --softin flag. "
                               f"Using IQ mode with text PTU fallback. "
                               f"For full PTU support, install Auto_RX-compatible decoders from rs1729/RS.")
         
@@ -158,10 +212,12 @@ class RS1729Decoder:
         self.last_frame_time: Optional[datetime] = None
         self.frame_count = 0
         self._start_time: Optional[float] = None
-        #self.debug_json_ptu = os.environ.get("OPENWX_JSON_PTU_DEBUG", "0").lower() in ("1", "true", "yes", "on")
-        self.debug_json_ptu = 1
-        self.ptu_cache = {}  # Cache PTU data from text lines (recency-based merge)
-        self.ptu_cache_timestamps = {}  # Track PTU data timestamps for recency matching
+        self.debug_json_ptu = os.environ.get("OPENWX_JSON_PTU_DEBUG", "0").lower() in ("1", "true", "yes", "on")
+        self.ptu_cache = {}  # Cache PTU data from text lines, keyed by (serial, frame_num)
+        self.ptu_cache_timestamps = {}  # Track PTU data timestamps for freshness check
+        self.startup_failure_count = 0  # Track immediate startup failures
+        self.last_failure_time = None  # Track last failure for cooldown
+        self._logged_ptu_degraded_mode = False  # One-time warning for PTU fallback mode
     
     def set_frame_callback(self, callback: Callable[[dict], None]):
         """Set callback for decoded frames"""
@@ -195,19 +251,62 @@ class RS1729Decoder:
                 # --json: JSON output with position/velocity
                 # PTU data appears in verbose text lines, not in JSON (with --IQ mode)
                 cmd.extend(['-vv', '--ptu2', '--sat', '--json', '--IQ', '0.0', '-', '48000', '16'])
+                # CRITICAL: unlike the DFM branch below, --ptu2 was previously added
+                # unconditionally without checking whether the installed rs41mod
+                # build actually recognizes it (install.sh clones rs1729/RS unpinned,
+                # so this varies per install — same root cause class as the
+                # dft_detect CLI-format mismatch). If unsupported, PTU silently never
+                # appears (JSON or text) with no diagnostic trail. Log it explicitly.
+                if not self.decoder_caps.get('ptu2', False):
+                    self.logger.warning(
+                        "rs41mod does not report --ptu2 support via --help — PTU "
+                        "(temp/humidity/pressure) will likely be unavailable for "
+                        "this decoder. Set OPENWX_JSON_PTU_DEBUG=1 to see raw JSON "
+                        "keys per frame for diagnosis."
+                    )
             elif self.sonde_type == 'DFM':
-                # DFM: dfm09mod -i -vv --IQ 0.0 --ecc --json --dist --ptu - 48000 16
-                # DFM decoder reliably supports --json with full telemetry
-                # -ID flag shows actual serial (without it, serial is masked as "xxxxxxxx")
-                cmd.extend(['-i', '-vv', '-ID', '--IQ', '0.0', '--ecc', '--json', '--dist', '--ptu', '-', '48000', '16'])
-            elif self.sonde_type == 'M10':
-                # M10: m10mod -v --IQ 0.0 - 48000 16
-                cmd.extend(['-v', '--IQ', '0.0', '-', '48000', '16'])
+                # DFM: dfm09mod with IQ input mode
+                # --auto: Automatic DFM subtype detection (DFM06/DFM09/DFM17) - CRITICAL for correct detection
+                # Without --auto, dfm09mod may not lock on DFM06/DFM17 variants
+                cmd.extend(['--auto', '-vv', '--IQ', '0.0'])
+                
+                # Add optional enhancement flags if supported
+                if self.decoder_caps.get('ecc', False):
+                    cmd.append('--ecc')
+                if self.decoder_caps.get('json', False):
+                    cmd.append('--json')
+                if self.decoder_caps.get('dist', False):
+                    cmd.append('--dist')
+                if self.decoder_caps.get('ptu', False):
+                    cmd.append('--ptu')
+                
+                # Add -ID flag only if explicitly supported
+                if self.decoder_caps.get('ID', False):
+                    cmd.append('-ID')
+                else:
+                    self.logger.info("DFM decoder does not support -ID flag, serial may be masked")
+                
+                # Add verbosity and input parameters
+                cmd.extend(['-', '48000', '16'])
+            elif self.sonde_type in ('M10', 'M20'):
+                # M10/M20: m10mod/m20mod with optional enhancement flags.
+                # NOTE: --dc, --ptu, --json, --lpIQ are only added when the probed
+                # binary actually supports them (see EMERGENCY_FIX_v1.0.46a: older
+                # decoder builds crash immediately on an unrecognized flag, producing
+                # zero frames). Baseline '-v --IQ 0.0 - 48000 16' always works.
+                cmd.append('-v')
+                if self.decoder_caps.get('dc', False):
+                    cmd.append('--dc')  # DC offset removal (helps with subcarrier)
+                if self.decoder_caps.get('ptu', False):
+                    cmd.append('--ptu')  # PTU sensor output
+                if self.decoder_caps.get('json', False):
+                    cmd.append('--json')  # JSON structured output
+                cmd.extend(['--IQ', '0.0'])
+                if self.decoder_caps.get('lpIQ', False):
+                    cmd.append('--lpIQ')  # Low-pass filter to reduce high-frequency noise
+                cmd.extend(['-', '48000', '16'])
             elif self.sonde_type == 'RS92':
                 # RS92: rs92mod -v --IQ 0.0 - 48000 16
-                cmd.extend(['-v', '--IQ', '0.0', '-', '48000', '16'])
-            elif self.sonde_type == 'M20':
-                # M20: m20mod -v --IQ 0.0 - 48000 16
                 cmd.extend(['-v', '--IQ', '0.0', '-', '48000', '16'])
             elif self.sonde_type == 'iMet':
                 # iMet: imet54mod -v --IQ 0.0 - 48000 16
@@ -243,10 +342,19 @@ class RS1729Decoder:
             time.sleep(0.5)
             if self.process.poll() is not None:
                 exit_code = self.process.poll()
-                stderr = self.process.stderr.read(500).decode('utf-8', errors='replace') if self.process.stderr else ""
-                self.logger.error(f"Decoder exited immediately with code {exit_code}")
-                if stderr:
-                    self.logger.error(f"Decoder stderr: {stderr}")
+                self.startup_failure_count += 1
+                self.last_failure_time = time.time()
+                self.logger.error(f"Decoder exited immediately with code {exit_code} (failure #{self.startup_failure_count})")
+                
+                # Log command for debugging startup failures
+                self.logger.error(f"Failed command: {' '.join(cmd)}")
+                
+                # Track failure for cooldown
+                failure_key = (self.decoder_path, self.sonde_type)
+                if failure_key not in self._decoder_failures:
+                    self._decoder_failures[failure_key] = []
+                self._decoder_failures[failure_key].append(time.time())
+                
                 return False
             
             self.running = True
@@ -271,10 +379,20 @@ class RS1729Decoder:
             time.sleep(2.0)
             if self.process.poll() is not None:
                 exit_code = self.process.poll()
-                self.logger.error(f"Decoder crashed early with exit code {exit_code}")
+                self.startup_failure_count += 1
+                self.last_failure_time = time.time()
+                self.logger.error(f"Decoder crashed early with exit code {exit_code} (failure #{self.startup_failure_count})")
+                self.running = False
+                
+                # Track failure for cooldown
+                failure_key = (self.decoder_path, self.sonde_type)
+                if failure_key not in self._decoder_failures:
+                    self._decoder_failures[failure_key] = []
+                self._decoder_failures[failure_key].append(time.time())
+                
                 return False
-            else:
-                self.logger.info(f"Decoder still running after 2s, PID={self.process.pid}")
+            
+            self.logger.info(f"Decoder healthy after 2s startup, PID={self.process.pid}")
             
             return True
             
@@ -331,8 +449,42 @@ class RS1729Decoder:
             'frequency': self.frequency,
             'frame_count': self.frame_count,
             'last_frame': self.last_frame_time.isoformat() if self.last_frame_time else None,
-            'running': self.running and self.is_alive()
+            'running': self.running and self.is_alive(),
+            'startup_failures': self.startup_failure_count,
+            'last_failure': self.last_failure_time
         }
+    
+    @classmethod
+    def should_retry_decoder(cls, decoder_path: str, sonde_type: str, cooldown_seconds: int = 60) -> bool:
+        """
+        Check if decoder should be retried based on recent failure history
+        
+        Args:
+            decoder_path: Path to decoder binary
+            sonde_type: Type of radiosonde
+            cooldown_seconds: Minimum seconds between retry attempts
+            
+        Returns:
+            True if decoder can be retried, False if in cooldown
+        """
+        failure_key = (decoder_path, sonde_type)
+        if failure_key not in cls._decoder_failures:
+            return True
+        
+        failures = cls._decoder_failures[failure_key]
+        if not failures:
+            return True
+        
+        # Check if last failure is outside cooldown window
+        last_failure = failures[-1]
+        time_since_failure = time.time() - last_failure
+        
+        if time_since_failure < cooldown_seconds:
+            return False
+        
+        # Clean up old failures (keep last 10)
+        cls._decoder_failures[failure_key] = failures[-10:]
+        return True
     
     def _monitor_stdout(self):
         """Monitor decoder stdout. Prefer JSON frames, use text lines only as PTU fallback/debug."""
@@ -356,16 +508,23 @@ class RS1729Decoder:
                 if line.startswith('{') and line.endswith('}'):
                     try:
                         json_data = json.loads(line)
+                        # Basic validation: ensure critical fields exist
+                        if not isinstance(json_data, dict):
+                            continue
                         frame = self._parse_json_frame(json_data)
                         if frame and self.frame_callback:
                             self.frame_count += 1
                             self.last_frame_time = datetime.now()
                             self.frame_callback(frame)
+                    except json.JSONDecodeError as e:
+                        self.logger.warning(f"Invalid JSON from decoder: {e}")
                     except Exception as e:
-                        self.logger.error(f"Could not parse decoder JSON line: {e}")
+                        self.logger.error(f"Error processing decoder frame: {e}")
                     continue
 
                 # Non-JSON lines: extract PTU data
+                if self.debug_json_ptu:
+                    self.logger.info(f"Decoder stdout (non-JSON): {line}")
                 try:
                     self._extract_ptu_from_text(line)
                 except Exception as e:
@@ -411,18 +570,25 @@ class RS1729Decoder:
             self.logger.error(f"Error monitoring decoder stderr: {e}", exc_info=True)
 
     def _extract_ptu_from_text(self, line: str):
-        """Legacy PTU fallback from verbose text output, cached with timestamps for recency-based merging.
+        """Legacy PTU fallback from verbose text output, cached with serial + timestamp.
         
         RS41 text format with -vv --ptu2:
         [ 5644] (W4060809)  Mon 2026-06-08 05:06:05.997  lat: 52.89519 lon: 7.89611 alt: 24350.9  vH: 10.4 D: 294.0 vV: 6.3  T=-47.6°C RH=5.8% P=24.38hPa
         
-        Uses recency-based caching instead of exact frame number matching,
-        because frame numbers from text and JSON may not align perfectly.
+        Caches by (serial, frame_num) to prevent cross-contamination when multiple sondes are decoded.
         """
+        # Extract frame number
         frame_match = re.search(r'\[\s*(\d+)\]', line)
         if not frame_match:
             return
         frame_num = int(frame_match.group(1))
+        
+        # Extract sonde serial (in parentheses)
+        serial_match = re.search(r'\(([A-Z0-9]+)\)', line)
+        if not serial_match:
+            return  # Need serial for proper cache keying
+        sonde_serial = serial_match.group(1)
+        
         ptu = {}
 
         # Match T=-47.6°C or T=-47.6
@@ -439,21 +605,24 @@ class RS1729Decoder:
             ptu['pressure'] = float(m.group(1))
 
         if ptu:
-            # Store with current timestamp for recency-based matching
+            # Store with current timestamp, keyed by (serial, frame) to prevent cross-contamination
             now = time.time()
-            self.ptu_cache[frame_num] = ptu
-            self.ptu_cache_timestamps[frame_num] = now
+            cache_key = (sonde_serial, frame_num)
+            self.ptu_cache[cache_key] = ptu
+            self.ptu_cache_timestamps[cache_key] = now
             
-            # Cleanup old cache entries (keep last 100)
-            if len(self.ptu_cache) > 200:
-                # Remove oldest by timestamp
-                sorted_by_time = sorted(self.ptu_cache_timestamps.items(), key=lambda x: x[1])
-                for k, _ in sorted_by_time[:-100]:
+            # Cleanup old cache entries aggressively to prevent memory growth
+            if len(self.ptu_cache) > 100:  # Higher limit for multi-sonde scenarios
+                # Remove entries older than 10 seconds
+                cutoff_time = now - 10.0
+                expired_keys = [k for k, t in self.ptu_cache_timestamps.items() if t < cutoff_time]
+                for k in expired_keys:
                     self.ptu_cache.pop(k, None)
                     self.ptu_cache_timestamps.pop(k, None)
                     
             if self.debug_json_ptu:
-                self.logger.info(f"Cached fallback PTU for frame {frame_num}: {ptu}")
+                self.logger.info(f"Cached fallback PTU for {sonde_serial} frame {frame_num}: {ptu}")
+    
     def _parse_json_frame(self, json_data: dict) -> Optional[dict]:
         """Parse decoder JSON output. JSON is the primary source for PTU and navigation data."""
         try:
@@ -468,11 +637,22 @@ class RS1729Decoder:
             if lat is None or lon is None or alt is None or frame_num is None:
                 return None
 
+            # Normalize sonde type (handle hex values from decoder output)
             sonde_type = str(json_data.get('type') or self.sonde_type).strip()
             if sonde_type.startswith('0x'):
+                # Decoder returned hex type code - use configured sonde_type
                 sonde_type = self.sonde_type
-            if 'DFM' in sonde_type and sonde_id.lstrip('D').isdigit():
-                sonde_id = f"DFM-{sonde_id.lstrip('D')}"
+            
+            # Strip any existing prefixes from sonde_id (M10-, M20-, DFM-, iMet-, etc.)
+            # and keep only the actual serial number for all output streams
+            for prefix in ['M10-', 'M20-', 'DFM-', 'iMet-', 'IMET-', 'LMS6-', 'MRZ-']:
+                if sonde_id.startswith(prefix):
+                    sonde_id = sonde_id[len(prefix):]
+                    break
+            
+            # For DFM: also strip leading 'D' if the rest is numeric
+            if sonde_type == 'DFM' and sonde_id.startswith('D') and sonde_id[1:].isdigit():
+                sonde_id = sonde_id[1:]
 
             decoded_datetime = None
             dt_raw = json_data.get('datetime')
@@ -494,8 +674,33 @@ class RS1729Decoder:
                 'alt': float(alt),
                 'decoded_datetime': decoded_datetime,
             }
+            
+            # Validate critical coordinate bounds
+            if not (-90 <= frame['lat'] <= 90):
+                self.logger.warning(f"Invalid latitude {frame['lat']} for {sonde_id}, skipping frame")
+                return None
+            if not (-180 <= frame['lon'] <= 180):
+                self.logger.warning(f"Invalid longitude {frame['lon']} for {sonde_id}, skipping frame")
+                return None
+            if frame['alt'] < -1000 or frame['alt'] > 50000:
+                self.logger.warning(f"Invalid altitude {frame['alt']}m for {sonde_id}, skipping frame")
+                return None
 
             # Optional fields – only include when present in this JSON frame
+            # Parse DFM subtype format: "0xC:DFM17" → subtype="DFM17", dfmcode="0xC"
+            dfm_subtype_parsed = False
+            if self.sonde_type == 'DFM' and json_data.get('subtype'):
+                raw_subtype = str(json_data.get('subtype'))
+                if ':' in raw_subtype:
+                    # Split "0xC:DFM17" format
+                    parts = raw_subtype.split(':', 1)
+                    frame['dfmcode'] = parts[0]  # "0xC"
+                    frame['subtype'] = parts[1]  # "DFM17"
+                    dfm_subtype_parsed = True
+                else:
+                    frame['subtype'] = raw_subtype
+                    dfm_subtype_parsed = True
+            
             for src, dst, cast in [
                 ('vel_h', 'velocity_horizontal', float),
                 ('vel_v', 'velocity_vertical', float),
@@ -510,6 +715,9 @@ class RS1729Decoder:
                 ('ref_datetime', 'ref_datetime', str),
                 ('ref_position', 'ref_position', str),
             ]:
+                # Skip subtype if already parsed for DFM
+                if dst == 'subtype' and dfm_subtype_parsed:
+                    continue
                 value = json_data.get(src)
                 if value is not None:
                     try:
@@ -539,18 +747,35 @@ class RS1729Decoder:
                     except (TypeError, ValueError):
                         pass
 
-            # Recency-based PTU fallback merge: match by proximity instead of exact frame number
-            # because text and JSON frame numbers may not align perfectly
-            if not all(frame.get(k) for k in ('temp', 'humidity', 'pressure')):
-                # Look for recent PTU data within +/- 5 frames
+            # Track PTU source for quality analysis
+            ptu_source = 'none'
+            has_json_ptu = all(frame.get(k) for k in ('temp', 'humidity', 'pressure'))
+            
+            if has_json_ptu:
+                ptu_source = 'json'
+            else:
+                # Serial-aware PTU fallback: match by (serial, frame) proximity with freshness check
                 current_frame = frame['frame_number']
+                current_serial = frame['sonde_id']
                 best_match = None
                 best_distance = 999999
+                now = time.time()
+                freshness_window = 5.0  # 5 second expiry for stale data
                 
-                for cached_frame, timestamp in self.ptu_cache_timestamps.items():
+                for (cached_serial, cached_frame), timestamp in self.ptu_cache_timestamps.items():
+                    # Only match same serial to prevent cross-contamination
+                    if cached_serial != current_serial:
+                        continue
+                    
+                    # Check freshness (within 5 seconds)
+                    age = now - timestamp
+                    if age > freshness_window:
+                        continue
+                    
+                    # Look for recent PTU data within +/- 3 frames
                     frame_distance = abs(cached_frame - current_frame)
-                    if frame_distance <= 5 and frame_distance < best_distance:
-                        best_match = cached_frame
+                    if frame_distance <= 3 and frame_distance < best_distance:
+                        best_match = (cached_serial, cached_frame)
                         best_distance = frame_distance
                 
                 if best_match is not None:
@@ -558,15 +783,36 @@ class RS1729Decoder:
                     frame.setdefault('temp', cached.get('temp'))
                     frame.setdefault('humidity', cached.get('humidity'))
                     frame.setdefault('pressure', cached.get('pressure'))
+                    
+                    # Update source if any PTU data was merged
+                    if any(frame.get(k) for k in ('temp', 'humidity', 'pressure')):
+                        ptu_source = 'text_fallback'
+                        
+                        # Log PTU degraded mode warning once per decoder session
+                        if not self._logged_ptu_degraded_mode:
+                            self.logger.warning(
+                                f"PTU degraded mode: {self.sonde_type} decoder lacks --softin support or "
+                                f"JSON PTU fields. Using text fallback (frame proximity + freshness check). "
+                                f"For better PTU reliability, install Auto_RX-compatible rs1729 decoders."
+                            )
+                            self._logged_ptu_degraded_mode = True
+                    
                     if self.debug_json_ptu:
-                        self.logger.info(f"[PTU Merged by recency] Frame {current_frame} matched with text frame {best_match} (distance={best_distance}): T={frame.get('temp')}°C RH={frame.get('humidity')}% P={frame.get('pressure')}hPa")
+                        self.logger.info(
+                            f"[PTU Merged] {current_serial} frame {current_frame} matched with text frame "
+                            f"{best_match[1]} (distance={best_distance}): T={frame.get('temp')}°C "
+                            f"RH={frame.get('humidity')}% P={frame.get('pressure')}hPa"
+                        )
+            
+            # Add PTU source tag to frame for quality tracking
+            frame['ptu_source'] = ptu_source
 
             if self.debug_json_ptu:
                 ptu_keys = {k: json_data.get(k) for k in ('temp', 'tempc', 'temperature', 'T', 'humidity', 'humidityrh', 'rh', 'RH', 'pressure', 'pressurehpa', 'pres', 'P') if k in json_data}
-                # self.logger.info(f"JSON frame keys={sorted(json_data.keys())}")
-                # self.logger.info(f"JSON PTU candidate fields for {sonde_id}: {ptu_keys}")
+                self.logger.info(f"JSON frame keys={sorted(json_data.keys())}")
+                self.logger.info(f"JSON PTU candidate fields for {sonde_id}: {ptu_keys}")
                 final_ptu = {k: frame.get(k) for k in ('temp', 'humidity', 'pressure') if frame.get(k) is not None}
-                # self.logger.info(f"Final frame PTU for {sonde_id} frame {frame['frame_number']}: {final_ptu}")
+                self.logger.info(f"Final frame PTU for {sonde_id} frame {frame['frame_number']} (source={ptu_source}): {final_ptu}")
 
             return frame
         except Exception as e:

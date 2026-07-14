@@ -78,7 +78,9 @@ class SondeTelemetry:
     sonde_type: str
     serial: str
     frame_number: int
+    satellites: Optional[int] = None  # GPS SVs used for position fix
     subtype: Optional[str] = None  # Subtype like "DFM17", "RS41-SGP", etc.
+    dfmcode: Optional[str] = None  # DFM-specific type code (e.g., "0xC" for DFM17)
     
     # Position & velocity
     position: Optional[SondePosition] = None
@@ -91,8 +93,8 @@ class SondeTelemetry:
     frequency: float = 0.0  # Hz
     snr: float = 0.0        # dB
     rssi: float = 0.0       # dBm
-    satellites: Optional[int] = None  # GPS SVs used
     battery: Optional[float] = None  # Battery voltage
+    receiver_device: Optional[str] = None  # Receiver device ID
     
     # RS41-specific fields
     burst_timer: Optional[int] = None  # RS41 burst timer (seconds)
@@ -121,6 +123,8 @@ class SondeTelemetry:
         
         if self.subtype:
             data['subtype'] = self.subtype
+        if self.dfmcode:
+            data['dfmcode'] = self.dfmcode
         if self.satellites is not None:
             data['sats'] = self.satellites
         if self.battery is not None:
