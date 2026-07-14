@@ -3,7 +3,40 @@
 A lightweight, efficient radiosonde decoder for Raspberry Pi, designed to work with RTL-SDR, Airspy and KA9Q radio receivers. 
 Using the excellent rs1729/RS decoders embedded into this framework.
 
-## Current Version:** 1.0.50 (June 15, 2026) available:
+## Current Version:** 1.0.52 (July 10, 2026) available:
+
+⚠ <u>Important notice:</u> With update to version 1.0.52 upload of radiosonde telemetry to sondehub.org has been further improved.
+
+✨ What's New in v1.0.52
+
+## 🐛 Crash & Race-Condition Fixes
+
+## ⚙️ Self-Healing & Device Status
+
+## 🎯 Detection Accuracy
+
+## 📡 SondeHub Upload Correctness
+
+Following feedback from a SondeHub maintainer, both upload paths
+(`sondehub_queue.py` and `sondehub_output.py`) were brought in line with
+`radiosonde_auto_rx`'s own field policy:
+
+- **`subtype` is no longer blindly passed through for every sonde type.** M10/M20
+  (and any type auto_rx doesn't upload a subtype for) no longer send a meaningless
+  `subtype` field that could confuse trackers. RS41/RS92/DFM/LMS6/MRZ still report
+  their subtype as before.
+- **Sentinel "no data" values are now filtered out** instead of being uploaded as
+  real readings: temperature ≤ ‑273 °C, humidity/pressure < 0, velocity/heading
+  ≤ ‑9999, and negative battery voltage are all now dropped rather than sent as-is.
+- `dfmcode` is now only attached to DFM uploads (previously a global check).
+
+## 🖥️ Web UI
+
+## 🔧 Maintenance & Code Quality
+
+## 🔒 Repository Updates & Changes
+
+
 
 ⚠ <u>Important notice:</u> With update to version 1.0.50 several further adressed issues of radiosonde telemetry to sondehub.org has been fixed.
 We are looking forward that the ban / blocking of OpenWXSDR uploads will be suspended after review of the submitted telemetry data
