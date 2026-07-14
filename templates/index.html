@@ -563,6 +563,8 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                         <i class="bi bi-gear-wide-connected"></i> System
                     </button>
                     <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="systemDropdown">
+                        <li><a class="dropdown-item" href="/dashboard"><i class="bi bi-speedometer2"></i> System Dashboard</a></li>
+                        <li><hr class="dropdown-divider"></li>
                         <li><a class="dropdown-item{% if not enable_config %} disabled{% endif %}" href="#"{% if enable_config %} onclick="showConfigurationModal(); return false;"{% endif %}><i class="bi bi-sliders"></i> Configuration</a></li>
                         <li><a class="dropdown-item" href="#" onclick="showDecoderSettingsModal(); return false;"><i class="bi bi-usb-plug"></i> Receiver</a></li>
                         <li><a class="dropdown-item" href="#" onclick="showLogfilesModal(); return false;"><i class="bi bi-file-text"></i> Logfile</a></li>                        
@@ -589,25 +591,43 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
             <!-- Statistics Section -->
             <div class="section-header d-flex justify-content-between align-items-center">
                 <span><i class="bi bi-graph-up"></i> System Statistics</span>
-                <button
-                    id="resetSystemStatsBtn"
-                    class="stats-reset-btn"
-                    type="button"
-                    title="Reset active sondes, total frames and inactive frequencies"
-                    aria-label="Reset statistics"
-                    onclick="resetSystemStatistics(); return false;"
-                >
-                    <i class="bi bi-arrow-counterclockwise"></i>
-                </button>
+                <div>
+                    <button class="btn btn-sm btn-outline-info me-2" onclick="showRxStatistics()" style="font-size: 11px; padding: 2px 8px;" title="Show receiver statistics from activity log">
+                        <i class="bi bi-graph-up"></i> RX Statistics
+                    </button>
+                    <button
+                        id="resetSystemStatsBtn"
+                        class="stats-reset-btn"
+                        type="button"
+                        title="Reset active sondes, total frames and inactive frequencies"
+                        aria-label="Reset statistics"
+                        onclick="resetSystemStatistics(); return false;"
+                    >
+                        <i class="bi bi-arrow-counterclockwise"></i>
+                    </button>
+                </div>
             </div>
             <div class="stats-grid">
                 <div class="stat-card">
                     <div class="stat-value" id="activeSondesCount">0</div>
                     <div class="stat-label">Active Sondes</div>
                 </div>
-                <div class="stat-card">
+                <div class="stat-card" style="position: relative;">
                     <div class="stat-value" id="totalFrames">0</div>
-                    <div class="stat-label">Total Frames</div>
+                    <div class="stat-label" id="totalStatsLabel">Total Frames</div>
+                    <div class="dropdown" style="position: absolute; top: 5px; right: 5px;">
+                        <button class="btn btn-sm btn-link p-0" style="font-size: 14px; color: #6c757d;" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+                            <i class="bi bi-three-dots-vertical"></i>
+                        </button>
+                        <ul class="dropdown-menu dropdown-menu-end" style="min-width: 150px;">
+                            <li><a class="dropdown-item" href="#" onclick="toggleTotalStats('frames'); return false;">
+                                <i class="bi bi-file-text"></i> Total Frames
+                            </a></li>
+                            <li><a class="dropdown-item" href="#" onclick="toggleTotalStats('sondes'); return false;">
+                                <i class="bi bi-broadcast"></i> Total Sondes
+                            </a></li>
+                        </ul>
+                    </div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-value small-font" id="activeFrequencies">-</div>
@@ -623,7 +643,7 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
             <div class="section-header d-flex justify-content-between align-items-center">
                 <span><i class="bi bi-broadcast"></i> Active Radiosondes</span>
                 <button class="btn btn-sm btn-outline-info" onclick="testStatisticsModal()" style="font-size: 11px; padding: 2px 8px;">
-                    <i class="bi bi-graph-up"></i> Show Statistics
+                    <i class="bi bi-graph-up"></i> Sonde Statistics
                 </button>
             </div>
             <div class="sonde-list" id="sondesList">
@@ -697,14 +717,15 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                         <tr style="background: rgba(255,255,255,0.05);">
                             <th style="padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);"></th>
                             <th style="padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);">Device</th>
-                            <th style="padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);">Status</th>
                             <th style="padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);">Frequency</th>
-                            <th style="padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);">Sonde Type</th>
+                            <th style="padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);">Sonde</th>
+                            <th style="padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);">Status</th>
+                            <th style="padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1);">Timer</th>
                         </tr>
                     </thead>
                     <tbody id="devicesTableBody">
                         <tr>
-                            <td colspan="5" style="padding: 15px; text-align: center; color: rgba(255,255,255,0.5);">Loading devices...</td>
+                            <td colspan="6" style="padding: 15px; text-align: center; color: rgba(255,255,255,0.5);">Loading devices...</td>
                         </tr>
                     </tbody>
                 </table>
@@ -714,6 +735,9 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
     
     <!-- Bootstrap JS -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <!-- RX Statistics Common Functions -->
+    <script src="/static/js/rx-statistics-common.js"></script>
     
     <!-- Leaflet JS -->
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -733,6 +757,30 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
         
         // Initialize map
         const map = L.map('map').setView([{{ default_lat }}, {{ default_lon }}], {{ default_zoom }});
+
+        // Home button — recenters the map on the station's configured lat/lon.
+        // Stacks below the default zoom control since both use position
+        // 'topleft' and the zoom control is created first (during L.map()).
+        const STATION_LAT = {{ station_lat }};
+        const STATION_LON = {{ station_lon }};
+        const HomeControl = L.Control.extend({
+            options: { position: 'topleft' },
+            onAdd: function() {
+                const container = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+                const link = L.DomUtil.create('a', '', container);
+                link.href = '#';
+                link.title = 'Center on station';
+                link.setAttribute('role', 'button');
+                link.setAttribute('aria-label', 'Center on station');
+                link.innerHTML = '<i class="bi bi-house-door-fill"></i>';
+                L.DomEvent.disableClickPropagation(link);
+                L.DomEvent.on(link, 'click', L.DomEvent.stop).on(link, 'click', function() {
+                    map.setView([STATION_LAT, STATION_LON], 9);
+                });
+                return container;
+            }
+        });
+        map.addControl(new HomeControl());
         
         // Define base layers
         const osmLayer = L.tileLayer('{{ tile_server }}', {
@@ -792,6 +840,23 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
             popupAnchor: [0, -12]
         });
         
+        // Total statistics display mode ('frames' or 'sondes')
+        let totalStatsMode = 'frames';
+        let cachedTotalFrames = 0;
+        let cachedTotalSondes = 0;
+        
+        // Toggle total statistics display
+        function toggleTotalStats(mode) {
+            totalStatsMode = mode;
+            if (mode === 'frames') {
+                document.getElementById('totalFrames').textContent = cachedTotalFrames.toLocaleString();
+                document.getElementById('totalStatsLabel').textContent = 'Total Frames';
+            } else {
+                document.getElementById('totalFrames').textContent = cachedTotalSondes.toLocaleString();
+                document.getElementById('totalStatsLabel').textContent = 'Total Sondes';
+            }
+        }
+        
         // Update data from API
         async function updateData() {
             try {
@@ -800,9 +865,17 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                 
                 // Update statistics
                 document.getElementById('activeSondesCount').textContent = data.count || 0;
-                // Format frame count with proper number display (no 1000 limit)
-                const frameCount = data.total_frames || 0;
-                document.getElementById('totalFrames').textContent = frameCount.toLocaleString();
+                
+                // Cache both total values
+                cachedTotalFrames = data.total_frames || 0;
+                cachedTotalSondes = data.total_sondes || 0;
+                
+                // Update display based on current mode
+                if (totalStatsMode === 'frames') {
+                    document.getElementById('totalFrames').textContent = cachedTotalFrames.toLocaleString();
+                } else {
+                    document.getElementById('totalFrames').textContent = cachedTotalSondes.toLocaleString();
+                }
                 
                 // Update frequencies - extract from sondes data
                 if (data.sondes && data.sondes.length > 0) {
@@ -924,7 +997,7 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                 const tbody = document.getElementById('devicesTableBody');
                 
                 if (devices.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan=\"5\" style=\"padding: 15px; text-align: center; color: rgba(255,255,255,0.5);\">No devices configured</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan=\"6\" style=\"padding: 15px; text-align: center; color: rgba(255,255,255,0.5);\">No devices configured</td></tr>';
                     return;
                 }
                 
@@ -945,34 +1018,68 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                     } else if (device.status === 'disconnected') {
                         statusClass = 'status-error';
                         statusText = 'Disconnected';
+                    } else if (device.status === 'error') {
+                        statusClass = 'status-error';
+                        statusText = 'Error';
                     }
                     
                     // Frequency display - use freq_label when available (shows scan range)
                     const freqText = device.freq_label ? device.freq_label
                                    : device.frequency  ? `${device.frequency.toFixed(3)} MHz`
                                    : '—';
-                    
+
                     // Sonde type display
-                    const sondeText = device.sonde_type || '—';
-                    
+                    const sondeText = formatSondeTypeShort(device.sonde_type);
+
+                    // Timer: hh:mm countdown until this device returns to scanning
+                    // if no more valid frames arrive (only meaningful while decoding).
+                    const timerText = formatScanReturnEta(device.scan_return_eta_s);
+
                     return `
                         <tr style=\"border-bottom: 1px solid rgba(255,255,255,0.05);\">
                             <td style=\"padding: 8px; text-align: center;\">
                                 <span class=\"status-indicator ${statusClass}\"></span>
                             </td>
                             <td style=\"padding: 8px;\"><b>${device.serial}</b></td>
-                            <td style=\"padding: 8px;\">${statusText}</td>
                             <td style=\"padding: 8px; font-family: monospace;\">${freqText}</td>
                             <td style=\"padding: 8px;\">${sondeText}</td>
+                            <td style=\"padding: 8px;\">${statusText}</td>
+                            <td style=\"padding: 8px; font-family: monospace;\">${timerText}</td>
                         </tr>
                     `;
                 }).join('');
-                
+
             } catch (error) {
                 console.error('Error fetching devices:', error);
-                document.getElementById('devicesTableBody').innerHTML = 
-                    '<tr><td colspan=\"5\" style=\"padding: 15px; text-align: center; color: rgba(255,0,0,0.7);\">Error loading devices</td></tr>';
+                document.getElementById('devicesTableBody').innerHTML =
+                    '<tr><td colspan=\"6\" style=\"padding: 15px; text-align: center; color: rgba(255,0,0,0.7);\">Error loading devices</td></tr>';
             }
+        }
+
+        // SDR Devices table: shortened sonde type display.
+        // Known base/sub types are shown as-is (with any "-SUFFIX" subtype
+        // qualifier like "-SG"/"-SGP" stripped first); anything else is
+        // truncated to 5 characters to keep the column narrow.
+        const SDR_TABLE_KNOWN_SONDE_TYPES = ['RS41', 'RS92', 'DFM06', 'DFM09', 'DFM17', 'M10', 'M20'];
+        function formatSondeTypeShort(sondeType) {
+            if (!sondeType) return '—';
+            const base = String(sondeType).split('-')[0];
+            if (SDR_TABLE_KNOWN_SONDE_TYPES.includes(base)) {
+                return base;
+            }
+            return base.substring(0, 5);
+        }
+
+        // Format seconds-remaining as "HH:MM"; '—' when not applicable
+        // (device not decoding, or no timeout applies).
+        function formatScanReturnEta(remainingSeconds) {
+            if (remainingSeconds === null || remainingSeconds === undefined) {
+                return '—';
+            }
+            const totalMinutes = Math.max(0, Math.ceil(remainingSeconds / 60));
+            const hh = Math.floor(totalMinutes / 60);
+            const mm = totalMinutes % 60;
+            return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
         }
         
         // Update sondes list
@@ -1142,12 +1249,12 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                             const launchFreq = sonde.frequency ? sonde.frequency.toFixed(3) + ' MHz' : 'N/A';
                             const launchTime = sonde.timestamp ? new Date(sonde.timestamp).toISOString().slice(0, 19).replace('T', ' ') + ' UTC' : 'N/A';
                             launchMarker.bindPopup(
-                                `<b>Launch Site</b><br>${sonde.serial}<br>` +
+                                `<b>First frame</b><br>${sonde.serial}<br>` +
                                 `<small>` +
+                                `Freq: ${launchFreq}<br>` +                                    
+                                `${launchTime}` +
                                 `${launchPt[0].toFixed(5)}, ${launchPt[1].toFixed(5)}<br>` +
                                 `Alt: ${launchAlt !== null ? launchAlt + ' m' : 'N/A'}<br>` +
-                                `Freq: ${launchFreq}<br>` +
-                                `${launchTime}` +
                                 `</small>`
                             );
                             
@@ -1255,6 +1362,34 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
         map._userPanned = false;
         map.on('dragstart', () => { map._userPanned = true; });
         map.on('zoomstart', () => { map._userPanned = true; });  // Also track zoom
+        
+        // Check for sonde query parameter to focus on specific sonde
+        const urlParams = new URLSearchParams(window.location.search);
+        const sondeParam = urlParams.get('sonde');
+        if (sondeParam) {
+            console.log(`[OPENWXSDR] Sonde parameter detected: ${sondeParam}, will focus after data loads`);
+            // Show loading modal
+            const loadingModal = new bootstrap.Modal(document.getElementById('loadingModal'));
+            document.getElementById('loadingModalText').textContent = `Loading radiosonde ${sondeParam}...`;
+            loadingModal.show();
+            window._loadingModal = loadingModal;
+            
+            // Wait for data to load before focusing
+            setTimeout(() => {
+                if (sondeMarkers[sondeParam]) {
+                    focusSonde(sondeParam);
+                    console.log(`[OPENWXSDR] Focused on sonde ${sondeParam}`);
+                    // Hide loading modal
+                    if (window._loadingModal) {
+                        window._loadingModal.hide();
+                        window._loadingModal = null;
+                    }
+                } else {
+                    console.warn(`[OPENWXSDR] Sonde ${sondeParam} not found in active markers, attempting to load from logfiles...`);
+                    loadSondeFromLogfiles(sondeParam);
+                }
+            }, 3000); // Wait 3 seconds for initial data load
+        }
         
         // Initial updates
         updateData();
@@ -1513,14 +1648,14 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                 const timestamp = new Date(formattedDate).getTime();
                 
                 // Determine sonde type from serial prefix
+                // NOTE: Serial IDs no longer have M10-/M20-/DFM-/iMet- prefixes
                 let type = 'Sonde';
                 if (serial.match(/^[A-Z]\d{7}/)) type = 'RS41';
                 else if (serial.match(/^[A-Z]\d{6}/)) type = 'RS92';
-                else if (serial.match(/^DFM/i)) type = 'DFM';  // DFM- prefix
-                else if (serial.match(/^\d{8}/)) type = 'DFM';  // Plain 8-digit
-                else if (serial.match(/^M10/i)) type = 'M10';  // M10- prefix
-                else if (serial.match(/^M20/i)) type = 'M20';  // M20- prefix
-                else if (serial.match(/^M\d+/)) type = 'M10';  // Fallback M-number
+                else if (serial.match(/^\d{8}$/)) type = 'DFM';  // 8 digits = DFM (no prefix)
+                else if (serial.match(/^\d+-\d+-\d+/)) type = 'M20';  // Hyphenated numeric = M20/M10
+                else if (serial.match(/^M\d+/)) type = 'M10';  // M-number fallback
+                else if (serial.match(/^iMet/i)) type = 'iMet';
                 else if (serial.match(/^W\d+/)) type = 'iMet';
                 else if (serial.match(/^L\d+/)) type = 'LMS6';
                 else if (serial.match(/^ME\d+/)) type = 'MRZ';
@@ -1622,7 +1757,59 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
             window.location.href = '/api/export_action_log';
         }
         
-        function startManualDecoder() {
+        // Store chart instances for RX statistics modal
+        let rxStatisticsCharts = {
+            sondesPerDay: null,
+            framesPerDay: null,
+            sondeTypes: null,
+            frequencies: null,
+            rssiTimeline: null,
+            satsDist: null,
+            altitudeBySonde: null,
+            lastAltitudeBySonde: null
+        };
+        
+        async function showRxStatistics() {
+            // Call shared function with index.html-specific options
+            await showRxStatisticsCommon({
+                currentActivityLogfile: currentActivityLogfile,
+                rxStatisticsCharts: rxStatisticsCharts,
+                loadingModalId: 'loadingModal'
+            });
+        }
+        
+        // Helper function to create histogram data from array of values
+        function createHistogram(values, bins) {
+            if (!values || values.length === 0) {
+                return { labels: [], counts: [] };
+            }
+            
+            const min = Math.min(...values);
+            const max = Math.max(...values);
+            const binWidth = (max - min) / bins;
+            
+            const counts = new Array(bins).fill(0);
+            const labels = [];
+            
+            for (let i = 0; i < bins; i++) {
+                const binStart = min + i * binWidth;
+                const binEnd = binStart + binWidth;
+                labels.push(binStart.toFixed(1));
+                
+                for (const value of values) {
+                    if (value >= binStart && value < binEnd) {
+                        counts[i]++;
+                    } else if (i === bins - 1 && value === binEnd) {
+                        // Include max value in last bin
+                        counts[i]++;
+                    }
+                }
+            }
+            
+            return { labels, counts };
+        }
+        
+        async function startManualDecoder() {
             const frequency  = document.getElementById('manualFrequency').value;
             const sondeType  = document.getElementById('manualSondeType').value;
             const deviceSel  = document.getElementById('manualDeviceSerial');
@@ -1641,29 +1828,60 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
             
             const durationLabel = duration === 0 ? 'infinite' : `${duration} minute${duration !== 1 ? 's' : ''}`;
             
-            fetch('/api/start_decoder', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    frequency: parseFloat(frequency),
-                    sonde_type: sondeType,
-                    device_serial: deviceSerial !== 'auto' ? deviceSerial : null,
-                    duration_minutes: duration
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
+            // Close the frequency entry modal
+            const entryModal = bootstrap.Modal.getInstance(document.getElementById('enterFrequencyModal'));
+            if (entryModal) {
+                entryModal.hide();
+            }
+            
+            // Show loading modal with "Decoder start in progress..." message
+            const loadingModalEl = document.getElementById('loadingModal');
+            const loadingModal = new bootstrap.Modal(loadingModalEl, { backdrop: 'static', keyboard: false });
+            document.getElementById('loadingModalText').textContent = 'Decoder start in progress...';
+            
+            // Wait for modal to be shown
+            await new Promise((resolve) => {
+                loadingModalEl.addEventListener('shown.bs.modal', resolve, { once: true });
+                loadingModal.show();
+            });
+            
+            try {
+                const response = await fetch('/api/start_decoder', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        frequency: parseFloat(frequency),
+                        sonde_type: sondeType,
+                        device_serial: deviceSerial !== 'auto' ? deviceSerial : null,
+                        duration_minutes: duration
+                    })
+                });
+                
+                const data = await response.json();
+                
+                // Hide loading modal
+                await new Promise((resolve) => {
+                    loadingModalEl.addEventListener('hidden.bs.modal', resolve, { once: true });
+                    loadingModal.hide();
+                });
+                
+                // Show result
                 if (data.success) {
                     alert(`Decoder started for ${frequency} MHz (${sondeType}) - ${durationLabel}`);
-                    bootstrap.Modal.getInstance(document.getElementById('enterFrequencyModal')).hide();
                 } else {
                     alert('Failed to start decoder: ' + (data.error || 'Unknown error'));
                 }
-            })
-            .catch(error => {
+            } catch (error) {
                 console.error('Error starting decoder:', error);
+                
+                // Hide loading modal on error
+                await new Promise((resolve) => {
+                    loadingModalEl.addEventListener('hidden.bs.modal', resolve, { once: true });
+                    loadingModal.hide();
+                });
+                
                 alert('Failed to start decoder');
-            });
+            }
         }
         
         function saveDecoderSettings() {
@@ -1694,6 +1912,9 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
             }
         }
         
+        // Global variable to store current logfile name for RX statistics
+        let currentActivityLogfile = null;
+        
         function loadLogfile(filename) {
             fetch(`/api/logfile/${encodeURIComponent(filename)}`)
                 .then(response => response.text())
@@ -1708,6 +1929,7 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                     const exportGpxBtn = document.getElementById('exportGpxBtn');
                     const exportActivityBtn = document.getElementById('exportActivityBtn');
                     const showMapBtn = document.getElementById('showMapBtn');
+                    const showRxStatsBtn = document.getElementById('showRxStatsBtn');
                     const downloadBtn = document.getElementById('downloadLogBtn');
                     
                     // Store current filename for download
@@ -1716,17 +1938,21 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                     };
                     
                     if (isActivityLog) {
-                        // Activity log: show Export Activity Log button only
+                        // Activity log: show Export Activity Log and RX Statistics buttons
+                        currentActivityLogfile = filename;  // Store for statistics
                         if (exportGpxBtn) exportGpxBtn.style.display = 'none';
                         if (exportActivityBtn) exportActivityBtn.style.display = 'inline-block';
                         if (showMapBtn) showMapBtn.style.display = 'none';
+                        if (showRxStatsBtn) showRxStatsBtn.style.display = 'inline-block';
                     } else if (isSondeLog) {
                         // Sonde log: show Export GPX and Show on Map buttons
+                        currentActivityLogfile = null;
                         if (exportGpxBtn) {
                             exportGpxBtn.style.display = 'inline-block';
                             exportGpxBtn.disabled = false;
                         }
                         if (exportActivityBtn) exportActivityBtn.style.display = 'none';
+                        if (showRxStatsBtn) showRxStatsBtn.style.display = 'none';
                         
                         // Show "Show on Map" button only if sonde is NOT currently active
                         // Extract serial by removing date/time suffix
@@ -1738,9 +1964,11 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                         }
                     } else {
                         // Unknown log type: hide all special buttons
+                        currentActivityLogfile = null;
                         if (exportGpxBtn) exportGpxBtn.style.display = 'none';
                         if (exportActivityBtn) exportActivityBtn.style.display = 'none';
                         if (showMapBtn) showMapBtn.style.display = 'none';
+                        if (showRxStatsBtn) showRxStatsBtn.style.display = 'none';
                     }
                 })
                 .catch(error => {
@@ -1940,6 +2168,17 @@ ${trkSegs}
             // Fit map to track bounds
             map.fitBounds(polyline.getBounds(), { padding: [50, 50] });
             
+            // Add to inactive sondes list
+            if (!inactiveSondes.find(s => s.serial === sondeSerial)) {
+                inactiveSondes.push({
+                    serial: sondeSerial,
+                    type: 'Historic',
+                    lastPosition: { lat: lastPoint.lat, lon: lastPoint.lon },
+                    lastUpdate: lastPoint.time || new Date().toISOString()
+                });
+                updateInactiveSondesList();
+            }
+            
             // Close the logfiles modal
             const modal = bootstrap.Modal.getInstance(document.getElementById('logfilesModal'));
             if (modal) modal.hide();
@@ -1948,6 +2187,192 @@ ${trkSegs}
             setTimeout(() => {
                 alert(`Historic track for ${sondeSerial} displayed on map (${trackpoints.length} points)`);
             }, 300);
+        }
+        
+        async function loadSondeFromLogfiles(sondeSerial) {
+            try {
+                // Fetch list of logfiles
+                const response = await fetch('/api/logfiles');
+                const data = await response.json();
+                const logfiles = data.files || []; // API returns {files: [...]}
+                
+                // Find the latest logfile for this sonde serial
+                const sondeLogfiles = logfiles.filter(f => 
+                    f.startsWith(sondeSerial + '-') && f.endsWith('.log')
+                ).sort().reverse(); // Most recent first
+                
+                if (sondeLogfiles.length === 0) {
+                    console.warn(`No logfiles found for sonde ${sondeSerial}`);
+                    alert(`Sonde ${sondeSerial} not found in active sondes or logfiles.`);
+                    // Hide loading modal
+                    if (window._loadingModal) {
+                        window._loadingModal.hide();
+                        window._loadingModal = null;
+                    }
+                    return;
+                }
+                
+                const latestLogfile = sondeLogfiles[0];
+                console.log(`Loading sonde ${sondeSerial} from logfile ${latestLogfile}`);
+                
+                // Fetch and parse the logfile
+                const logResponse = await fetch(`/api/logfile/${latestLogfile}`);
+                const logContent = await logResponse.text();
+                
+                // Parse trackpoints from log format
+                const lines = logContent.split('\n');
+                const trackpoints = [];
+                let currentTime = null;
+                let currentLat = null;
+                let currentLon = null;
+                let currentAlt = null;
+                let sondeType = 'Unknown';
+                
+                // Try to extract sonde type from log header
+                for (const line of lines.slice(0, 20)) {
+                    const typeMatch = line.match(/Type:\s*(\w+)/);
+                    if (typeMatch) {
+                        sondeType = typeMatch[1];
+                        break;
+                    }
+                }
+                
+                for (const line of lines) {
+                    const frameMatch = line.match(/^Frame\s+\d+\s+-\s+(\S+)/);
+                    if (frameMatch) {
+                        // Flush previous point
+                        if (currentLat !== null && currentLon !== null) {
+                            trackpoints.push({ lat: currentLat, lon: currentLon, alt: currentAlt, time: currentTime });
+                        }
+                        currentTime = frameMatch[1];
+                        currentLat = null;
+                        currentLon = null;
+                        currentAlt = null;
+                        continue;
+                    }
+                    const posMatch = line.match(/Position:\s*(-?[\d.]+),\s*(-?[\d.]+)/);
+                    if (posMatch) {
+                        currentLat = parseFloat(posMatch[1]);
+                        currentLon = parseFloat(posMatch[2]);
+                        continue;
+                    }
+                    const altMatch = line.match(/Altitude:\s*(-?[\d.]+)\s*m/);
+                    if (altMatch) {
+                        currentAlt = parseFloat(altMatch[1]);
+                    }
+                }
+                // Flush last point
+                if (currentLat !== null && currentLon !== null) {
+                    trackpoints.push({ lat: currentLat, lon: currentLon, alt: currentAlt, time: currentTime });
+                }
+                
+                if (trackpoints.length === 0) {
+                    alert(`No position data found in logfile for ${sondeSerial}`);
+                    // Hide loading modal
+                    if (window._loadingModal) {
+                        window._loadingModal.hide();
+                        window._loadingModal = null;
+                    }
+                    return;
+                }
+                
+                // Remove any existing historic track
+                if (window.historicTrackLayer) {
+                    map.removeLayer(window.historicTrackLayer);
+                }
+                if (window.historicMarker) {
+                    map.removeLayer(window.historicMarker);
+                }
+                if (window.historicLaunchMarker) {
+                    map.removeLayer(window.historicLaunchMarker);
+                }
+                
+                // Create polyline for the track
+                const latLngs = trackpoints.map(pt => [pt.lat, pt.lon]);
+                const polyline = L.polyline(latLngs, {
+                    color: '#FF6A00',
+                    weight: 3,
+                    opacity: 0.8
+                }).addTo(map);
+                
+                // Create launch marker at the first position
+                const firstPoint = trackpoints[0];
+                const launchMarker = L.marker([firstPoint.lat, firstPoint.lon], {
+                    icon: L.icon({
+                        iconUrl: '/static/img/launch-marker-cyan.png',
+                        iconSize: [21, 21],
+                        iconAnchor: [11, 11],
+                        popupAnchor: [0, -11]
+                    })
+                }).addTo(map);
+                
+                launchMarker.bindPopup(`
+                    <strong>Launch Site</strong><br>
+                    ${sondeSerial}<br>
+                    <small>
+                    ${firstPoint.lat.toFixed(5)}, ${firstPoint.lon.toFixed(5)}<br>
+                    Altitude: ${firstPoint.alt ? firstPoint.alt.toFixed(0) + ' m' : 'N/A'}<br>
+                    Time: ${firstPoint.time || 'N/A'}
+                    </small>
+                `);
+                
+                // Create marker at the last known position
+                const lastPoint = trackpoints[trackpoints.length - 1];
+                const marker = L.marker([lastPoint.lat, lastPoint.lon], {
+                    icon: L.icon({
+                        iconUrl: '/static/img/target-red.png',
+                        iconSize: [21, 21],
+                        iconAnchor: [11, 11],
+                        popupAnchor: [0, -11]
+                    })
+                }).addTo(map);
+                
+                marker.bindPopup(`
+                    <strong>Historic Track: ${sondeSerial}</strong><br>
+                    Type: ${sondeType}<br>
+                    Last Position: ${lastPoint.lat.toFixed(5)}, ${lastPoint.lon.toFixed(5)}<br>
+                    Altitude: ${lastPoint.alt ? lastPoint.alt.toFixed(0) + ' m' : 'N/A'}<br>
+                    Time: ${lastPoint.time || 'N/A'}<br>
+                    <em>Track from log file ${latestLogfile}</em>
+                `);
+                
+                // Store references for cleanup
+                window.historicTrackLayer = polyline;
+                window.historicLaunchMarker = launchMarker;
+                window.historicMarker = marker;
+                
+                // Add to inactive sondes list
+                if (!inactiveSondes.find(s => s.serial === sondeSerial)) {
+                    inactiveSondes.push({
+                        serial: sondeSerial,
+                        type: sondeType,
+                        lastPosition: { lat: lastPoint.lat, lon: lastPoint.lon },
+                        lastUpdate: lastPoint.time || new Date().toISOString()
+                    });
+                    updateInactiveSondesList();
+                }
+                
+                // Fit map to track bounds
+                map.fitBounds(polyline.getBounds(), { padding: [50, 50] });
+                
+                console.log(`Successfully loaded ${sondeSerial} with ${trackpoints.length} trackpoints`);
+                
+                // Hide loading modal if it's showing
+                if (window._loadingModal) {
+                    window._loadingModal.hide();
+                    window._loadingModal = null;
+                }
+                
+            } catch (error) {
+                console.error(`Error loading sonde from logfiles:`, error);
+                alert(`Error loading sonde ${sondeSerial}: ${error.message}`);
+                
+                // Hide loading modal on error
+                if (window._loadingModal) {
+                    window._loadingModal.hide();
+                    window._loadingModal = null;
+                }
+            }
         }
     </script>
     
@@ -2150,18 +2575,18 @@ ${trkSegs}
 
     <!-- Logfiles Modal -->
     <div class="modal fade" id="logfilesModal" tabindex="-1">
-        <div class="modal-dialog modal-xl">
-            <div class="modal-content">
+        <div class="modal-dialog modal-xl" style="max-width: 95vw; max-height: 90vh; height: 90vh;">
+            <div class="modal-content" style="height: 100%;">
                 <div class="modal-header">
                     <h5 class="modal-title"><i class="bi bi-file-text"></i> Logfiles</h5>
                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
-                <div class="modal-body">
-                    <div class="row">
-                        <div class="col-md-5">
+                <div class="modal-body" style="overflow: hidden; display: flex; flex-direction: column; padding: 1rem;">
+                    <div class="row g-2" style="flex: 1; min-height: 0; margin: 0; display: flex;">
+                        <div class="col-md-5" style="display: flex; flex-direction: column; min-height: 0; overflow: hidden; height: 100%;">
                             <h6>Available Logs</h6>
-                            <div style="max-height: 500px; overflow-y: auto;">
-                                <table class="table table-sm table-hover" id="logfileTable" style="font-size: 13px;">
+                            <div style="flex: 1; min-height: 0; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 4px;">
+                                <table class="table table-sm table-hover mb-0" id="logfileTable" style="font-size: 13px;">
                                     <thead style="position: sticky; top: 0; background: white; z-index: 10;">
                                         <tr>
                                             <th style="cursor: pointer;" onclick="sortLogfiles('name')">
@@ -2181,10 +2606,13 @@ ${trkSegs}
                                 </table>
                             </div>
                         </div>
-                        <div class="col-md-7">
+                        <div class="col-md-7" style="display: flex; flex-direction: column; min-height: 0; overflow: hidden; height: 100%;">
                             <div class="d-flex align-items-center justify-content-between mb-1">
                                 <h6 id="logfileTitle" class="mb-0">Select a log file</h6>
                                 <div class="btn-group btn-group-sm">
+                                    <button id="showRxStatsBtn" class="btn btn-outline-info" onclick="showRxStatistics()" style="display: none;">
+                                        <i class="bi bi-graph-up-arrow"></i> Show RX Statistics
+                                    </button>
                                     <button id="exportGpxBtn" class="btn btn-outline-success" onclick="exportGpx()" disabled style="display: none;">
                                         <i class="bi bi-download"></i> Export GPX
                                     </button>
@@ -2199,7 +2627,7 @@ ${trkSegs}
                                     </button>
                                 </div>
                             </div>
-                            <pre id="logfileContent" style="max-height: 400px; overflow-y: auto; background: #f8f9fa; padding: 10px; border-radius: 4px; font-size: 12px;">No file selected</pre>
+                            <pre id="logfileContent" style="flex: 1; min-height: 0; overflow-y: auto; background: #f8f9fa; padding: 10px; border-radius: 4px; font-size: 12px; margin: 0;">No file selected</pre>
                         </div>
                     </div>
                 </div>
@@ -2209,9 +2637,145 @@ ${trkSegs}
             </div>
         </div>
     </div>
+    
+    <!-- Receiver Statistics Modal -->
+    <div class="modal fade" id="rxStatisticsModal" tabindex="-1">
+        <div class="modal-dialog modal-xl" style="max-width: 1400px;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-graph-up-arrow"></i> Receiver Statistics</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" style="max-height: 80vh; overflow-y: auto;">
+                    <!-- Summary Statistics at Top -->
+                    <div class="row mb-4">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-info-circle"></i> Summary Statistics</h6>
+                            <div class="row">
+                                <div class="col">
+                                    <div class="card" style="background-color: #f0f8ff;">
+                                        <div class="card-body text-center">
+                                            <h3 id="rxStatsTotalSondes" class="mb-0">-</h3>
+                                            <small class="text-muted">Total Sondes</small>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col">
+                                    <div class="card" style="background-color: #f0fff0;">
+                                        <div class="card-body text-center">
+                                            <h3 id="rxStatsTotalFrames" class="mb-0">-</h3>
+                                            <small class="text-muted">Frames today</small>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col">
+                                    <div class="card" style="background-color: #fffef0;">
+                                        <div class="card-body text-center">
+                                            <h3 id="rxStatsRecordedDays" class="mb-0">-</h3>
+                                            <small class="text-muted">Recorded Days</small>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col">
+                                    <div class="card" style="background-color: #fff0f5;">
+                                        <div class="card-body text-center">
+                                            <h3 id="rxStatsTotalFramesStopped" class="mb-0">-</h3>
+                                            <small class="text-muted">Total Frames</small>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col">
+                                    <div class="card" style="background-color: #f5f0ff;">
+                                        <div class="card-body text-center">
+                                            <h3 id="rxStatsMaxSondes" class="mb-0">-</h3>
+                                            <small id="rxStatsMaxSondesDate" class="text-muted d-block" style="font-size: 0.75rem; margin-top: 2px; display: none;">-</small>
+                                            <small class="text-muted">Max. Sondes/day</small>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-4">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-calendar3"></i> Received Sondes per Day</h6>
+                            <div style="height: 250px;">
+                                <canvas id="sondesPerDayChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-4">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-file-earmark-text"></i> Total Frames per Day</h6>
+                            <div style="height: 250px;">
+                                <canvas id="framesPerDayChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-4">
+                        <div class="col-md-6">
+                            <h6><i class="bi bi-broadcast"></i> Received Sonde Types</h6>
+                            <div style="height: 250px;">
+                                <canvas id="sondeTypesChart"></canvas>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <h6><i class="bi bi-reception-4"></i> Received Frequencies (MHz)</h6>
+                            <div style="height: 250px;">
+                                <canvas id="frequenciesChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-4">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-reception-4"></i> RSSI Over Time</h6>
+                            <div style="height: 250px;">
+                                <canvas id="rssiTimelineChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-3">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-satellite"></i> Satellite Count Distribution</h6>
+                            <div style="height: 250px;">
+                                <canvas id="satsDistChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-3">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-cloud-arrow-up"></i> First Frame Altitude by Sonde</h6>
+                            <div style="height: 300px; overflow-x: auto;">
+                                <canvas id="altitudeBySondeChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-3">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-cloud-arrow-down"></i> Last Frame Altitude by Sonde</h6>
+                            <div style="height: 300px; overflow-x: auto;">
+                                <canvas id="lastAltitudeBySondeChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
     <!-- Configuration Modal -->
     <div class="modal fade" id="configurationModal" tabindex="-1">
-        <div class="modal-dialog modal-lg">
+        <div class="modal-dialog modal-lg" style="max-width: 880px;">
             <div class="modal-content">
                 <div class="modal-header">
                     <h5 class="modal-title"><i class="bi bi-gear-wide-connected"></i> Configuration</h5>
@@ -2228,6 +2792,11 @@ ${trkSegs}
                         <li class="nav-item" role="presentation">
                             <button class="nav-link" id="tab-station-btn" data-bs-toggle="tab" data-bs-target="#tab-station" type="button" role="tab">
                                 <i class="bi bi-broadcast-pin"></i> Station
+                            </button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="tab-importapi-btn" data-bs-toggle="tab" data-bs-target="#tab-importapi" type="button" role="tab">
+                                <i class="bi bi-cloud-download"></i> Import API
                             </button>
                         </li>
                         <li class="nav-item" role="presentation">
@@ -2379,6 +2948,104 @@ ${trkSegs}
                             <div class="alert alert-info small py-2 mb-0">
                                 <i class="bi bi-info-circle"></i>
                                 Changes are applied immediately without restarting the service. They are <strong>not</strong> written to config.yaml.
+                            </div>
+                        </div>
+
+                        <!-- ── Import API tab ── -->
+                        <div class="tab-pane fade" id="tab-importapi" role="tabpanel">
+                            <div class="mt-2 mb-3">
+                                <div class="form-check form-switch config-upload-toggle">
+                                    <input class="form-check-input" type="checkbox" role="switch" id="importApiEnabled">
+                                    <label class="form-check-label fw-semibold" for="importApiEnabled">Enable Import API</label>
+                                </div>
+                                <div class="form-text">Automatically detect nearby sondes using external API and assign to available SDR receivers.</div>
+                            </div>
+                            <div class="row g-3">
+                                <div class="col-md-8">
+                                    <label for="importApiUrl" class="form-label">API Base URL</label>
+                                    <input type="text" class="form-control" id="importApiUrl" placeholder="api.opnwx.de">
+                                    <div class="form-text">Base URL for the sonde import API (without https://)</div>
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="importApiCheckInterval" class="form-label">Check Interval (s)</label>
+                                    <input type="number" class="form-control" id="importApiCheckInterval" min="30" max="3600" step="30" placeholder="300">
+                                    <div class="form-text">How often to poll the API</div>
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="importApiLat" class="form-label">Latitude</label>
+                                    <input type="text" class="form-control" id="importApiLat" inputmode="decimal" placeholder="52.00">
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="importApiLon" class="form-label">Longitude</label>
+                                    <input type="text" class="form-control" id="importApiLon" inputmode="decimal" placeholder="10.00">
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="importApiDistance" class="form-label">Max. Distance (km)</label>
+                                    <input type="number" class="form-control" id="importApiDistance" min="10" max="999999" step="10" placeholder="150">
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="importApiTimeRange" class="form-label">Time Range (minutes)</label>
+                                    <input type="number" class="form-control" id="importApiTimeRange" min="5" max="1440" step="5" placeholder="15">
+                                    <div class="form-text">Import sondes active within this time window</div>
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="importApiSondeType" class="form-label">Sonde Type Filter</label>
+                                    <select class="form-select" id="importApiSondeType">
+                                        <option value="all">All Types</option>
+                                        <option value="RS41">RS41</option>
+                                        <option value="DFM">DFM</option>
+                                        <option value="M10">M10</option>
+                                        <option value="M20">M20</option>
+                                        <option value="iMet">iMet</option>
+                                        <option value="LMS6">LMS6</option>
+                                    </select>
+                                    <div class="form-text">Filter imported sondes by type</div>
+                                </div>
+                                <div class="col-md-4">
+                                    <label for="importApiMaxSondes" class="form-label">Max. Sondes</label>
+                                    <input type="number" class="form-control" id="importApiMaxSondes" min="1" max="8" step="1" placeholder="4">
+                                    <div class="form-text">Maximum concurrent imported sondes</div>
+                                </div>
+                            </div>
+                            <div class="alert alert-info small py-2 mt-3 mb-0">
+                                <i class="bi bi-info-circle"></i>
+                                Import API will assign detected frequencies to available SDR receivers based on distance (nearest first).
+                            </div>
+                            
+                            <!-- Preview Results -->
+                            <div id="importApiPreviewResults" class="mt-3" style="display: none;">
+                                <h6 class="fw-semibold mb-2"><i class="bi bi-search"></i> Preview Results</h6>
+                                <div class="table-responsive" style="max-height: 300px; overflow-y: auto;">
+                                    <table class="table table-sm table-hover mb-0" style="font-size: 13px;">
+                                        <thead class="table-light" style="position: sticky; top: 0; z-index: 10;">
+                                            <tr>
+                                                <th>Serial</th>
+                                                <th>Type</th>
+                                                <th>Frequency</th>
+                                                <th>Distance</th>
+                                                <th>Altitude</th>
+                                                <th>Uploader</th>
+                                                <th>Launch Site</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="importApiPreviewTable">
+                                            <tr><td colspan="7" class="text-center">Loading...</td></tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                            
+                            <div class="alert alert-warning small py-2 mt-2 mb-0">
+                                <i class="bi bi-exclamation-triangle"></i>
+                                Changes are written to config.yaml and require a <strong>service restart</strong> to take effect.
+                            </div>
+                            <div class="d-flex justify-content-between mt-3">
+                                <button type="button" class="btn btn-outline-info" onclick="previewImportApi()">
+                                    <i class="bi bi-eye"></i> Preview Available Sondes
+                                </button>
+                                <button type="button" class="btn btn-warning text-dark" onclick="saveImportApiConfig()">
+                                    <i class="bi bi-save"></i> Save (&amp; Restart)
+                                </button>
                             </div>
                         </div>
 
@@ -4228,7 +4895,11 @@ ${trkSegs}
                                 <tr><td>Descent:</td><td>${tParams['descent_rate'].toFixed(1)} m/s</td></tr>
                                 <tr><td>Burst:</td><td>${tParams['burst_altitude']} m</td></tr>
                             </table>
-                            <button class="btn btn-sm btn-danger" onclick="removePrediction('${sondeid}')">Remove Prediction</button>
+                            <div class="d-flex justify-content-center">
+                                <button class="btn btn-sm btn-danger" onclick="removePrediction('${sondeid}')">
+                                    Remove Prediction
+                                </button>
+                            </div>
                         </div>`;
                         
                         landMarker.bindPopup(popup, {
@@ -4438,6 +5109,21 @@ ${trkSegs}
                 document.getElementById('stationMinSignal').value = st.min_signal_strength ?? -20;
                 document.getElementById('stationUseDftDetect').checked = !!st.use_dft_detect;
 
+                // Import API
+                const ia = _cfgSections.import_api || {};
+                document.getElementById('importApiEnabled').checked = !!ia.enabled;
+                document.getElementById('importApiUrl').value = ia.url ?? 'api.opnwx.de';
+                document.getElementById('importApiCheckInterval').value = ia.check_interval_s ?? 300;
+                // Use station lat/lon as defaults if import_api values are 0 or not set
+                const defaultLat = (ia.lat && ia.lat !== 0) ? ia.lat : (ia.station_lat ?? st.lat ?? '');
+                const defaultLon = (ia.lon && ia.lon !== 0) ? ia.lon : (ia.station_lon ?? st.lon ?? '');
+                document.getElementById('importApiLat').value = defaultLat;
+                document.getElementById('importApiLon').value = defaultLon;
+                document.getElementById('importApiDistance').value = ia.distance_km ?? 500;
+                document.getElementById('importApiTimeRange').value = ia.time_range_minutes ?? 240;
+                document.getElementById('importApiSondeType').value = ia.sonde_type ?? 'all';
+                document.getElementById('importApiMaxSondes').value = ia.max_sondes ?? 4;
+
                 attachFreqFormatters();
 
             } catch(e) { console.error('Error loading config sections:', e); }
@@ -4556,6 +5242,77 @@ ${trkSegs}
                     upload_rate_s: parseInt(document.getElementById('sondehubRate').value),
                 }
             });
+        }
+
+        async function saveImportApiConfig() {
+            await _saveConfigSection({
+                import_api: {
+                    enabled: document.getElementById('importApiEnabled').checked,
+                    url: document.getElementById('importApiUrl').value.trim(),
+                    check_interval_s: parseInt(document.getElementById('importApiCheckInterval').value),
+                    lat: parseFloat(document.getElementById('importApiLat').value),
+                    lon: parseFloat(document.getElementById('importApiLon').value),
+                    distance_km: parseInt(document.getElementById('importApiDistance').value),
+                    time_range_minutes: parseInt(document.getElementById('importApiTimeRange').value),
+                    sonde_type: document.getElementById('importApiSondeType').value,
+                    max_sondes: parseInt(document.getElementById('importApiMaxSondes').value),
+                }
+            });
+        }
+
+        async function previewImportApi() {
+            const previewResults = document.getElementById('importApiPreviewResults');
+            const previewTable = document.getElementById('importApiPreviewTable');
+            
+            // Show loading state
+            previewResults.style.display = 'block';
+            previewTable.innerHTML = '<tr><td colspan="7" class="text-center"><div class="spinner-border spinner-border-sm me-2" role="status"></div>Loading sondes...</td></tr>';
+            
+            try {
+                // Gather current form values
+                const params = {
+                    url: document.getElementById('importApiUrl').value.trim() || 'api.opnwx.de',
+                    lat: parseFloat(document.getElementById('importApiLat').value) || 0,
+                    lon: parseFloat(document.getElementById('importApiLon').value) || 0,
+                    distance_km: parseInt(document.getElementById('importApiDistance').value) || 500,
+                    time_range_minutes: parseInt(document.getElementById('importApiTimeRange').value) || 240,
+                    sonde_type: document.getElementById('importApiSondeType').value || 'all',
+                    max_sondes: parseInt(document.getElementById('importApiMaxSondes').value) || 4,
+                };
+                
+                // Call backend preview endpoint
+                const response = await fetch('/api/preview_import_api', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(params)
+                });
+                
+                const data = await response.json();
+                
+                if (data.success && data.sondes && data.sondes.length > 0) {
+                    // Display results in table
+                    let rows = '';
+                    for (const sonde of data.sondes) {
+                        rows += `<tr>
+                            <td><strong>${sonde.serial}</strong></td>
+                            <td><span class="badge bg-secondary">${sonde.type}</span></td>
+                            <td>${(sonde.frequency / 1e6).toFixed(3)} MHz</td>
+                            <td>${sonde.distance_km.toFixed(1)} km</td>
+                            <td>${Math.round(sonde.alt)} m</td>
+                            <td>${sonde.uploader || '-'}</td>
+                            <td>${sonde.launchsite || '-'}</td>
+                        </tr>`;
+                    }
+                    previewTable.innerHTML = rows;
+                } else if (data.success && data.sondes && data.sondes.length === 0) {
+                    previewTable.innerHTML = '<tr><td colspan="7" class="text-center text-muted">No sondes found matching your criteria</td></tr>';
+                } else {
+                    previewTable.innerHTML = `<tr><td colspan="7" class="text-center text-danger">Error: ${data.error || 'Unknown error'}</td></tr>`;
+                }
+            } catch (error) {
+                console.error('Preview error:', error);
+                previewTable.innerHTML = `<tr><td colspan="7" class="text-center text-danger">Error: ${error.message}</td></tr>`;
+            }
         }
 
         async function saveStationConfig() {

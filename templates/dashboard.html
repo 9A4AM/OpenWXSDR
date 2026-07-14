@@ -1,0 +1,2788 @@
+<!DOCTYPE html>
+<html lang="en">
+<!--
+========================================================================================================
+   All content of this private site copyright (C) 2026 by Meinhard F. Guenther, DL2MF http://dl2mf.de
+ ------------------------------------------------------------------------------------------------------
+     All rights reserved - No commercial use of this work is allowed - Free for amateur radio use
+ ------------------------------------------------------------------------------------------------------ 
+                Copyright (C) 2019-2026 by Meinhard F. Guenther, DL2MF - OpenWX.de
+========================================================================================================
+-->
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenWXSDR - System Dashboard</title>
+    
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    
+    <!-- Bootstrap Icons -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .dashboard-container {
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+        
+        .dashboard-header {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 25px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }
+        
+        .dashboard-title {
+            font-size: 36px;
+            font-weight: 700;
+            color: #2d3748;
+            margin-bottom: 10px;
+        }
+        
+        .openwx-open { color: #667eea; font-weight: bold; }
+        .openwx-wx { color: #667eea; font-weight: bold; }
+        .openwx-sdr { color: #764ba2; font-weight: bold; }
+        
+        .dashboard-subtitle {
+            color: #718096;
+            font-size: 16px;
+        }
+        
+        .action-buttons {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        
+        .btn-action {
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.3s;
+        }
+        
+        .btn-primary-action {
+            background: #667eea;
+            color: white;
+            border: none;
+        }
+        
+        .btn-primary-action:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-secondary-action {
+            background: white;
+            color: #667eea;
+            border: 2px solid #667eea;
+        }
+        
+        .btn-secondary-action:hover {
+            background: #667eea;
+            color: white;
+            transform: translateY(-2px);
+        }
+        
+        .stats-overview {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 25px;
+        }
+        
+        .stat-card {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            transition: transform 0.3s;
+        }
+        
+        .stat-card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .stat-icon {
+            font-size: 32px;
+            color: #667eea;
+            margin-bottom: 15px;
+        }
+        
+        .stat-value {
+            font-size: 36px;
+            font-weight: 700;
+            color: #2d3748;
+            margin-bottom: 5px;
+        }
+        
+        .stat-label {
+            color: #718096;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .section-card {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 25px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }
+        
+        .section-title {
+            font-size: 24px;
+            font-weight: 700;
+            color: #2d3748;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .section-icon {
+            color: #667eea;
+        }
+        
+        .receivers-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        
+        .receiver-card {
+            background: #f7fafc;
+            border: 2px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 20px;
+            transition: all 0.3s;
+        }
+        
+        .receiver-card.scanning {
+            border-color: #4299e1;
+            background: #ebf8ff;
+        }
+        
+        .receiver-card.decoding {
+            border-color: #48bb78;
+            background: #f0fff4;
+        }
+        
+        .receiver-card.idle {
+            border-color: #cbd5e0;
+            background: #f7fafc;
+        }
+        
+        .receiver-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .receiver-name {
+            font-size: 18px;
+            font-weight: 700;
+            color: #2d3748;
+        }
+        
+        .receiver-status {
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .status-scanning { background: #4299e1; color: white; }
+        .status-decoding { background: #48bb78; color: white; }
+        .status-idle { background: #cbd5e0; color: #4a5568; }
+        
+        .receiver-info {
+            margin-top: 10px;
+        }
+        
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #e2e8f0;
+            font-size: 14px;
+        }
+        
+        .info-row:last-child {
+            border-bottom: none;
+        }
+        
+        .info-label {
+            color: #718096;
+            font-weight: 600;
+        }
+        
+        .info-value {
+            color: #2d3748;
+            font-weight: 500;
+        }
+        
+        .manual-controls {
+            margin-top: 15px;
+            padding-top: 12px;
+            border-top: 2px solid #e2e8f0;
+        }
+        
+        .manual-controls-label {
+            font-size: 12px;
+            font-weight: 600;
+            color: #718096;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .manual-form {
+            display: flex;
+            gap: 8px;
+            align-items: flex-end;
+        }
+        
+        .manual-input-group {
+            flex: 1;
+            min-width: 0;
+        }
+        
+        .manual-input-label {
+            display: block;
+            font-size: 11px;
+            color: #718096;
+            margin-bottom: 4px;
+            font-weight: 500;
+        }
+        
+        .manual-freq-input {
+            width: 100%;
+            padding: 6px 8px;
+            border: 1px solid #cbd5e0;
+            border-radius: 6px;
+            font-size: 13px;
+            font-family: 'Courier New', Consolas, monospace;
+            font-weight: 600;
+            color: #2d3748;
+            background: white;
+            transition: border-color 0.2s;
+        }
+        
+        .manual-freq-input:focus {
+            outline: none;
+            border-color: #4299e1;
+            box-shadow: 0 0 0 3px rgba(66, 153, 225, 0.1);
+        }
+        
+        .manual-type-select {
+            width: 100%;
+            padding: 6px 8px;
+            border: 1px solid #cbd5e0;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            color: #2d3748;
+            background: white;
+            transition: border-color 0.2s;
+        }
+        
+        .manual-type-select:focus {
+            outline: none;
+            border-color: #4299e1;
+            box-shadow: 0 0 0 3px rgba(66, 153, 225, 0.1);
+        }
+        
+        .manual-start-btn {
+            padding: 7px 16px;
+            background: #48bb78;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+            white-space: nowrap;
+        }
+        
+        .manual-start-btn:hover:not(:disabled) {
+            background: #38a169;
+        }
+        
+        .manual-start-btn:disabled {
+            background: #cbd5e0;
+            cursor: not-allowed;
+        }
+        
+        .config-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+        }
+        
+        .config-item {
+            background: #f7fafc;
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .config-label {
+            color: #718096;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 5px;
+        }
+        
+        .config-value {
+            color: #2d3748;
+            font-size: 18px;
+            font-weight: 600;
+        }
+        
+        .sondes-table {
+            width: 100%;
+            margin-top: 15px;
+        }
+        
+        .sondes-table thead th {
+            background: #f7fafc;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+            color: #4a5568;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        
+        .sondes-table tbody td {
+            padding: 12px;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        
+        .sondes-table tbody tr:hover {
+            background: #f7fafc;
+        }
+        
+        .badge-sonde-type {
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        
+        .badge-rs41 { background: #bee3f8; color: #2c5282; }
+        .badge-dfm { background: #fed7d7; color: #742a2a; }
+        .badge-m10 { background: #feebc8; color: #7c2d12; }
+        
+        .update-time {
+            text-align: center;
+            padding: 15px;
+            color: #e8f0fd;
+            font-size: 14px;
+        }
+        
+        @media (max-width: 768px) {
+            .dashboard-header {
+                padding: 20px;
+            }
+            
+            .dashboard-title {
+                font-size: 28px;
+            }
+            
+            .stats-overview {
+                grid-template-columns: 1fr 1fr;
+            }
+            
+            .receivers-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .config-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        .about-btn-orange {
+            color: #ffcc88 !important;
+            border-color: #ffcc88 !important;
+        }
+
+        .about-btn-orange:hover,
+        .about-btn-orange:focus {
+            color: #2b1a00 !important;
+            background-color: #ffcc88 !important;
+            border-color: #ffcc88 !important;
+        }
+    </style>
+</head>
+<body>
+    <div class="dashboard-container">
+        <!-- Header -->
+        <div class="dashboard-header">
+            <div class="d-flex justify-content-between align-items-start">
+                <div>
+                    <h1 class="dashboard-title">
+                        <span class="openwx-open">Open</span><span class="openwx-wx">WX</span> <span class="openwx-sdr"><i class="bi bi-radar"></i></span> <span class="openwx-open">SDR</span>
+                    </h1>
+                    <p class="dashboard-subtitle">System Dashboard & Monitoring</p>
+                </div>
+                <h2 class="text-end" style="color: #667eea; font-weight: 700; margin: 0;" id="stationName">-</h2>
+            </div>
+            
+            <div class="action-buttons">
+                <a href="/" class="btn btn-action btn-primary-action">
+                    <i class="bi bi-map"></i> Map View
+                </a>
+                <button class="btn btn-action btn-secondary-action" onclick="showReceiverStatistics()">
+                    <i class="bi bi-graph-up-arrow"></i> Receiver Statistics
+                </button>
+                <button class="btn btn-action btn-secondary-action" onclick="showLogfilesModal()">
+                    <i class="bi bi-file-earmark-text"></i> View Logfiles
+                </button>
+                <button class="btn btn-action btn-secondary-action about-btn-orange" onclick="showAboutModal()">
+                    <i class="bi bi-info-circle"></i> About
+                </button>
+                <button class="btn btn-action btn-secondary-action" onclick="refreshData()">
+                    <i class="bi bi-arrow-clockwise"></i> Refresh
+                </button>
+            </div>
+        </div>
+        
+        <!-- Statistics Overview -->
+        <div class="stats-overview">
+            <div class="stat-card">
+                <div class="stat-icon"><i class="bi bi-broadcast-pin"></i></div>
+                <div class="stat-value" id="totalSondes">-</div>
+                <div class="stat-label">Active Sondes</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon"><i class="bi bi-file-earmark-bar-graph"></i></div>
+                <div class="stat-value" id="totalFrames">-</div>
+                <div class="stat-label">Frames Today</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon"><i class="bi bi-hdd"></i></div>
+                <div class="stat-value" id="uniqueSondes">-</div>
+                <div class="stat-label">Unique Sondes</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon"><i class="bi bi-clock-history"></i></div>
+                <div class="stat-value" id="uptime">-</div>
+                <div class="stat-label">System Uptime</div>
+            </div>
+        </div>
+        
+        <!-- SDR Receivers -->
+        <div class="section-card">
+            <h2 class="section-title">
+                <i class="bi bi-broadcast section-icon"></i>
+                SDR Receivers
+            </h2>
+            <div class="receivers-grid" id="receiversGrid">
+                <div class="text-center text-muted py-4">
+                    <div class="spinner-border" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <p class="mt-2">Loading receiver status...</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Configuration Details -->
+        <div class="section-card">
+            <h2 class="section-title">
+                <i class="bi bi-sliders section-icon"></i>
+                Configuration
+            </h2>
+            <div class="config-grid" id="configGrid">
+                <div class="config-item">
+                    <div class="config-label">SDR Type</div>
+                    <div class="config-value" id="configSdrType">-</div>
+                </div>
+                <div class="config-item">
+                    <div class="config-label">Gain</div>
+                    <div class="config-value" id="configGain">-</div>
+                </div>
+                <div class="config-item">
+                    <div class="config-label">Detection Threshold</div>
+                    <div class="config-value" id="configThreshold">-</div>
+                </div>
+                <div class="config-item">
+                    <div class="config-label">Scan Interval</div>
+                    <div class="config-value" id="configScanInterval">-</div>
+                </div>
+                <div class="config-item">
+                    <div class="config-label">Station Callsign</div>
+                    <div class="config-value" id="configCallsign">-</div>
+                </div>
+                <!--div class="config-item">
+                    <div class="config-label">Frequency Range</div>
+                    <div class="config-value" id="configFreqRange">-</div>
+                </div-->
+            </div>
+        </div>
+        
+        <!-- Active Sondes -->
+        <div class="section-card">
+            <h2 class="section-title">
+                <i class="bi bi-broadcast-pin section-icon"></i>
+                Decoded Radiosondes
+            </h2>
+            <div id="sondesContainer">
+                <div class="text-center text-muted py-4">
+                    <div class="spinner-border" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <p class="mt-2">Loading sonde data...</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Update Time -->
+        <div class="update-time">
+            Last updated: <span id="lastUpdate">-</span>
+        </div>
+    </div>
+    
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <!-- RX Statistics Common Functions -->
+    <script src="/static/js/rx-statistics-common.js"></script>
+    
+    <script>
+        // Auto-refresh interval (30 seconds)
+        let refreshInterval;
+        
+        // External URL settings
+        let externalUrlProvider = 'openwx';
+        let externalUrlCustom = '';
+        
+        // Initialize dashboard
+        document.addEventListener('DOMContentLoaded', function() {
+            refreshData();
+            // Auto-refresh every 30 seconds
+            refreshInterval = setInterval(refreshData, 30000);
+        });
+        
+        async function refreshData() {
+            try {
+                await Promise.all([
+                    loadSystemStatus(),
+                    loadReceivers(),
+                    loadConfiguration(),
+                    loadActiveSondes()
+                ]);
+                
+                document.getElementById('lastUpdate').textContent = new Date().toLocaleString();
+            } catch (error) {
+                console.error('Error refreshing dashboard:', error);
+            }
+        }
+        
+        async function loadSystemStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                
+                const totalFrames = data.total_frames || 0;
+                const totalSondes = data.total_sondes_received || 0;
+                const activeSondes = data.active_sondes || 0;
+                
+                // Check if we need to load historical data (service just started)
+                // Only load once per browser session using sessionStorage
+                const needsHistoricalData = (totalFrames === 0 && totalSondes === 0 && activeSondes === 0);
+                const hasLoadedThisSession = sessionStorage.getItem('dashboardHistoricalDataLoaded') === 'true';
+                
+                // Always update active sondes (can be 0)
+                document.getElementById('totalSondes').textContent = activeSondes;
+                
+                // Update frames and unique sondes only if API has data OR we haven't loaded historical yet
+                if (totalFrames > 0 || totalSondes > 0 || !hasLoadedThisSession) {
+                    document.getElementById('totalFrames').textContent = totalFrames.toLocaleString();
+                    document.getElementById('uniqueSondes').textContent = totalSondes;
+                }
+                // Otherwise preserve existing displayed values from historical data
+                
+                // Format uptime
+                const uptimeSeconds = data.uptime_seconds || 0;
+                const hours = Math.floor(uptimeSeconds / 3600);
+                const minutes = Math.floor((uptimeSeconds % 3600) / 60);
+                document.getElementById('uptime').textContent = `${hours}h ${minutes}m`;
+                
+                // Load historical data if needed AND not already loaded this session
+                if (needsHistoricalData && !hasLoadedThisSession) {
+                    console.log('[Dashboard] No active data, loading from log files (first time this session)...');
+                    await loadHistoricalDataFromLogs();
+                    // Mark as loaded for this browser session
+                    sessionStorage.setItem('dashboardHistoricalDataLoaded', 'true');
+                } else if (needsHistoricalData && hasLoadedThisSession) {
+                    console.log('[Dashboard] Historical data already loaded this session, preserving displayed values');
+                }
+                
+            } catch (error) {
+                console.error('Error loading system status:', error);
+            }
+        }
+        
+        async function loadReceivers() {
+            try {
+                const response = await fetch('/api/receivers');
+                const receivers = await response.json();
+                
+                const grid = document.getElementById('receiversGrid');
+                
+                if (!receivers || receivers.length === 0) {
+                    grid.innerHTML = '<div class="text-center text-muted py-4">No receivers configured</div>';
+                    return;
+                }
+                
+                grid.innerHTML = receivers.map(rx => {
+                    const state = rx.state || 'IDLE';
+                    const stateLower = state.toLowerCase();
+                    const stateClass = `status-${stateLower}`;
+                    
+                    let freqInfo = 'Idle';
+                    // Use freq_label for scanning (shows range), or format frequency for decoding
+                    if (state === 'SCANNING' && rx.freq_label) {
+                        freqInfo = rx.freq_label;  // Shows "400.4-402.8 MHz" range
+                    } else if (rx.frequency && rx.frequency > 0) {
+                        // Frequency is in Hz, convert to MHz
+                        freqInfo = `${(rx.frequency / 1e6).toFixed(3)} MHz`;
+                    }
+                    
+                    let sondeInfo = '';
+                    if (state === 'DECODING' && rx.sonde_serial) {
+                        sondeInfo = `
+                            <div class="info-row">
+                                <span class="info-label">Sonde:</span>
+                                <span class="info-value">${rx.sonde_serial}</span>
+                            </div>
+                        `;
+                    }
+                    
+                    return `
+                        <div class="receiver-card ${stateLower}">
+                            <div class="receiver-header">
+                                <div class="receiver-name">${rx.device_id || 'Unknown'}</div>
+                                <div class="receiver-status ${stateClass}">${state}</div>
+                            </div>
+                            <div class="receiver-info">
+                                <div class="info-row">
+                                    <span class="info-label">Frequency:</span>
+                                    <span class="info-value">${freqInfo}</span>
+                                </div>
+                                ${sondeInfo}
+                                <div class="info-row">
+                                    <span class="info-label">Type:</span>
+                                    <span class="info-value">${rx.sonde_type || '-'}</span>
+                                </div>
+                                <div class="info-row">
+                                    <span class="info-label">Gain:</span>
+                                    <span class="info-value">${rx.gain !== undefined ? rx.gain + ' dB' : 'Auto'}</span>
+                                </div>
+                                ${rx.decoder_mode === 'channelizer' ? `
+                                <div class="info-row">
+                                    <span class="info-label">Mode:</span>
+                                    <span class="info-value">Channelizer (${Array.isArray(rx.channelizer_active) ? rx.channelizer_active.length : 0}/${rx.channelizer_max || 4} channels)</span>
+                                </div>
+                                ` : ''}
+                            </div>
+                            <div class="mb-2">
+                                <button class="btn btn-sm btn-outline-secondary w-100" onclick="showSpectrumModal('${rx.device_id}')">
+                                    <i class="bi bi-bar-chart-line"></i> Spectrum
+                                </button>
+                            </div>
+                            <div class="manual-controls">
+                                <div class="manual-controls-label">Manual Decode</div>
+                                <div class="manual-form">
+                                    <div class="manual-input-group" style="flex: 2;">
+                                        <label class="manual-input-label">Frequency (MHz)</label>
+                                        <input type="text" 
+                                               class="manual-freq-input" 
+                                               id="freq-${rx.device_id}" 
+                                               placeholder="403.500"
+                                               pattern="[0-9.]+"
+                                               data-preserve="true">
+                                    </div>
+                                    <div class="manual-input-group" style="flex: 1.5;">
+                                        <label class="manual-input-label">Type</label>
+                                        <select class="manual-type-select" id="type-${rx.device_id}">
+                                            <option value="RS41">RS41</option>
+                                            <option value="RS92">RS92</option>
+                                            <option value="DFM">DFM</option>
+                                            <option value="M10">M10</option>
+                                            <option value="M20">M20</option>
+                                            <option value="iMet">iMet</option>
+                                            <option value="LMS6">LMS6</option>
+                                            <option value="MRZ">MRZ</option>
+                                        </select>
+                                    </div>
+                                    ${state === 'DECODING' ? 
+                                        `<button class="manual-start-btn" style="background: #4299e1; border-color: #4299e1;"
+                                                onclick="stopDecoder('${rx.device_id}')"
+                                                title="Stop decoder and resume scanning">
+                                            Scan
+                                        </button>` :
+                                        `<button class="manual-start-btn" 
+                                                onclick="startManualDecode('${rx.device_id}')"
+                                                title="Start manual decoding">
+                                            Start
+                                        </button>`
+                                    }
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+                
+            } catch (error) {
+                console.error('Error loading receivers:', error);
+                document.getElementById('receiversGrid').innerHTML = 
+                    '<div class="text-center text-danger py-4">Error loading receivers</div>';
+            }
+        }
+        
+        async function startManualDecode(deviceId) {
+            const freqInput = document.getElementById(`freq-${deviceId}`);
+            const typeSelect = document.getElementById(`type-${deviceId}`);
+            
+            const frequency = parseFloat(freqInput.value);
+            const sondeType = typeSelect.value;
+            
+            if (!frequency || isNaN(frequency)) {
+                alert('Please enter a valid frequency in MHz (e.g., 403.500)');
+                freqInput.focus();
+                return;
+            }
+            
+            if (frequency < 400 || frequency > 406) {
+                alert('Frequency must be between 400 and 406 MHz');
+                freqInput.focus();
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/start_decoder', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        frequency: frequency,
+                        sonde_type: sondeType,
+                        device_serial: deviceId,
+                        duration_minutes: 0  // Infinite duration
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert(`✓ Decoder started on ${deviceId}\nFrequency: ${frequency} MHz\nType: ${sondeType}`);
+                    // Reload receivers to show updated state
+                    setTimeout(() => loadReceivers(), 500);
+                } else {
+                    alert(`Failed to start decoder: ${result.error || 'Unknown error'}`);
+                }
+            } catch (error) {
+                console.error('Error starting manual decode:', error);
+                alert(`Error: ${error.message}`);
+            }
+        }
+        
+        async function loadConfiguration() {
+            try {
+                const response = await fetch('/api/config');
+                const config = await response.json();
+                
+                console.log('Config loaded:', config);  // Debug log
+                
+                // SDR Type
+                const sdrType = config.sdr?.type || 'Unknown';
+                document.getElementById('configSdrType').textContent = sdrType.toUpperCase();
+                
+                // Gain - handle different SDR types
+                let gainText = 'Auto';
+                if (sdrType === 'rtlsdr') {
+                    const devices = config.sdr?.rtlsdr?.devices || [];
+                    if (devices.length > 0) {
+                        const gain = devices[0].gain;
+                        gainText = (gain === 0 || gain === 'auto') ? 'Auto' : `${gain} dB`;
+                    }
+                } else if (sdrType === 'airspy') {
+                    const gain = config.sdr?.airspy?.gain || 0;
+                    gainText = `Gain: ${gain}`;
+                }
+                document.getElementById('configGain').textContent = gainText;
+                
+                // Detection Threshold
+                const threshold = config.detection?.detection_threshold || 0;
+                document.getElementById('configThreshold').textContent = `${threshold} dB`;
+                console.log('Detection threshold:', threshold);  // Debug log
+                
+                // Scan Interval
+                const scanInterval = config.receivers?.scan_interval || 0;
+                document.getElementById('configScanInterval').textContent = `${scanInterval}s`;
+                console.log('Scan interval:', scanInterval);  // Debug log
+                
+                // Station Callsign
+                const callsign = config.station?.callsign || 'N/A';
+                document.getElementById('configCallsign').textContent = callsign;
+                console.log('Station callsign:', callsign);  // Debug log
+                
+                // Update header station name
+                const stationName = config.station?.name || callsign;
+                document.getElementById('stationName').textContent = stationName;
+                
+                // Frequency Range
+                const freqRanges = config.detection?.freq_ranges || [];
+                let freqRangeText = '400 - 406 MHz';  // Default
+                if (freqRanges.length > 0) {
+                    const firstRange = freqRanges[0];
+                    const startMhz = (firstRange[0] / 1e6).toFixed(0);
+                    const endMhz = (firstRange[1] / 1e6).toFixed(0);
+                    freqRangeText = `${startMhz} - ${endMhz} MHz`;
+                }
+                //document.getElementById('configFreqRange').textContent = freqRangeText;
+                
+                // External URL settings
+                externalUrlProvider = config.external_url_provider || 'openwx';
+                externalUrlCustom = config.external_url_custom || '';
+                console.log('External URL provider:', externalUrlProvider);
+                
+            } catch (error) {
+                console.error('Error loading configuration:', error);
+            }
+        }
+        
+        async function loadActiveSondes() {
+            try {
+                const response = await fetch('/api/sondes');
+                const data = await response.json();
+                
+                const container = document.getElementById('sondesContainer');
+                const sondes = data.sondes || [];  // Extract sondes array from response
+                
+                console.log('Sondes data:', sondes);  // Debug log
+                
+                // If no active sondes but historical data was loaded, preserve the table
+                const hasLoadedThisSession = sessionStorage.getItem('dashboardHistoricalDataLoaded') === 'true';
+                if (!sondes || sondes.length === 0) {
+                    if (!hasLoadedThisSession) {
+                        container.innerHTML = '<div class="text-center text-muted py-4">No active sondes</div>';
+                    }
+                    // Otherwise keep the historical sonde table visible
+                    return;
+                }
+                
+                // Create table
+                let html = `
+                    <table class="sondes-table">
+                        <thead>
+                            <tr>
+                                <th>SondeID</th>
+                                <th>Type</th>
+                                <th>Frequency</th>
+                                <th>Altitude</th>
+                                <th>Position</th>
+                                <th>Frames</th>
+                                <th>Last Update</th>
+                                <th>Advanced</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                `;
+                
+                sondes.forEach(sonde => {
+                    const serial = sonde.serial || sonde.id || 'Unknown';
+                    const type = sonde.type || 'Unknown';
+                    
+                    // Fix frequency - handle both Hz and MHz, check multiple fields
+                    let freq = '-';
+                    const freqValue = sonde.frequency || sonde.freq;
+                    if (freqValue && freqValue > 0) {
+                        // If frequency is > 1000, it's in Hz, convert to MHz
+                        const freqMhz = freqValue > 1000 ? freqValue / 1e6 : freqValue;
+                        freq = `${freqMhz.toFixed(3)} MHz`;
+                    }
+                    
+                    const alt = sonde.alt ? `${Math.round(sonde.alt)} m` : '-';
+                    
+                    let position = '-';
+                    if (sonde.lat && sonde.lon) {
+                        const latDir = sonde.lat >= 0 ? 'N' : 'S';
+                        const lonDir = sonde.lon >= 0 ? 'E' : 'W';
+                        position = `${Math.abs(sonde.lat).toFixed(4)}°${latDir} ${Math.abs(sonde.lon).toFixed(4)}°${lonDir}`;
+                    }
+                    
+                    const frames = sonde.frame || 0;
+                    
+                    // Calculate age - handle both timestamp formats
+                    let age = '-';
+                    const timeValue = sonde.reception_time || sonde.timestamp;
+                    if (timeValue) {
+                        let receptionDate;
+                        // If it's a large number, assume it's in seconds since epoch
+                        if (typeof timeValue === 'number') {
+                            receptionDate = new Date(timeValue * 1000);
+                        } else if (typeof timeValue === 'string') {
+                            receptionDate = new Date(timeValue);
+                        }
+                        
+                        if (receptionDate && !isNaN(receptionDate.getTime())) {
+                            const ageSeconds = Math.floor((Date.now() - receptionDate.getTime()) / 1000);
+                            if (ageSeconds < 60) {
+                                age = `${ageSeconds}s`;
+                            } else if (ageSeconds < 3600) {
+                                age = `${Math.floor(ageSeconds / 60)}m`;
+                            } else {
+                                age = `${Math.floor(ageSeconds / 3600)}h`;
+                            }
+                        }
+                    }
+                    
+                    const typeBadge = type.toLowerCase().startsWith('rs') ? 'badge-rs41' : 
+                                     type.toLowerCase().startsWith('dfm') ? 'badge-dfm' : 
+                                     'badge-m10';
+                    
+                    html += `
+                        <tr>
+                            <td><strong><a href="#" onclick="showSondeOnMap('${serial}'); return false;" style="color: #3f84dd; text-decoration: none;">${serial}</a></strong></td>
+                            <td><span class="badge-sonde-type ${typeBadge}">${type}</span></td>
+                            <td>${freq}</td>
+                            <td>${alt}</td>
+                            <td><small>${position}</small></td>
+                            <td>${frames}</td>
+                            <td>${age}</td>
+                            <td>
+                                <button class="btn btn-sm btn-outline-secondary me-1" onclick="showKindleView('${serial}')" title="Kindle View"><i class="bi bi-display"></i></button>
+                                <button class="btn btn-sm btn-outline-secondary me-1" onclick="showSondeLogfile('${serial}')" title="View Logfile"><i class="bi bi-file-text"></i></button>
+                                <button class="btn btn-sm btn-outline-secondary" onclick="openExternalUrl('${serial}')" title="External Link"><i class="bi bi-box-arrow-up-right"></i></button>
+                            </td>
+                        </tr>
+                    `;
+                });
+                
+                html += '</tbody></table>';
+                container.innerHTML = html;
+                
+            } catch (error) {
+                console.error('Error loading active sondes:', error);
+                document.getElementById('sondesContainer').innerHTML = 
+                    '<div class="text-center text-danger py-4">Error loading sonde data</div>';
+            }
+        }
+        
+        // Store chart instances for RX statistics modal
+        let rxStatisticsCharts = {
+            sondesPerDay: null,
+            framesPerDay: null,
+            sondeTypes: null,
+            frequencies: null,
+            rssiTimeline: null,
+            satsDist: null,
+            altitudeBySonde: null,
+            lastAltitudeBySonde: null
+        };
+        
+        async function showReceiverStatistics() {
+            // Call shared function with dashboard.html-specific options (no loading modal)
+            await showRxStatisticsCommon({
+                currentActivityLogfile: null,  // Auto-select latest
+                rxStatisticsCharts: rxStatisticsCharts
+            });
+        }
+        
+        async function loadHistoricalDataFromLogs() {
+            // Auto-select the latest activity log
+            let currentActivityLogfile = null;
+            
+            try {
+                const logfilesResponse = await fetch('/api/logfiles');
+                const logfilesData = await logfilesResponse.json();
+                
+                const latestActivityLog = logfilesData.files.find(f => f.startsWith('openwxsdr_'));
+                
+                if (!latestActivityLog) {
+                    alert('No activity log files found in data/logs');
+                    return;
+                }
+                
+                currentActivityLogfile = latestActivityLog;
+                console.log('Auto-selected latest activity log:', currentActivityLogfile);
+                
+                // Fetch statistics data
+                console.log('Fetching RX statistics for', currentActivityLogfile);
+                const response = await fetch(`/api/logfile/${currentActivityLogfile}/rx_statistics`);
+                const data = await response.json();
+                
+                if (!data.success) {
+                    throw new Error(data.error || 'Failed to load statistics');
+                }
+                
+                console.log('RX Statistics data:', data);
+                
+                // Destroy existing charts
+                Object.values(rxStatisticsCharts).forEach(chart => {
+                    if (chart) chart.destroy();
+                });
+                
+                // Update summary statistics
+                document.getElementById('rxStatsTotalSondes').textContent = data.statistics.total_sondes;
+                document.getElementById('rxStatsTotalFrames').textContent = data.statistics.total_frames;
+                document.getElementById('rxStatsRecordedDays').textContent = data.statistics.recorded_days || '0';
+                document.getElementById('rxStatsTotalFramesStopped').textContent = (data.statistics.total_frames_from_stopped || 0).toLocaleString();
+                
+                const maxSondesEl = document.getElementById('rxStatsMaxSondes');
+                const maxSondesDateEl = document.getElementById('rxStatsMaxSondesDate');
+                maxSondesEl.textContent = data.statistics.max_sondes_per_day || '0';
+                if (data.statistics.max_sondes_date) {
+                    maxSondesDateEl.textContent = data.statistics.max_sondes_date;
+                    maxSondesDateEl.style.display = 'block';
+                } else {
+                    maxSondesDateEl.style.display = 'none';
+                }
+                
+                // Create charts (simplified versions for dashboard)
+                const sondePerDayLabels = Object.keys(data.sonde_timeline).sort();
+                const sondePerDayCounts = sondePerDayLabels.map(k => data.sonde_timeline[k]);
+                
+                rxStatisticsCharts.sondesPerDay = new Chart(document.getElementById('sondesPerDayChart'), {
+                    type: 'bar',
+                    data: {
+                        labels: sondePerDayLabels,
+                        datasets: [{
+                            label: 'Unique Sondes',
+                            data: sondePerDayCounts,
+                            backgroundColor: '#667eea',
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: { beginAtZero: true, ticks: { stepSize: 1 } }
+                        }
+                    }
+                });
+                
+                const framesPerDayLabels = Object.keys(data.frames_timeline).sort();
+                const framesPerDayCounts = framesPerDayLabels.map(k => data.frames_timeline[k]);
+                
+                rxStatisticsCharts.framesPerDay = new Chart(document.getElementById('framesPerDayChart'), {
+                    type: 'bar',
+                    data: {
+                        labels: framesPerDayLabels,
+                        datasets: [{
+                            label: 'Total Frames',
+                            data: framesPerDayCounts,
+                            backgroundColor: '#764ba2',
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: { beginAtZero: true }
+                        }
+                    }
+                });
+                
+                const sondeTypeLabels = Object.keys(data.sonde_types).sort();
+                const sondeTypeCounts = sondeTypeLabels.map(k => data.sonde_types[k]);
+                
+                rxStatisticsCharts.sondeTypes = new Chart(document.getElementById('sondeTypesChart'), {
+                    type: 'bar',
+                    data: {
+                        labels: sondeTypeLabels,
+                        datasets: [{
+                            label: 'Sondes/Type',
+                            data: sondeTypeCounts,
+                            backgroundColor: '#48bb78',
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: { beginAtZero: true, ticks: { stepSize: 1 } }
+                        }
+                    }
+                });
+                
+                // Frequencies chart with TODAY marked (stacked bar)
+                const freqLabels = Object.keys(data.frequencies).sort((a, b) => parseFloat(a) - parseFloat(b));
+                const freqCountsToday = freqLabels.map(k => data.frequencies[k].today);
+                const freqCountsOther = freqLabels.map(k => data.frequencies[k].total - data.frequencies[k].today);
+                
+                rxStatisticsCharts.frequencies = new Chart(document.getElementById('frequenciesChart'), {
+                    type: 'bar',
+                    data: {
+                        labels: freqLabels,
+                        datasets: [
+                            {
+                                label: 'Other days',
+                                data: freqCountsOther,
+                                backgroundColor: '#ffc107',
+                            },
+                            {
+                                label: 'Today',
+                                data: freqCountsToday,
+                                backgroundColor: '#cc8800',  // Darker orange
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            x: {
+                                stacked: true
+                            },
+                            y: {
+                                beginAtZero: true,
+                                ticks: { stepSize: 1 },
+                                stacked: true
+                            }
+                        },
+                        plugins: {
+                            legend: {
+                                display: true,
+                                position: 'top'
+                            }
+                        }
+                    }
+                });
+                
+                // RSSI timeline chart (line chart)
+                if (data.rssi_timeline && data.rssi_timeline.length > 0) {
+                    const rssiTimelineData = data.rssi_timeline.sort((a, b) => 
+                        new Date(a.timestamp) - new Date(b.timestamp)
+                    );
+                    const rssiLabels = rssiTimelineData.map(d => d.timestamp);
+                    const rssiValues = rssiTimelineData.map(d => d.rssi);
+                    
+                    rxStatisticsCharts.rssiTimeline = new Chart(document.getElementById('rssiTimelineChart'), {
+                        type: 'line',
+                        data: {
+                            labels: rssiLabels,
+                            datasets: [{
+                                label: 'RSSI (dBm)',
+                                data: rssiValues,
+                                borderColor: '#dc3545',
+                                backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                                fill: false,
+                                tension: 0.1,
+                                pointRadius: 2
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            scales: {
+                                x: {
+                                    display: true,
+                                    title: { display: true, text: 'Time' }
+                                },
+                                y: {
+                                    display: true,
+                                    title: { display: true, text: 'RSSI (dBm)' }
+                                }
+                            }
+                        }
+                    });
+                }
+                
+                // Satellites distribution histogram
+                if (data.sats_values && data.sats_values.length > 0) {
+                    const satsHistogram = createIntegerHistogram(data.sats_values);
+                    rxStatisticsCharts.satsDist = new Chart(document.getElementById('satsDistChart'), {
+                        type: 'bar',
+                        data: {
+                            labels: satsHistogram.labels,
+                            datasets: [{
+                                label: 'Frequency',
+                                data: satsHistogram.counts,
+                                backgroundColor: '#6c757d',
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            scales: {
+                                x: {
+                                    display: true,
+                                    title: { display: true, text: 'Satellite Count' }
+                                },
+                                y: {
+                                    display: true,
+                                    title: { display: true, text: 'Count' },
+                                    beginAtZero: true,
+                                    ticks: { stepSize: 1 }
+                                }
+                            }
+                        }
+                    });
+                }
+                
+                // First altitude by sonde chart
+                if (data.sonde_altitudes && data.sonde_altitudes.length > 0) {
+                    const altLabels = data.sonde_altitudes.map(s => s.serial);
+                    const altValues = data.sonde_altitudes.map(s => s.altitude);
+                    const altColors = data.sonde_altitudes.map(s => {
+                        const colors = {
+                            'RS41': '#007bff',
+                            'RS92': '#0056b3',
+                            'DFM': '#28a745',
+                            'DFM-09': '#1e7e34',
+                            'DFM-17': '#155724',
+                            'M10': '#ffc107',
+                            'M20': '#ff9800',
+                            'iMet': '#6c757d'
+                        };
+                        return colors[s.sonde_type] || '#6c757d';
+                    });
+                    
+                    rxStatisticsCharts.altitudeBySonde = new Chart(document.getElementById('altitudeBySondeChart'), {
+                        type: 'line',
+                        data: {
+                            labels: altLabels,
+                            datasets: [{
+                                label: 'First Frame Altitude (m)',
+                                data: altValues,
+                                borderColor: '#007bff',
+                                backgroundColor: 'rgba(0, 123, 255, 0.1)',
+                                fill: false,
+                                tension: 0.1,
+                                pointRadius: 4,
+                                pointBackgroundColor: altColors
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            scales: {
+                                x: {
+                                    display: true,
+                                    title: { display: true, text: 'Sonde Serial' }
+                                },
+                                y: {
+                                    display: true,
+                                    title: { display: true, text: 'Altitude (m)' },
+                                    beginAtZero: true
+                                }
+                            }
+                        }
+                    });
+                }
+                
+                // Last altitude by sonde chart
+                if (data.last_sonde_altitudes && data.last_sonde_altitudes.length > 0) {
+                    const lastAltLabels = data.last_sonde_altitudes.map(s => s.serial);
+                    const lastAltValues = data.last_sonde_altitudes.map(s => s.altitude);
+                    const lastAltColors = data.last_sonde_altitudes.map(s => {
+                        const colors = {
+                            'RS41': '#007bff',
+                            'RS92': '#0056b3',
+                            'DFM': '#28a745',
+                            'DFM-09': '#1e7e34',
+                            'DFM-17': '#155724',
+                            'M10': '#ffc107',
+                            'M20': '#ff9800',
+                            'iMet': '#6c757d'
+                        };
+                        return colors[s.sonde_type] || '#6c757d';
+                    });
+                    
+                    rxStatisticsCharts.lastAltitudeBySonde = new Chart(document.getElementById('lastAltitudeBySondeChart'), {
+                        type: 'line',
+                        data: {
+                            labels: lastAltLabels,
+                            datasets: [{
+                                label: 'Last Frame Altitude (m)',
+                                data: lastAltValues,
+                                borderColor: '#dc3545',
+                                backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                                fill: false,
+                                tension: 0.1,
+                                pointRadius: 4,
+                                pointBackgroundColor: lastAltColors
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            scales: {
+                                x: {
+                                    display: true,
+                                    title: { display: true, text: 'Sonde Serial' }
+                                },
+                                y: {
+                                    display: true,
+                                    title: { display: true, text: 'Altitude (m)' },
+                                    beginAtZero: true
+                                }
+                            }
+                        }
+                    });
+                }
+                
+                // Show the RX statistics modal
+                const rxStatsModal = new bootstrap.Modal(document.getElementById('rxStatisticsModal'));
+                rxStatsModal.show();
+                
+            } catch (error) {
+                console.error('Error loading RX statistics:', error);
+                alert('Error loading RX statistics: ' + error.message);
+            }
+        }
+        
+        async function loadHistoricalDataFromLogs() {
+            // Show loading modal
+            const loadingModal = new bootstrap.Modal(document.getElementById('loadingDataModal'));
+            const modalEl = document.getElementById('loadingDataModal');
+            
+            loadingModal.show();
+            document.getElementById('loadingDataMessage').textContent = 'Loading historical data from log files...';
+            
+            try {
+                // Get list of log files
+                const logfilesResp = await fetch('/api/logfiles');
+                const logfilesData = await logfilesResp.json();
+                
+                if (!logfilesData.files || logfilesData.files.length === 0) {
+                    console.log('[Dashboard] No log files found');
+                    loadingModal.hide();
+                    return;
+                }
+                
+                // Filter for today's sonde logs (format: SERIAL-YYYYMMDD-HHMMSS.log)
+                const today = new Date().toISOString().split('T')[0].replace(/-/g, '');
+                const sondeLogs = logfilesData.files.filter(f => {
+                    const match = f.match(/^(.+?)-(\d{8})-(\d{6})\.log$/);
+                    return match && match[2] === today;
+                });
+                
+                console.log(`[Dashboard] Found ${sondeLogs.length} sonde logs for today (${today})`);
+                
+                if (sondeLogs.length === 0) {
+                    console.log('[Dashboard] No sonde logs found for today');
+                    loadingModal.hide();
+                    return;
+                }
+                
+                const sondeData = [];
+                let totalFrames = 0;
+                
+                // Process each sonde log file
+                for (let i = 0; i < sondeLogs.length; i++) {
+                    const logFile = sondeLogs[i];
+                    document.getElementById('loadingDataMessage').textContent = 
+                        `Reading sonde logs (${i + 1}/${sondeLogs.length}): ${logFile}`;
+                    
+                    try {
+                        // Parse filename to get serial and timestamp
+                        const match = logFile.match(/^(.+?)-(\d{8})-(\d{6})\.log$/);
+                        if (!match) continue;
+                        
+                        const serial = match[1];
+                        
+                        // Fetch log file content
+                        const logResp = await fetch(`/api/logfile/${encodeURIComponent(logFile)}`);
+                        const logContent = await logResp.text();
+                        const lines = logContent.split('\n');
+                        
+                        // Parse sonde log to extract telemetry
+                        let sondeType = 'Unknown';
+                        let frameCount = 0;
+                        let lastPosition = null;
+                        let lastAltitude = null;
+                        let lastFrequency = null;
+                        let lastTimestamp = null;
+                        let lastRSSI = null;
+                        
+                        for (let j = 0; j < lines.length; j++) {
+                            const line = lines[j];
+                            
+                            // Extract sonde type from header
+                            const typeMatch = line.match(/^Sonde: .+? \((\w+)\)/);
+                            if (typeMatch) {
+                                sondeType = typeMatch[1];
+                            }
+                            
+                            // Count frames
+                            const frameMatch = line.match(/^Frame (\d+) - (.+)/);
+                            if (frameMatch) {
+                                frameCount++;
+                                lastTimestamp = frameMatch[2];
+                            }
+                            
+                            // Extract position (next line after Frame)
+                            const posMatch = line.match(/^\s+Position: ([\d.-]+), ([\d.-]+)/);
+                            if (posMatch) {
+                                lastPosition = { lat: parseFloat(posMatch[1]), lon: parseFloat(posMatch[2]) };
+                            }
+                            
+                            // Extract altitude
+                            const altMatch = line.match(/^\s+Altitude: ([\d.-]+) m/);
+                            if (altMatch) {
+                                lastAltitude = parseFloat(altMatch[1]);
+                            }
+                            
+                            // Extract frequency
+                            const freqMatch = line.match(/^\s+Frequency: ([\d.-]+) MHz/);
+                            if (freqMatch) {
+                                lastFrequency = parseFloat(freqMatch[1]);
+                            }
+                            
+                            // Extract RSSI
+                            const rssiMatch = line.match(/^\s+RSSI: ([\d.-]+) dB/);
+                            if (rssiMatch) {
+                                lastRSSI = parseFloat(rssiMatch[1]);
+                            }
+                        }
+                        
+                        // Add to sonde data array
+                        if (frameCount > 0) {
+                            sondeData.push({
+                                serial: serial,
+                                type: sondeType,
+                                frequency: lastFrequency,
+                                position: lastPosition,
+                                altitude: lastAltitude,
+                                frames: frameCount,
+                                lastUpdate: lastTimestamp,
+                                rssi: lastRSSI
+                            });
+                            totalFrames += frameCount;
+                        }
+                        
+                    } catch (error) {
+                        console.error(`[Dashboard] Error parsing log ${logFile}:`, error);
+                    }
+                }
+                
+                console.log(`[Dashboard] Processed ${sondeData.length} sondes with ${totalFrames} total frames`);
+                
+                // Update stats display
+                document.getElementById('totalSondes').textContent = sondeData.length;
+                document.getElementById('totalFrames').textContent = totalFrames.toLocaleString();
+                document.getElementById('uniqueSondes').textContent = sondeData.length;
+                
+                // Populate sondes table
+                if (sondeData.length > 0) {
+                    document.getElementById('loadingDataMessage').textContent = 'Populating sonde table...';
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    
+                    const container = document.getElementById('sondesContainer');
+                    let html = `
+                        <table class="sondes-table">
+                            <thead>
+                                <tr>
+                                    <th>Serial</th>
+                                    <th>Type</th>
+                                    <th>Frequency</th>
+                                    <th>Altitude</th>
+                                    <th>Position</th>
+                                    <th>Frames</th>
+                                    <th>Last Update</th>
+                                    <th>Advanced</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                    `;
+                    
+                    sondeData.forEach(sonde => {
+                        const freq = sonde.frequency ? `${sonde.frequency.toFixed(3)} MHz` : '-';
+                        const alt = sonde.altitude !== null ? `${Math.round(sonde.altitude)} m` : '-';
+                        const type = sonde.type || 'Unknown';
+                        
+                        // Type badge styling
+                        let typeBadge = 'badge-m10';
+                        if (type.toLowerCase().startsWith('rs41')) typeBadge = 'badge-rs41';
+                        else if (type.toLowerCase().startsWith('rs92')) typeBadge = 'badge-rs41';
+                        else if (type.toLowerCase().startsWith('dfm')) typeBadge = 'badge-dfm';
+                        else if (type.toLowerCase().startsWith('m10')) typeBadge = 'badge-m10';
+                        else if (type.toLowerCase().startsWith('m20')) typeBadge = 'badge-m10';
+                        
+                        // Format position
+                        let positionStr = '-';
+                        if (sonde.position) {
+                            positionStr = `${sonde.position.lat.toFixed(4)}, ${sonde.position.lon.toFixed(4)}`;
+                        }
+                        
+                        // Format last update
+                        let lastUpdateStr = '-';
+                        if (sonde.lastUpdate) {
+                            // Try to parse timestamp
+                            try {
+                                const date = new Date(sonde.lastUpdate);
+                                if (!isNaN(date.getTime())) {
+                                    lastUpdateStr = date.toLocaleTimeString();
+                                } else {
+                                    lastUpdateStr = sonde.lastUpdate.substring(0, 19);
+                                }
+                            } catch (e) {
+                                lastUpdateStr = sonde.lastUpdate.substring(0, 19);
+                            }
+                        }
+                        
+                        html += `
+                            <tr>
+                                <td><strong><a href="#" onclick="showSondeOnMap('${sonde.serial}'); return false;" style="color: #3f84dd; text-decoration: none;">${sonde.serial}</a></strong></td>
+                                <td><span class="badge-sonde-type ${typeBadge}">${type}</span></td>
+                                <td>${freq}</td>
+                                <td>${alt}</td>
+                                <td><small>${positionStr}</small></td>
+                                <td>${sonde.frames}</td>
+                                <td><small>${lastUpdateStr}</small></td>
+                                <td>
+                                    <button class="btn btn-sm btn-outline-secondary me-1" onclick="showKindleView('${sonde.serial}')" title="Kindle View"><i class="bi bi-display"></i></button>
+                                    <button class="btn btn-sm btn-outline-secondary me-1" onclick="showSondeLogfile('${sonde.serial}')" title="View Logfile"><i class="bi bi-file-text"></i></button>
+                                    <button class="btn btn-sm btn-outline-secondary" onclick="openExternalUrl('${sonde.serial}')" title="External Link"><i class="bi bi-box-arrow-up-right"></i></button>
+                                </td>
+                            </tr>
+                        `;
+                    });
+                    
+                    html += '</tbody></table>';
+                    container.innerHTML = html;
+                }
+                
+            } catch (error) {
+                console.error('[Dashboard] Error loading historical data:', error);
+            } finally {
+                // Hide loading modal
+                setTimeout(() => {
+                    loadingModal.hide();
+                }, 500);
+            }
+        }
+        
+        // Logfile management variables
+        let logfilesData = [];
+        let logfilesSortColumn = 'date';
+        let logfilesSortDirection = -1;
+        let activeSondeSerials = [];
+        
+        function parseLogfileName(filename) {
+            if (filename.startsWith('openwxsdr_')) {
+                return { filename, type: 'Activity', date: '', timestamp: 0 };
+            }
+            
+            const match = filename.match(/^(.+?)-(\d{8})-(\d{6})\.log$/);
+            if (match) {
+                const serial = match[1];
+                const dateStr = match[2];
+                const timeStr = match[3];
+                
+                const year = dateStr.substr(0, 4);
+                const month = dateStr.substr(4, 2);
+                const day = dateStr.substr(6, 2);
+                const hour = timeStr.substr(0, 2);
+                const min = timeStr.substr(2, 2);
+                const sec = timeStr.substr(4, 2);
+                const formattedDate = `${year}-${month}-${day} ${hour}:${min}:${sec}`;
+                const timestamp = new Date(formattedDate).getTime();
+                
+                let type = 'Sonde';
+                if (serial.match(/^[A-Z]\d{7}/)) type = 'RS41';
+                else if (serial.match(/^[A-Z]\d{6}/)) type = 'RS92';
+                else if (serial.match(/^DFM/i)) type = 'DFM';
+                else if (serial.match(/^\d{8}/)) type = 'DFM';
+                else if (serial.match(/^M10/i)) type = 'M10';
+                else if (serial.match(/^M20/i)) type = 'M20';
+                else if (serial.match(/^M\d+/)) type = 'M10';
+                else if (serial.match(/^W\d+/)) type = 'iMet';
+                else if (serial.match(/^L\d+/)) type = 'LMS6';
+                else if (serial.match(/^ME\d+/)) type = 'MRZ';
+                
+                return { filename, type, date: formattedDate, timestamp };
+            }
+            
+            return { filename, type: 'Unknown', date: '', timestamp: 0 };
+        }
+        
+        function sortLogfiles(column) {
+            if (logfilesSortColumn === column) {
+                logfilesSortDirection *= -1;
+            } else {
+                logfilesSortColumn = column;
+                logfilesSortDirection = column === 'date' ? -1 : 1;
+            }
+            
+            document.getElementById('sortIconName').className = 'bi bi-arrow-down-up';
+            document.getElementById('sortIconType').className = 'bi bi-arrow-down-up';
+            document.getElementById('sortIconDate').className = 'bi bi-arrow-down-up';
+            
+            const iconId = 'sortIcon' + column.charAt(0).toUpperCase() + column.slice(1);
+            const iconClass = logfilesSortDirection === 1 ? 'bi-sort-alpha-down' : 'bi-sort-alpha-up';
+            document.getElementById(iconId).className = 'bi ' + iconClass;
+            
+            logfilesData.sort((a, b) => {
+                let valA, valB;
+                if (column === 'name') {
+                    valA = a.filename;
+                    valB = b.filename;
+                } else if (column === 'type') {
+                    valA = a.type;
+                    valB = b.type;
+                } else {
+                    valA = a.timestamp;
+                    valB = b.timestamp;
+                }
+                
+                if (valA < valB) return -logfilesSortDirection;
+                if (valA > valB) return logfilesSortDirection;
+                return 0;
+            });
+            
+            renderLogfileTable();
+        }
+        
+        function renderLogfileTable() {
+            const logList = document.getElementById('logfileList');
+            if (logfilesData.length === 0) {
+                logList.innerHTML = '<tr><td colspan="3" class="text-center text-muted">No log files found</td></tr>';
+                return;
+            }
+            
+            logList.innerHTML = logfilesData.map(item => {
+                const isActiveSonde = activeSondeSerials.some(serial => item.filename.startsWith(serial + '-'));
+                const rowClass = isActiveSonde ? 'table-success' : '';
+                return `<tr class="${rowClass}" style="cursor: pointer;" onclick="loadLogfile('${item.filename}')">
+                    <td>${item.filename}</td>
+                    <td><span class="badge bg-secondary">${item.type}</span></td>
+                    <td>${item.date || '-'}</td>
+                </tr>`;
+            }).join('');
+        }
+        
+        function showLogfilesModal() {
+            fetch('/api/status')
+                .then(response => response.json())
+                .then(statusData => {
+                    activeSondeSerials = (statusData.sondes || []).map(s => s.serial);
+                    return fetch('/api/logfiles');
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.files && data.files.length > 0) {
+                        logfilesData = data.files.map(parseLogfileName);
+                        sortLogfiles('date');
+                    } else {
+                        logfilesData = [];
+                        renderLogfileTable();
+                    }
+                    const modal = new bootstrap.Modal(document.getElementById('logfilesModal'));
+                    modal.show();
+                })
+                .catch(error => {
+                    console.error('Error loading logfiles:', error);
+                    alert('Failed to load log files');
+                });
+        }
+        
+        function loadLogfile(filename) {
+            fetch(`/api/logfile/${encodeURIComponent(filename)}`)
+                .then(response => response.text())
+                .then(data => {
+                    document.getElementById('logfileContent').textContent = data;
+                    document.getElementById('logfileTitle').textContent = filename;
+                    
+                    const downloadBtn = document.getElementById('downloadLogBtn');
+                    downloadBtn.onclick = () => {
+                        window.location.href = `/api/logfile/${encodeURIComponent(filename)}`;
+                    };
+                })
+                .catch(error => {
+                    console.error('Error loading logfile:', error);
+                    document.getElementById('logfileContent').textContent = 'Error loading file: ' + error;
+                });
+        }
+        
+        function showAboutModal() {
+            const modal = new bootstrap.Modal(document.getElementById('aboutModal'));
+            const currentLang = localStorage.getItem('aboutLanguage') || 'en';
+            setAboutLanguage(currentLang);
+            modal.show();
+        }
+
+        function setAboutLanguage(lang) {
+            localStorage.setItem('aboutLanguage', lang);
+            
+            const enContent = document.getElementById('aboutContentEN');
+            const deContent = document.getElementById('aboutContentDE');
+            const enBtn = document.getElementById('langEN');
+            const deBtn = document.getElementById('langDE');
+            const titleEl = document.getElementById('aboutModalTitle');
+            const closeBtn = document.getElementById('aboutCloseBtn');
+            
+            if (lang === 'en') {
+                enContent.style.display = 'block';
+                deContent.style.display = 'none';
+                enBtn.classList.add('active');
+                deBtn.classList.remove('active');
+                titleEl.textContent = 'About OpenWXSDR';
+                closeBtn.textContent = 'Close';
+            } else {
+                enContent.style.display = 'none';
+                deContent.style.display = 'block';
+                enBtn.classList.remove('active');
+                deBtn.classList.add('active');
+                titleEl.textContent = 'Über OpenWXSDR';
+                closeBtn.textContent = 'Schließen';
+            }
+        }
+
+        function showSondeOnMap(sondeSerial) {
+            // Navigate directly to map with sonde parameter
+            // Loading modal will be shown by index.html
+            window.location.href = `/?sonde=${encodeURIComponent(sondeSerial)}`;
+        }
+
+        function openExternalUrl(sondeId) {
+            let url = '';
+            if (externalUrlProvider === 'openwx') {
+                url = `https://map.openwx.de/index.html?sondeid=${sondeId}`;
+            } else if (externalUrlProvider === 'sondehub') {
+                url = `https://sondehub.org/#!mt=Mapnik&mz=10&qm=3h&f=${sondeId}&q=${sondeId}`;
+            } else if (externalUrlProvider === 'custom' && externalUrlCustom) {
+                url = externalUrlCustom.replace(/<sondeid>/g, sondeId);
+            } else {
+                alert('External URL not configured');
+                return;
+            }
+            window.open(url, '_blank');
+        }
+
+        async function showSondeLogfile(sondeSerial) {
+            try {
+                // Show modal
+                const modal = new bootstrap.Modal(document.getElementById('sondeLogfileModal'));
+                const loadingDiv = document.getElementById('sondeLogfileLoading');
+                const contentPre = document.getElementById('sondeLogfileContent');
+                const serialSpan = document.getElementById('sondeLogfileSerial');
+                const downloadBtn = document.getElementById('downloadSondeLogBtn');
+                
+                serialSpan.textContent = sondeSerial;
+                loadingDiv.style.display = 'block';
+                contentPre.style.display = 'none';
+                modal.show();
+                
+                // Fetch list of logfiles for this sonde
+                const response = await fetch('/api/logfiles');
+                const data = await response.json();
+                const logfiles = data.files || [];
+                
+                // Find the latest logfile for this sonde
+                const sondeLogfiles = logfiles.filter(f => 
+                    f.startsWith(sondeSerial + '-') && f.endsWith('.log')
+                ).sort().reverse();
+                
+                if (sondeLogfiles.length === 0) {
+                    contentPre.textContent = `No logfile found for sonde ${sondeSerial}`;
+                    loadingDiv.style.display = 'none';
+                    contentPre.style.display = 'block';
+                    downloadBtn.disabled = true;
+                    return;
+                }
+                
+                const latestLogfile = sondeLogfiles[0];
+                
+                // Fetch logfile content
+                const logResponse = await fetch(`/api/logfile/${latestLogfile}`);
+                const logContent = await logResponse.text();
+                
+                // Display content
+                contentPre.textContent = logContent;
+                loadingDiv.style.display = 'none';
+                contentPre.style.display = 'block';
+                
+                // Setup download button
+                downloadBtn.disabled = false;
+                downloadBtn.onclick = () => {
+                    const blob = new Blob([logContent], { type: 'text/plain' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = latestLogfile;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                };
+                
+            } catch (error) {
+                console.error('Error loading logfile:', error);
+                alert(`Error loading logfile: ${error.message}`);
+            }
+        }
+
+        async function showKindleView(sondeSerial) {
+            try {
+                // Show loading modal
+                const modal = new bootstrap.Modal(document.getElementById('kindleViewModal'));
+                const imageContainer = document.getElementById('kindleImageContainer');
+                const loadingSpinner = document.getElementById('kindleLoadingSpinner');
+                
+                imageContainer.style.display = 'none';
+                loadingSpinner.style.display = 'block';
+                modal.show();
+                
+                // Generate Kindle view (Paperwhite version)
+                const url = `/api/kindle/sonde/${sondeSerial}/pw.png`;
+                const response = await fetch(url);
+                
+                if (!response.ok) {
+                    throw new Error(`Failed to generate Kindle view: ${response.statusText}`);
+                }
+                
+                // Create image element
+                const blob = await response.blob();
+                const imageUrl = URL.createObjectURL(blob);
+                
+                const img = document.createElement('img');
+                img.src = imageUrl;
+                img.alt = `Kindle view for ${sondeSerial}`;
+                img.style.maxWidth = '100%';
+                img.style.height = 'auto';
+                img.style.border = '1px solid #ddd';
+                
+                // Show image
+                imageContainer.innerHTML = '';
+                imageContainer.appendChild(img);
+                imageContainer.style.display = 'block';
+                loadingSpinner.style.display = 'none';
+                
+            } catch (error) {
+                console.error('Error loading Kindle view:', error);
+                document.getElementById('kindleLoadingSpinner').innerHTML = 
+                    '<div class="alert alert-danger">Error loading Kindle view: ' + error.message + '</div>';
+            }
+        }
+        
+        // Spectrum Modal Functions
+        let _spectrumChart = null;
+        let _selectedSpectrumReceiver = '';
+        let _waterfallHistory = [];  // Array of {freqs, powers, timestamp}
+        let _waterfallMaxLines = 200;  // Maximum history lines
+        let _waterfallTimer = null;
+        let _scanInterval = 15;  // Default scan interval
+        let _waterfallEnabled = true;  // Waterfall toggle state
+        let _waterfallStartTime = null;  // Track when waterfall started for time scale
+
+        const peakLabelPlugin = {
+            id: 'peakLabelPlugin',
+            afterDatasetsDraw(chart) {
+                const dsIndex = chart.data.datasets.findIndex(d => d.id === 'peaks');
+                if (dsIndex < 0) return;
+                const meta = chart.getDatasetMeta(dsIndex);
+                const dataset = chart.data.datasets[dsIndex];
+                if (!meta || !dataset || !dataset.data) return;
+
+                const ctx = chart.ctx;
+                ctx.save();
+                ctx.fillStyle = '#87d37c';
+                ctx.font = '11px sans-serif';
+
+                meta.data.forEach((pt, i) => {
+                    const item = dataset.data[i] || {};
+                    const label = item.label;
+                    if (!label) return;
+                    ctx.fillText(label, pt.x + 6, pt.y - 8);
+                });
+                ctx.restore();
+            }
+        };
+        
+        async function showSpectrumModal(deviceId) {
+            _selectedSpectrumReceiver = `rtlsdr:${deviceId}`;
+            
+            // Fetch scan interval from config
+            try {
+                const res = await fetch('/api/runtime_settings');
+                const settings = await res.json();
+                _scanInterval = settings.scan_interval || 15;
+            } catch(e) {
+                console.warn('Failed to fetch scan_interval, using default 15s', e);
+            }
+            
+            new bootstrap.Modal(document.getElementById('spectrumModal')).show();
+            
+            // Clear old waterfall data
+            _waterfallHistory = [];
+            _waterfallStartTime = Date.now();
+            
+            // Defer draw until canvas is visible
+            setTimeout(() => refreshSpectrum(), 150);
+            
+            // Start auto-refresh timer (1 second refresh)
+            if (_waterfallTimer) clearInterval(_waterfallTimer);
+            _waterfallTimer = setInterval(() => refreshSpectrum(), 1000);
+        }
+        
+        function toggleWaterfall() {
+            _waterfallEnabled = document.getElementById('waterfallToggle').checked;
+            const container = document.getElementById('waterfallContainer');
+            const chartContainer = document.getElementById('spectrumChartContainer');
+            if (_waterfallEnabled) {
+                container.style.display = 'flex';
+                chartContainer.style.flex = '0 0 40%';
+            } else {
+                container.style.display = 'none';
+                chartContainer.style.flex = '1';
+            }
+            if (_spectrumChart) _spectrumChart.resize();
+        }
+
+        async function refreshSpectrum() {
+            try {
+                const params = new URLSearchParams();
+                if (_selectedSpectrumReceiver) {
+                    params.set('receiver', _selectedSpectrumReceiver);
+                }
+                // Cache buster to ensure manual refresh always requests fresh data.
+                params.set('_ts', Date.now().toString());
+                const r = await fetch('/api/spectrum?' + params.toString(), { cache: 'no-store' });
+                const spec = await r.json();
+
+                const modalTitle = document.getElementById('spectrumModalTitle');
+                if (modalTitle) {
+                    const rxName = (spec && spec.receiver_name) ? spec.receiver_name : '';
+                    modalTitle.innerHTML = `<i class="bi bi-bar-chart-line"></i> Spectrum scan${rxName ? ' - ' + rxName : ''}`;
+                }
+
+                if (!spec || !spec.freqs_mhz || spec.freqs_mhz.length === 0) {
+                    const ts = document.getElementById('spectrumTimestamp');
+                    ts.textContent = 'No spectrum data yet - wait for next scan cycle.';
+                    ts.style.color = '#ff6b6b';
+                    
+                    // Clear existing spectrum chart
+                    if (_spectrumChart) {
+                        _spectrumChart.destroy();
+                        _spectrumChart = null;
+                    }
+                    
+                    // Clear waterfall history
+                    _waterfallHistory = [];
+                    
+                    // Clear waterfall canvas
+                    const waterfallCanvas = document.getElementById('waterfallCanvas');
+                    if (waterfallCanvas) {
+                        const ctx = waterfallCanvas.getContext('2d');
+                        ctx.clearRect(0, 0, waterfallCanvas.width, waterfallCanvas.height);
+                    }
+                    
+                    return;
+                }
+
+                // Restore normal info color when data is available.
+                const ts = document.getElementById('spectrumTimestamp');
+                ts.style.color = '#8ecbff';
+                drawSpectrum(spec);
+                
+                // Add to waterfall history if enabled
+                if (_waterfallEnabled && spec.freqs_mhz && spec.power_db) {
+                    _waterfallHistory.push({
+                        freqs: spec.freqs_mhz,
+                        powers: spec.power_db,
+                        timestamp: Date.now(),
+                        noiseFloor: spec.noise_floor || -100
+                    });
+                    
+                    // Keep only last N lines
+                    if (_waterfallHistory.length > _waterfallMaxLines) {
+                        _waterfallHistory.shift();
+                    }
+                    
+                    drawWaterfall();
+                }
+            } catch(e) {
+                console.error('Spectrum fetch error', e);
+                const ts = document.getElementById('spectrumTimestamp');
+                ts.textContent = 'Spectrum refresh failed - check server/API connectivity.';
+                ts.style.color = '#ff6b6b';
+            }
+        }
+
+        function drawSpectrum(spec) {
+            const freqs  = spec.freqs_mhz;
+            const powers = spec.power_db;
+            const floor  = spec.noise_floor;
+            const thr    = spec.threshold_db;
+            const signals = spec.signals || [];
+
+            document.getElementById('spectrumTimestamp').textContent = 'Latest scan: ' + (spec.timestamp || '-');
+            document.getElementById('spectrumNoiseFloor').textContent = floor != null ? floor.toFixed(1) + ' dB' : '-';
+            document.getElementById('spectrumThreshold').textContent = thr != null ? ('+' + thr.toFixed(1) + ' dB SNR') : '-';
+
+            const ctx = document.getElementById('spectrumChart').getContext('2d');
+
+            if (_spectrumChart) {
+                _spectrumChart.destroy();
+                _spectrumChart = null;
+            }
+
+            // Noise floor and threshold lines
+            const floorLine  = freqs.map(() => floor);
+            const thrLine    = freqs.map(() => floor + thr);
+
+            // Peak markers: green dot + frequency label
+            const peakPoints = signals.map(s => {
+                const x = s.freq_mhz;
+                const snr = s.snr_db != null ? s.snr_db : 0;
+                const y = floor + snr;
+                return {
+                    x,
+                    y,
+                    label: `${x.toFixed(3)} MHz`,
+                };
+            });
+
+            _spectrumChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: freqs,
+                    datasets: [
+                        {
+                            label: 'Power (dB)',
+                            data: powers,
+                            borderColor: '#4DA6FF',
+                            backgroundColor: 'rgba(77,166,255,0.08)',
+                            borderWidth: 1,
+                            pointRadius: 0,
+                            fill: true,
+                            tension: 0,
+                            order: 1,
+                        },
+                        {
+                            label: 'Noise Floor',
+                            data: floorLine,
+                            borderColor: 'rgba(40,167,69,0.7)',
+                            borderWidth: 1,
+                            borderDash: [6, 3],
+                            pointRadius: 0,
+                            fill: false,
+                            order: 2,
+                        },
+                        {
+                            label: 'Threshold',
+                            data: thrLine,
+                            borderColor: 'rgba(255,193,7,0.7)',
+                            borderWidth: 1,
+                            borderDash: [4, 3],
+                            pointRadius: 0,
+                            fill: false,
+                            order: 3,
+                        },
+                        {
+                            id: 'peaks',
+                            label: 'Peaks',
+                            type: 'scatter',
+                            data: peakPoints,
+                            parsing: false,
+                            showLine: false,
+                            pointRadius: 4,
+                            pointHoverRadius: 6,
+                            pointBackgroundColor: '#4caf50',
+                            pointBorderColor: '#d4ffd7',
+                            pointBorderWidth: 1,
+                            order: 4,
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    interaction: { mode: 'nearest', intersect: false },
+                    plugins: {
+                        legend: {
+                            labels: { color: '#ccc', boxWidth: 20, padding: 10 }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                title: items => {
+                                    const first = items[0];
+                                    if (first.raw && first.raw.x != null) return first.raw.x.toFixed(4) + ' MHz';
+                                    return first.label.toString() + ' MHz';
+                                },
+                                label: item => {
+                                    if (item.dataset && item.dataset.id === 'peaks') {
+                                        return 'Peak: ' + item.raw.x.toFixed(3) + ' MHz';
+                                    }
+                                    const v = item.raw;
+                                    if (typeof v === 'number') return `${item.dataset.label}: ${v.toFixed(1)} dB`;
+                                    if (v && v.y != null) return `${item.dataset.label}: ${v.y.toFixed(1)} dB`;
+                                    return item.dataset.label || '';
+                                }
+                            }
+                        },
+                    },
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            title: { display: true, text: 'Frequency (MHz)', color: '#aaa' },
+                            ticks: {
+                                color: '#aaa',
+                                maxTicksLimit: 14,
+                                callback: v => v.toFixed(2),
+                            },
+                            grid: { color: 'rgba(255,255,255,0.06)' }
+                        },
+                        y: {
+                            title: { display: true, text: 'Power (dB, uncalibrated)', color: '#aaa' },
+                            ticks: { color: '#aaa' },
+                            grid: { color: 'rgba(255,255,255,0.06)' }
+                        }
+                    }
+                },
+                plugins: [peakLabelPlugin]
+            });
+
+            // Draw signal dot markers manually after chart render
+            _spectrumChart.update();
+        }
+
+        function drawWaterfall() {
+            const canvas = document.getElementById('waterfallCanvas');
+            if (!canvas) return;
+            
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            
+            // Set canvas resolution to match display size
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = rect.width;
+            canvas.height = rect.height;
+            
+            if (_waterfallHistory.length === 0) {
+                ctx.fillStyle = '#111';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#666';
+                ctx.font = '14px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('Waterfall will appear after spectrum scans...', canvas.width / 2, canvas.height / 2);
+                return;
+            }
+            
+            // Get Chart.js chart area for precise alignment
+            if (!_spectrumChart || !_spectrumChart.chartArea) {
+                console.warn('Spectrum chart not ready for waterfall alignment');
+                return;
+            }
+            const chartArea = _spectrumChart.chartArea;
+            
+            // Get frequency range from chart scales
+            const xScale = _spectrumChart.scales.x;
+            const minFreq = xScale.min;
+            const maxFreq = xScale.max;
+            const freqRange = maxFreq - minFreq;
+            
+            // Calculate dynamic power range from all history
+            let minPower = Infinity;
+            let maxPower = -Infinity;
+            _waterfallHistory.forEach(scan => {
+                const scanMin = Math.min(...scan.powers);
+                const scanMax = Math.max(...scan.powers);
+                minPower = Math.min(minPower, scanMin);
+                maxPower = Math.max(maxPower, scanMax);
+            });
+            
+            // Add some headroom
+            const powerRange = maxPower - minPower;
+            minPower -= powerRange * 0.1;
+            maxPower += powerRange * 0.1;
+            
+            // Use Chart.js chart area dimensions for perfect alignment
+            const timeAxisWidth = 55;  // Width for hh:mm:ss timestamps
+            const drawHeight = canvas.height;
+            
+            // Calculate waterfall drawable area to match spectrum chart area exactly
+            // Match the chart's left and right positions
+            const drawX = chartArea.left;
+            const drawWidth = chartArea.right - chartArea.left;
+            
+            // Draw waterfall with newest scans at TOP, scrolling down
+            const lineHeight = drawHeight / Math.min(_waterfallHistory.length, _waterfallMaxLines);
+            
+            _waterfallHistory.forEach((scan, scanIdx) => {
+                // Reverse index: newest (last in array) at y=0 (top), oldest at bottom
+                const reversedIdx = _waterfallHistory.length - 1 - scanIdx;
+                const y = reversedIdx * lineHeight;
+                
+                scan.powers.forEach((power, freqIdx) => {
+                    const freq = scan.freqs[freqIdx];
+                    // Map frequency to chart area coordinates
+                    const x = drawX + ((freq - minFreq) / freqRange) * drawWidth;
+                    
+                    // Normalize power to 0-1 range
+                    const normalizedPower = (power - minPower) / (maxPower - minPower);
+                    
+                    // Color gradient: blue (weak) -> cyan -> green -> yellow -> red (strong)
+                    const color = powerToColor(normalizedPower);
+                    
+                    ctx.fillStyle = color;
+                    ctx.fillRect(Math.floor(x), Math.floor(y), Math.ceil(drawWidth / scan.powers.length) + 1, Math.ceil(lineHeight) + 1);
+                });
+            });
+            
+            // Draw time scale on left axis (hh:mm:ss format, every 5 seconds)
+            ctx.fillStyle = 'rgba(200, 200, 200, 0.9)';
+            ctx.font = '9px monospace';
+            ctx.textAlign = 'right';
+            ctx.textBaseline = 'middle';
+            
+            // Draw timestamp for each 5-second interval that has data
+            _waterfallHistory.forEach((scan, scanIdx) => {
+                const reversedIdx = _waterfallHistory.length - 1 - scanIdx;
+                const y = reversedIdx * lineHeight;
+                
+                // Only draw label every 5 seconds
+                const scanTime = new Date(scan.timestamp);
+                const seconds = scanTime.getSeconds();
+                if (seconds % 5 === 0) {
+                    const timeStr = scanTime.toTimeString().substr(0, 8);  // hh:mm:ss
+                    ctx.fillText(timeStr, drawX - 5, y + lineHeight / 2);
+                }
+            });
+        }
+        
+        function powerToColor(normalized) {
+            // Clamp to 0-1
+            normalized = Math.max(0, Math.min(1, normalized));
+            
+            // Color gradient mapping
+            let r, g, b;
+            
+            if (normalized < 0.2) {
+                // Dark blue to blue
+                const t = normalized / 0.2;
+                r = 0;
+                g = 0;
+                b = Math.floor(50 + t * 155);
+            } else if (normalized < 0.4) {
+                // Blue to cyan
+                const t = (normalized - 0.2) / 0.2;
+                r = 0;
+                g = Math.floor(t * 200);
+                b = 205;
+            } else if (normalized < 0.6) {
+                // Cyan to green
+                const t = (normalized - 0.4) / 0.2;
+                r = 0;
+                g = 200;
+                b = Math.floor(205 - t * 155);
+            } else if (normalized < 0.8) {
+                // Green to yellow
+                const t = (normalized - 0.6) / 0.2;
+                r = Math.floor(t * 255);
+                g = 200;
+                b = 0;
+            } else {
+                // Yellow to red
+                const t = (normalized - 0.8) / 0.2;
+                r = 255;
+                g = Math.floor(200 - t * 200);
+                b = 0;
+            }
+            
+            return `rgb(${r}, ${g}, ${b})`;
+        }
+        
+        // Clean up timer when modal is closed
+        document.getElementById('spectrumModal')?.addEventListener('hidden.bs.modal', function() {
+            if (_waterfallTimer) {
+                clearInterval(_waterfallTimer);
+                _waterfallTimer = null;
+            }
+        });
+        
+        async function stopDecoder(deviceId) {
+            if (!confirm(`Stop decoder on ${deviceId} and resume scanning?`)) {
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/start_scanning', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        device_serial: deviceId
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert(`✓ Decoder stopped on ${deviceId}\\nResuming scan mode`);
+                    setTimeout(() => loadReceivers(), 500);
+                } else {
+                    alert(`Failed to stop decoder: ${result.error || 'Unknown error'}`);
+                }
+            } catch (error) {
+                console.error('Error stopping decoder:', error);
+                alert(`Error: ${error.message}`);
+            }
+        }
+        
+        // Preserve frequency inputs on reload
+        function preserveFrequencyInputs() {
+            document.querySelectorAll('.manual-freq-input[data-preserve=\"true\"]').forEach(input => {
+                const deviceId = input.id.replace('freq-', '');
+                const savedValue = localStorage.getItem(`freq_${deviceId}`);
+                if (savedValue) {
+                    input.value = savedValue;
+                }
+                
+                input.addEventListener('input', () => {
+                    localStorage.setItem(`freq_${deviceId}`, input.value);
+                });
+            });
+        }
+        
+        // Call preserve function after receivers are loaded
+        const originalLoadReceivers = loadReceivers;
+        loadReceivers = async function() {
+            await originalLoadReceivers();
+            setTimeout(() => preserveFrequencyInputs(), 100);
+        };
+    </script>
+    
+    <!-- Kindle View Modal -->
+    <div class="modal fade" id="kindleViewModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Kindle View (Paperwhite)</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body text-center">
+                    <div id="kindleLoadingSpinner">
+                        <div class="spinner-border text-primary" role="status">
+                            <span class="visually-hidden">Generating...</span>
+                        </div>
+                        <p class="mt-2">Generating Kindle view...</p>
+                    </div>
+                    <div id="kindleImageContainer" style="display: none;"></div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sonde Logfile Modal -->
+    <div class="modal fade" id="sondeLogfileModal" tabindex="-1">
+        <div class="modal-dialog modal-xl" style="max-width: 90vw; height: 85vh;">
+            <div class="modal-content" style="height: 100%;">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-file-text"></i> Logfile: <span id="sondeLogfileSerial">-</span></h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" style="display: flex; flex-direction: column; padding: 1rem; overflow: hidden;">
+                    <div id="sondeLogfileLoading" class="text-center py-5">
+                        <div class="spinner-border text-primary" role="status">
+                            <span class="visually-hidden">Loading...</span>
+                        </div>
+                        <p class="mt-2">Loading logfile...</p>
+                    </div>
+                    <pre id="sondeLogfileContent" style="display: none; flex: 1; overflow-y: auto; background: #f8f9fa; padding: 15px; border-radius: 4px; font-size: 12px; font-family: 'Courier New', monospace; margin: 0; white-space: pre-wrap;">No file selected</pre>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-primary" id="downloadSondeLogBtn">
+                        <i class="bi bi-file-earmark-arrow-down"></i> Download
+                    </button>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Spectrum Modal -->
+    <div class="modal fade" id="spectrumModal" tabindex="-1">
+        <div class="modal-dialog" style="max-width: min(95vw, 1368px); height: 90vh;">
+            <div class="modal-content" style="height: 100%;">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="spectrumModalTitle"><i class="bi bi-bar-chart-line"></i> Spectrum scan</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" style="background:#111; padding:12px; display: flex; flex-direction: column; overflow: hidden;">
+                    <!-- Spectrum Chart (Top) -->
+                    <div id="spectrumChartContainer" style="position:relative; flex: 0 0 40%; min-height: 200px;">
+                        <canvas id="spectrumChart"></canvas>
+                    </div>
+                    <!-- Waterfall Display (Bottom) -->
+                    <div id="waterfallContainer" style="position:relative; flex: 1; min-height: 150px; margin-top: 12px; display: flex;">
+                        <canvas id="waterfallCanvas" style="width: 100%; height: 100%; image-rendering: crisp-edges;"></canvas>
+                    </div>
+                    <!-- Footer Info -->
+                    <div class="d-flex justify-content-between align-items-center mt-2" style="flex: 0 0 auto;">
+                        <small class="spectrum-meta" id="spectrumTimestamp" style="color: #8ecbff;">-</small>
+                        <div class="d-flex gap-2 spectrum-meta" style="color: #8ecbff;">
+                            <small>Noise floor: <span id="spectrumNoiseFloor">-</span></small>
+                            <small>| Threshold: <span id="spectrumThreshold">-</span></small>
+                        </div>
+                        <button class="btn btn-sm btn-outline-secondary" onclick="refreshSpectrum()">
+                            <i class="bi bi-arrow-clockwise"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+                <div class="modal-footer d-flex justify-content-between">
+                    <div class="form-check form-switch mb-0">
+                        <input class="form-check-input" type="checkbox" id="waterfallToggle" checked onchange="toggleWaterfall()">
+                        <label class="form-check-label text-muted" for="waterfallToggle">Show waterfall</label>
+                    </div>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- About Modal -->
+    <div class="modal fade" id="aboutModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">
+                        <i class="bi bi-info-circle"></i> 
+                        <span id="aboutModalTitle">About OpenWXSDR</span>
+                    </h5>
+                    <div class="d-flex align-items-center ms-auto">
+                        <div class="btn-group btn-group-sm me-2">
+                            <button type="button" class="btn btn-outline-secondary" id="langEN" onclick="setAboutLanguage('en')">EN</button>
+                            <button type="button" class="btn btn-outline-secondary" id="langDE" onclick="setAboutLanguage('de')">DE</button>
+                        </div>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                </div>
+                <div class="modal-body">
+                    <!-- English Content -->
+                    <div id="aboutContentEN" style="display:none;">
+                        <h6 class="mb-3">System Information</h6>
+                        <table class="table table-bordered table-sm mb-4">
+                            <tbody>
+                                <tr><th style="width:35%">Application</th><td>OpenWX.de Radiosonde Tracking System (SDR Gateway)</td></tr>
+                                <tr><th>Version</th><td>V{{ version }} (Release)</td></tr>
+                                <tr><th>Station</th><td>{{ callsign }}</td></tr>
+                                <tr><th>Build Date</th><td>{{ build_date }}</td></tr>
+                            </tbody>
+                        </table>
+
+                        <h6 class="mb-2">Description</h6>
+                        <p class="small">OpenWXSDR is a real-time radiosonde reception and decoding system for amateur radio enthusiasts. The system receives radiosonde signals via RTL-SDR hardware and decodes telemetry data in real-time.</p>
+
+                        <h6 class="mb-2">Key Features</h6>
+                        <ul class="small">
+                            <li><i class="bi bi-geo-alt text-primary"></i> Real-time radiosonde tracking with live map display</li>
+                            <li><i class="bi bi-broadcast text-primary"></i> Support for multiple RTL-SDR devices simultaneously</li>
+                            <li><i class="bi bi-wifi text-primary"></i> MQTT and HTTP upload to OpenWX.de</li>
+                            <li><i class="bi bi-reception-4 text-primary"></i> Automatic frequency scanning and sonde detection</li>
+                            <li><i class="bi bi-file-earmark-code text-primary"></i> RS41, RS92, DFM, M10, M20 and other sonde types</li>
+                        </ul>
+
+                        <h6 class="mb-2">Copyright &amp; License</h6>
+                        <p class="small"><strong>Copyright &copy; 2025-2026 by DL2MF</strong><br>
+                        This software is distributed under the GNU General Public License v2.0 or later.</p>
+
+                        <h6 class="mb-2">Contact &amp; Support</h6>
+                        <p class="small mb-0">
+                            <i class="bi bi-envelope"></i> E-Mail: <a href="mailto:dl2mf@darc.de">dl2mf@darc.de</a><br>
+                            <i class="bi bi-globe"></i> Website: <a href="https://openwx.de" target="_blank">openwx.de</a>
+                        </p>
+
+                        <div class="alert alert-danger border-0 mt-3 mb-0 py-2 small text-center" style="background: rgba(220,53,69,0.08);">
+                            <i class="bi bi-heart-fill text-danger"></i> Made with love for the amateur radio community
+                        </div>
+                    </div>
+
+                    <!-- German Content -->
+                    <div id="aboutContentDE" style="display:none;">
+                        <h6 class="mb-3">Systeminformationen</h6>
+                        <table class="table table-bordered table-sm mb-4">
+                            <tbody>
+                                <tr><th style="width:35%">Anwendung</th><td>OpenWX.de Radiosonden-Tracking-System (SDR Gateway)</td></tr>
+                                <tr><th>Version</th><td>V{{ version }} (Release)</td></tr>
+                                <tr><th>Station</th><td>{{ callsign }}</td></tr>
+                                <tr><th>Build-Datum</th><td>{{ build_date }}</td></tr>
+                            </tbody>
+                        </table>
+
+                        <h6 class="mb-2">Beschreibung</h6>
+                        <p class="small">OpenWXSDR ist ein Echtzeit-Radiosonden-Empfangs- und Dekodiersystem f&uuml;r Amateurfunk-Enthusiasten. Das System empf&auml;ngt Radiosondensignale &uuml;ber RTL-SDR-Hardware und dekodiert die Telemetriedaten in Echtzeit.</p>
+
+                        <h6 class="mb-2">Hauptmerkmale</h6>
+                        <ul class="small">
+                            <li><i class="bi bi-geo-alt text-primary"></i> Echtzeit-Radiosonden-Tracking mit Live-Kartenanzeige</li>
+                            <li><i class="bi bi-broadcast text-primary"></i> Unterst&uuml;tzung mehrerer RTL-SDR-Ger&auml;te gleichzeitig</li>
+                            <li><i class="bi bi-wifi text-primary"></i> MQTT- und HTTP-Upload zu OpenWX.de</li>
+                            <li><i class="bi bi-reception-4 text-primary"></i> Automatische Frequenzsuche und Sondenerkennung</li>
+                            <li><i class="bi bi-file-earmark-code text-primary"></i> RS41, RS92, DFM, M10, M20 und weitere Sondentypen</li>
+                        </ul>
+
+                        <h6 class="mb-2">Copyright &amp; Lizenz</h6>
+                        <p class="small"><strong>Copyright &copy; 2025-2026 by DL2MF</strong><br>
+                        Diese Software wird unter der GNU General Public License v2.0 oder sp&auml;ter vertrieben.</p>
+
+                        <h6 class="mb-2">Kontakt &amp; Support</h6>
+                        <p class="small mb-0">
+                            <i class="bi bi-envelope"></i> E-Mail: <a href="mailto:dl2mf@darc.de">dl2mf@darc.de</a><br>
+                            <i class="bi bi-globe"></i> Website: <a href="https://openwx.de" target="_blank">openwx.de</a>
+                        </p>
+
+                        <div class="alert alert-danger border-0 mt-3 mb-0 py-2 small text-center" style="background: rgba(220,53,69,0.08);">
+                            <i class="bi bi-heart-fill text-danger"></i> Mit Liebe f&uuml;r die Amateurfunk-Community erstellt
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" id="aboutCloseBtn">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Loading Data Modal -->
+    <div class="modal fade" id="loadingDataModal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-body text-center py-4">
+                    <div class="spinner-border text-primary mb-3" role="status" style="width: 3rem; height: 3rem;">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <h5 id="loadingDataMessage">Loading data...</h5>
+                    <p class="text-muted mb-0">Please wait</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Logfile Modal -->
+    <div class="modal fade" id="logfilesModal" tabindex="-1">
+        <div class="modal-dialog modal-xl" style="max-width: 95vw; max-height: 90vh; height: 90vh;">
+            <div class="modal-content" style="height: 100%;">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-file-text"></i> Logfiles</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" style="overflow: hidden; display: flex; flex-direction: column; padding: 1rem;">
+                    <div class="row g-2" style="flex: 1; min-height: 0; margin: 0; display: flex;">
+                        <div class="col-md-5" style="display: flex; flex-direction: column; min-height: 0; overflow: hidden; height: 100%;">
+                            <h6>Available Logs</h6>
+                            <div style="flex: 1; min-height: 0; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 4px;">
+                                <table class="table table-sm table-hover mb-0" id="logfileTable" style="font-size: 13px;">
+                                    <thead style="position: sticky; top: 0; background: white; z-index: 10;">
+                                        <tr>
+                                            <th style="cursor: pointer;" onclick="sortLogfiles('name')">
+                                                Filename <i class="bi bi-arrow-down-up" id="sortIconName"></i>
+                                            </th>
+                                            <th style="cursor: pointer;" onclick="sortLogfiles('type')">
+                                                Type <i class="bi bi-arrow-down-up" id="sortIconType"></i>
+                                            </th>
+                                            <th style="cursor: pointer;" onclick="sortLogfiles('date')">
+                                                Date & Time <i class="bi bi-arrow-down-up" id="sortIconDate"></i>
+                                            </th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="logfileList">
+                                        <tr><td colspan="3" class="text-center">Loading...</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="col-md-7" style="display: flex; flex-direction: column; min-height: 0; overflow: hidden; height: 100%;">
+                            <div class="d-flex align-items-center justify-content-between mb-1">
+                                <h6 id="logfileTitle" class="mb-0">Select a log file</h6>
+                                <div class="btn-group btn-group-sm">
+                                    <button id="downloadLogBtn" class="btn btn-outline-secondary">
+                                        <i class="bi bi-file-earmark-arrow-down"></i> Download
+                                    </button>
+                                </div>
+                            </div>
+                            <pre id="logfileContent" style="flex: 1; min-height: 0; overflow-y: auto; background: #f8f9fa; padding: 10px; border-radius: 4px; font-size: 12px; margin: 0;">No file selected</pre>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- RX Statistics Modal -->
+    <div class="modal fade" id="rxStatisticsModal" tabindex="-1">
+        <div class="modal-dialog modal-xl" style="max-width: 1400px;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-graph-up-arrow"></i> Receiver Statistics</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" style="max-height: 80vh; overflow-y: auto;">
+                    <!-- Summary Statistics at Top -->
+                    <div class="row mb-4">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-info-circle"></i> Summary Statistics</h6>
+                            <div class="row">
+                                <div class="col">
+                                    <div class="card" style="background-color: #f0f8ff;">
+                                        <div class="card-body text-center">
+                                            <h3 id="rxStatsTotalSondes" class="mb-0">-</h3>
+                                            <small class="text-muted">Total Sondes</small>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col">
+                                    <div class="card" style="background-color: #f0fff0;">
+                                        <div class="card-body text-center">
+                                            <h3 id="rxStatsTotalFrames" class="mb-0">-</h3>
+                                            <small class="text-muted">Frames today</small>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col">
+                                    <div class="card" style="background-color: #fffef0;">
+                                        <div class="card-body text-center">
+                                            <h3 id="rxStatsRecordedDays" class="mb-0">-</h3>
+                                            <small class="text-muted">Recorded Days</small>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col">
+                                    <div class="card" style="background-color: #fff0f5;">
+                                        <div class="card-body text-center">
+                                            <h3 id="rxStatsTotalFramesStopped" class="mb-0">-</h3>
+                                            <small class="text-muted">Total Frames</small>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col">
+                                    <div class="card" style="background-color: #f5f0ff;">
+                                        <div class="card-body text-center">
+                                            <h3 id="rxStatsMaxSondes" class="mb-0">-</h3>
+                                            <small id="rxStatsMaxSondesDate" class="text-muted d-block" style="font-size: 0.75rem; margin-top: 2px; display: none;">-</small>
+                                            <small class="text-muted">Max. Sondes/day</small>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-4">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-calendar3"></i> Received Sondes per Day</h6>
+                            <div style="height: 250px;">
+                                <canvas id="sondesPerDayChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-4">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-file-earmark-text"></i> Total Frames per Day</h6>
+                            <div style="height: 250px;">
+                                <canvas id="framesPerDayChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-4">
+                        <div class="col-md-6">
+                            <h6><i class="bi bi-broadcast"></i> Received Sonde Types</h6>
+                            <div style="height: 250px;">
+                                <canvas id="sondeTypesChart"></canvas>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <h6><i class="bi bi-reception-4"></i> Received Frequencies (MHz)</h6>
+                            <div style="height: 250px;">
+                                <canvas id="frequenciesChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-4">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-reception-4"></i> RSSI Over Time</h6>
+                            <div style="height: 250px;">
+                                <canvas id="rssiTimelineChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-3">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-satellite"></i> Satellite Count Distribution</h6>
+                            <div style="height: 250px;">
+                                <canvas id="satsDistChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-3">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-cloud-arrow-up"></i> First Frame Altitude by Sonde</h6>
+                            <div style="height: 300px; overflow-x: auto;">
+                                <canvas id="altitudeBySondeChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-3">
+                        <div class="col-md-12">
+                            <h6><i class="bi bi-cloud-arrow-down"></i> Last Frame Altitude by Sonde</h6>
+                            <div style="height: 300px; overflow-x: auto;">
+                                <canvas id="lastAltitudeBySondeChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Footer -->
+    <footer class="text-center text-white mt-4 pb-3" style="font-size: 14px;">
+        <div class="container">
+            OpenWXSDR <span id="footerVersion">V{{ version }}</span> - Copyright &copy; 2025-2026 by DL2MF
+        </div>
+    </footer>
+</body>
+</html>
