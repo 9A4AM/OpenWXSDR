@@ -45,19 +45,21 @@
 """
 
 import os
-import platform
 import socket
 import subprocess
+import json
+import time
 
 # Import version info from package
 from .. import __version__, __build_date__
+from ..hardware_info import detect_host_hardware
 import logging
 import threading
 import math
 import re
-from flask import Flask, render_template, jsonify, request, send_file, send_from_directory
+from flask import Flask, render_template, jsonify, request, send_file, send_from_directory, Response
 from flask_cors import CORS
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Optional
 from datetime import datetime
 
 try:
@@ -83,8 +85,10 @@ class WebUI:
         # Store telemetry data (keyed by serial number)
         self.sondes: Dict[str, List[dict]] = {}
         self.total_frames_received = 0  # Total frames ever received
+        self.total_sondes_received = 0  # Total unique sondes ever received
         self.active_frequencies = set()  # Currently active frequencies
         self.lock = threading.Lock()
+        self.start_time = time.time()  # Track uptime
         
         # Per-sonde log files
         self.sonde_logfiles: Dict[str, str] = {}  # serial -> log file path
@@ -110,6 +114,7 @@ class WebUI:
         
         self.sonde_first_frames = {}  # Track first frame logged per sonde serial
         self.sonde_last_frames = {}  # Track last frame for each sonde
+        self.sonde_frame_counts = {}  # Track total frame count per sonde serial
         
         # Apply initial logging levels from config
         self._apply_logging_levels()
@@ -124,6 +129,7 @@ class WebUI:
         self.spectrum_analyzer = None
         self.decoder_manager = None
         self.flux242_receiver = None
+        self.ka9q_receiver = None
         self.mqtt_output = None
         self.sondehub_output = None
         
@@ -165,8 +171,19 @@ class WebUI:
                                  default_lon=map_config['default_lon'],
                                  default_zoom=map_config['default_zoom'],
                                  tile_server=map_config['tile_server'],
+                                 station_lat=station_cfg.get('lat', map_config['default_lat']),
+                                 station_lon=station_cfg.get('lon', map_config['default_lon']),
                                  callsign=station_cfg.get('callsign', ''),
                                  version=__version__,
+                                 build_date=__build_date__,
+                                 enable_config=self.enable_config)
+        
+        @self.app.route('/dashboard')
+        def dashboard():
+            """System dashboard overview page"""
+            return render_template('dashboard.html',
+                                 version=__version__,
+                                 callsign=self.config['station']['callsign'],
                                  build_date=__build_date__,
                                  enable_config=self.enable_config)
         
@@ -213,6 +230,7 @@ class WebUI:
                     'sondes': sondes,
                     'count': len(sondes),
                     'total_frames': self.total_frames_received,
+                    'total_sondes': self.total_sondes_received,
                     'timestamp': datetime.utcnow().isoformat() + 'Z'
                 })
         
@@ -271,15 +289,22 @@ class WebUI:
             with self.lock:
                 active_sondes = len(self.sondes)
                 total_frames = self.total_frames_received
+                total_sondes = self.total_sondes_received
                 # Get unique active frequencies
                 frequencies = list(self.active_frequencies)
             
             # Get system metrics
             system_metrics = self._get_system_metrics()
             
+            # Calculate uptime
+            uptime_seconds = int(time.time() - self.start_time)
+            
             return jsonify({
                 'active_sondes': active_sondes,
                 'total_frames': total_frames,
+                'total_sondes': total_sondes,
+                'total_sondes_received': total_sondes,  # Alias for dashboard
+                'uptime_seconds': uptime_seconds,
                 'frequencies': frequencies,
                 'cpu_percent': system_metrics['cpu_percent'],
                 'memory_percent': system_metrics['memory_percent'],
@@ -293,23 +318,32 @@ class WebUI:
         @self.app.route('/api/health')
         def get_health():
             """Get system health status"""
-            with self.lock:
-                # Get last frame time
+            try:
+                # Get last frame time (with lock for accessing self.sondes)
                 last_frame_time = None
-                for serial, data in self.sondes.items():
-                    if data and 'timestamp' in data[-1]:
-                        frame_time = data[-1]['timestamp']
-                        if last_frame_time is None or frame_time > last_frame_time:
-                            last_frame_time = frame_time
+                with self.lock:
+                    for serial, data in self.sondes.items():
+                        if data and 'timestamp' in data[-1]:
+                            frame_time = data[-1]['timestamp']
+                            if last_frame_time is None or frame_time > last_frame_time:
+                                last_frame_time = frame_time
                 
+                # Check SDR mode and get status (no lock needed - read-only component references)
                 # Check if using flux242 mode
                 if self.flux242_receiver is not None:
                     # Flux242 mode
                     decoder_status = 'flux242'
                     active_decoders = len(self.flux242_receiver.active_sondes) if hasattr(self.flux242_receiver, 'active_sondes') else 0
                     rtlsdr_status = 'flux242' if self.flux242_receiver.running else 'disconnected'
+                # Check if using KA9Q mode
+                elif self.ka9q_receiver is not None:
+                    # KA9Q mode
+                    decoder_status = 'running' if getattr(self.ka9q_receiver, 'running', False) else 'stopped'
+                    active_decoders = self.ka9q_receiver.get_decoder_count() if hasattr(self.ka9q_receiver, 'get_decoder_count') else 0
+                    stream_count = self.ka9q_receiver.get_stream_count() if hasattr(self.ka9q_receiver, 'get_stream_count') else 0
+                    rtlsdr_status = 'decoding' if active_decoders > 0 else ('scanning' if stream_count > 0 else 'connected')
                 else:
-                    # Standard RTL-SDR / KA9Q mode
+                    # Standard RTL-SDR mode
                     decoder_status = 'unknown'
                     active_decoders = 0
                     if self.decoder_manager is not None:
@@ -350,6 +384,9 @@ class WebUI:
                     'last_frame_time': last_frame_time,
                     'timestamp': datetime.utcnow().isoformat() + 'Z'
                 })
+            except Exception as e:
+                self.logger.error(f"Error in /api/health: {e}", exc_info=True)
+                return jsonify({'error': str(e), 'status': 'error'}), 500
         
         @self.app.route('/api/devices')
         def get_devices():
@@ -364,8 +401,37 @@ class WebUI:
             else:
                 connected_serials = None  # Non-RTL-SDR: always treat as present
 
+            # Check if using KA9Q mode
+            if self.ka9q_receiver is not None:
+                # Get active streams from KA9Q receiver
+                active_streams = self.ka9q_receiver.get_active_streams() if hasattr(self.ka9q_receiver, 'get_active_streams') else []
+                active_decoders = self.ka9q_receiver.get_decoder_count() if hasattr(self.ka9q_receiver, 'get_decoder_count') else 0
+                
+                for stream in active_streams:
+                    devices.append({
+                        'serial': f'KA9Q-{stream.ssrc:08x}',
+                        'status': 'decoding' if stream.ssrc in getattr(self.ka9q_receiver, 'active_decoders', {}) else 'idle',
+                        'frequency': stream.frequency / 1e6 if stream.frequency else None,
+                        'sonde_type': None,  # Updated when telemetry received
+                        'active_sondes': 1 if stream.ssrc in getattr(self.ka9q_receiver, 'active_decoders', {}) else 0,
+                        'present': True,
+                        'ssrc': stream.ssrc,
+                        'sample_rate': stream.sample_rate,
+                        'packet_count': stream.packet_count
+                    })
+                
+                # If no streams but receiver is running, show placeholder
+                if not active_streams and getattr(self.ka9q_receiver, 'running', False):
+                    devices.append({
+                        'serial': 'KA9Q-Radio',
+                        'status': 'scanning',
+                        'frequency': None,
+                        'sonde_type': 'Waiting for RTP streams',
+                        'active_sondes': 0,
+                        'present': True
+                    })
             # Check if using flux242 mode
-            if self.flux242_receiver is not None:
+            elif self.flux242_receiver is not None:
                 devices.append({
                     'serial': 'Flux242',
                     'status': 'decoding' if self.flux242_receiver.running else 'disconnected',
@@ -390,7 +456,8 @@ class WebUI:
                             'freq_label':   ws.get('freq_label'),
                             'sonde_type':   ws['sonde_type'],
                             'active_sondes': 1 if state == 'decoding' else 0,
-                            'present':      present
+                            'present':      present,
+                            'scan_return_eta_s': ws.get('scan_return_eta_s'),
                         })
                 else:
                     # Legacy DecoderManager
@@ -431,17 +498,107 @@ class WebUI:
                 'devices': [d for d in devices if d.get('present', True)],
                 'timestamp': datetime.utcnow().isoformat() + 'Z'
             })
+
+        @self.app.route('/api/receivers')
+        def get_receivers():
+            """Get receiver status for dashboard"""
+            try:
+                receivers = []
+                
+                # KA9Q mode: show active streams as receivers
+                if self.ka9q_receiver is not None:
+                    active_streams = self.ka9q_receiver.get_active_streams() if hasattr(self.ka9q_receiver, 'get_active_streams') else []
+                    active_decoders = getattr(self.ka9q_receiver, 'active_decoders', {})
+                    
+                    for stream in active_streams:
+                        is_decoding = stream.ssrc in active_decoders
+                        state = 'DECODING' if is_decoding else 'SCANNING'
+                        
+                        # Get sonde info if decoding
+                        sonde_serial = None
+                        sonde_type = None
+                        if is_decoding and hasattr(active_decoders[stream.ssrc], 'decoder'):
+                            decoder = active_decoders[stream.ssrc].decoder
+                            sonde_serial = getattr(decoder, 'sonde_serial', None)
+                            sonde_type = getattr(decoder, 'sonde_type', None)
+                        
+                        receivers.append({
+                            'device_id': f'KA9Q-{stream.ssrc:08x}',
+                            'state': state,
+                            'frequency': stream.frequency,  # Already in Hz
+                            'freq_label': f'{stream.frequency/1e6:.3f} MHz',
+                            'sonde_type': sonde_type,
+                            'sonde_serial': sonde_serial,
+                            'decoder_mode': 'ka9q',
+                            'channelizer_active': len(active_streams),
+                            'channelizer_max': getattr(self.ka9q_receiver, 'max_channels', 0),
+                        })
+                    
+                    # If no streams but receiver running, show waiting state
+                    if not active_streams and getattr(self.ka9q_receiver, 'running', False):
+                        receivers.append({
+                            'device_id': 'KA9Q-Radio',
+                            'state': 'IDLE',
+                            'frequency': 0,
+                            'freq_label': 'Waiting for RTP streams',
+                            'sonde_type': None,
+                            'sonde_serial': None,
+                            'decoder_mode': 'ka9q',
+                            'channelizer_active': 0,
+                            'channelizer_max': getattr(self.ka9q_receiver, 'max_channels', 0),
+                        })
+                
+                # RTL-SDR mode: show device workers
+                elif self.decoder_manager is not None and hasattr(self.decoder_manager, 'get_worker_status'):
+                    worker_statuses = self.decoder_manager.get_worker_status()
+                    for ws in worker_statuses:
+                        state = ws['state'].upper()  # IDLE, SCANNING, DECODING
+                        freq_hz = ws.get('frequency')
+                        # Convert MHz back to Hz if needed for display consistency
+                        if freq_hz is not None:
+                            freq_hz = freq_hz * 1e6  # API returns MHz, convert back to Hz
+                        
+                        # Step 4: Include channelizer info
+                        receiver_info = {
+                            'device_id': ws['serial'],
+                            'state': state,
+                            'frequency': freq_hz,
+                            'freq_label': ws.get('freq_label'),  # Add scan range label
+                            'sonde_type': ws['sonde_type'] or None,
+                            'sonde_serial': ws.get('sonde_serial'),
+                            'decoder_mode': ws.get('decoder_mode', 'legacy'),  # 'legacy' or 'channelizer'
+                            'channelizer_active': ws.get('channelizer_active', 0),  # Active channels
+                            'channelizer_max': ws.get('channelizer_max', 0),  # Max channels
+                        }
+                        receivers.append(receiver_info)
+                
+                return jsonify(receivers)
+            except Exception as e:
+                self.logger.error(f"Error in /api/receivers: {e}", exc_info=True)
+                return jsonify({'error': str(e), 'receivers': []}), 500
         
         @self.app.route('/api/config')
         def get_config():
             """Get current configuration"""
-            detection_cfg = self.config.get('detection', {})
-            return jsonify({
-                'sdr_type': self.config['sdr']['type'],
-                'airspy_available': self.config.get('sdr', {}).get('airspy_support', False),
-                'fixed_channels_enable': detection_cfg.get('fixed_channels_enable'),
-                'success': True
-            })
+            try:
+                detection_cfg = self.config.get('detection', {})
+                receivers_cfg = self.config.get('receivers', {})
+                station_cfg = self.config.get('station', {})
+                sdr_cfg = self.config.get('sdr', {})
+                
+                return jsonify({
+                    'sdr_type': sdr_cfg.get('type'),
+                    'airspy_available': sdr_cfg.get('airspy_support', False),
+                    'fixed_channels_enable': detection_cfg.get('fixed_channels_enable'),
+                    'sdr': sdr_cfg,  # Full SDR config for dashboard
+                    'detection': detection_cfg,  # Full detection config
+                    'receivers': receivers_cfg,  # Full receivers config
+                    'station': station_cfg,  # Full station config
+                    'success': True
+                })
+            except Exception as e:
+                self.logger.error(f"Error in /api/config: {e}", exc_info=True)
+                return jsonify({'error': str(e), 'success': False}), 500
 
         @self.app.route('/api/reset_statistics', methods=['POST'])
         def reset_statistics():
@@ -450,6 +607,7 @@ class WebUI:
                 with self.lock:
                     self.sondes.clear()
                     self.total_frames_received = 0
+                    self.total_sondes_received = 0
                     self.active_frequencies.clear()
 
                 self.logger.info("System statistics reset requested from Web UI")
@@ -665,6 +823,10 @@ class WebUI:
                     airspy_id = getattr(self.decoder_manager, '_serial', '') or 'airspy0'
                     self.decoder_manager.stop_decode_and_scan()
                     self.logger.info(f"Triggered scanning on Airspy ({airspy_id})")
+                    self._log_action('decoder_stop', {
+                        'device': airspy_id,
+                        'reason': 'manual_scan_requested'
+                    })
                     return jsonify({'success': True, 'device': airspy_id})
 
                 if not hasattr(self.decoder_manager, '_workers'):
@@ -677,6 +839,10 @@ class WebUI:
                     if worker.state in (DeviceWorker.STATE_IDLE, DeviceWorker.STATE_DECODING):
                         worker.stop_decode_and_scan()
                         self.logger.info(f"Triggered scanning on device {worker.device_serial}")
+                        self._log_action('decoder_stop', {
+                            'device': worker.device_serial,
+                            'reason': 'manual_scan_requested'
+                        })
                         return jsonify({'success': True, 'device': worker.device_serial})
                     elif worker.state == DeviceWorker.STATE_SCANNING:
                         return jsonify({'success': True, 'device': worker.device_serial, 'message': 'Already scanning'})
@@ -741,6 +907,7 @@ class WebUI:
             airspy = cfg.get('sdr', {}).get('airspy', {})
             mqtt = cfg.get('openwx', {}).get('mqtt', {})
             sondehub = cfg.get('sondehub', {})
+            import_api = cfg.get('import_api', {})
 
             available_receiver_bands = [
                 {
@@ -807,6 +974,19 @@ class WebUI:
                     'queue_batch_max': int(sondehub.get('queue_batch_max', 200)),
                     'queue_max_size': int(sondehub.get('queue_max_size', 2000)),
                     'upload_rate_s': int(sondehub.get('upload_rate_s', 15)),
+                },
+                'import_api': {
+                    'enabled': bool(import_api.get('enabled', False)),
+                    'url': import_api.get('url', 'api.opnwx.de'),
+                    'check_interval_s': int(import_api.get('check_interval_s', 300)),
+                    'lat': float(import_api.get('lat', station.get('lat', 0.0))),
+                    'lon': float(import_api.get('lon', station.get('lon', 0.0))),
+                    'distance_km': int(import_api.get('distance_km', 500)),
+                    'time_range_minutes': int(import_api.get('time_range_minutes', 240)),
+                    'sonde_type': import_api.get('sonde_type', 'all'),
+                    'max_sondes': int(import_api.get('max_sondes', 4)),
+                    'station_lat': float(station.get('lat', 0.0)),
+                    'station_lon': float(station.get('lon', 0.0)),
                 },
                 'detection': {
                     'fixed_channels_enable': detection.get('fixed_channels_enable', False),
@@ -891,6 +1071,32 @@ class WebUI:
                         }
                     )
 
+                if 'import_api' in data:
+                    ia = data['import_api']
+                    # Check if import_api section exists
+                    if 'import_api' not in config:
+                        # Create the section at the end of the file
+                        config_text = config_text.rstrip() + '\n\n# Import API for automatic sonde detection\nimport_api:\n  enabled: false\n  url: api.opnwx.de\n  check_interval_s: 300\n  lat: 0.0\n  lon: 0.0\n  distance_km: 500\n  time_range_minutes: 240\n  sonde_type: all\n  max_sondes: 4\n'
+                        # Re-parse to get updated config
+                        config = yaml.safe_load(config_text)
+                    
+                    # Now update with actual values
+                    config_text = self._update_mapping_keys_in_text(
+                        config_text,
+                        ['import_api'],
+                        {
+                            'enabled': bool(ia['enabled']),
+                            'url': str(ia['url']),
+                            'check_interval_s': int(ia['check_interval_s']),
+                            'lat': float(ia['lat']),
+                            'lon': float(ia['lon']),
+                            'distance_km': int(ia['distance_km']),
+                            'time_range_minutes': int(ia['time_range_minutes']),
+                            'sonde_type': str(ia['sonde_type']),
+                            'max_sondes': int(ia['max_sondes']),
+                        }
+                    )
+
                 if 'station' in data:
                     st = data['station']
                     config_text = self._update_mapping_keys_in_text(
@@ -955,6 +1161,658 @@ class WebUI:
             except Exception as e:
                 self.logger.error(f"Error saving config sections: {e}")
                 return jsonify({'success': False, 'error': str(e)})
+
+        @self.app.route('/api/preview_import_api', methods=['POST'])
+        def preview_import_api():
+            """Preview available sondes using Import API settings (no config save)."""
+            try:
+                from ..import_api.sonde_api_client import SondeApiClient
+                
+                # Get preview parameters from request
+                params = request.get_json() or {}
+                
+                # Create temporary config for preview
+                preview_config = {
+                    'enabled': True,  # Enable for preview
+                    'url': params.get('url', 'api.opnwx.de'),
+                    'check_interval_s': params.get('check_interval_s', 300),
+                    'lat': float(params.get('lat', 0.0)),
+                    'lon': float(params.get('lon', 0.0)),
+                    'distance_km': int(params.get('distance_km', 500)),
+                    'time_range_minutes': int(params.get('time_range_minutes', 240)),
+                    'sonde_type': params.get('sonde_type', 'all'),
+                    'max_sondes': int(params.get('max_sondes', 4)),
+                }
+                
+                # Create temporary API client
+                api_client = SondeApiClient(preview_config)
+                
+                # Fetch sondes immediately
+                sondes = api_client.fetch_sondes()
+                
+                return jsonify({
+                    'success': True,
+                    'sondes': sondes,
+                    'count': len(sondes),
+                })
+                
+            except Exception as e:
+                self.logger.error(f"Error previewing Import API: {e}")
+                return jsonify({'success': False, 'error': str(e)})
+
+        @self.app.route('/api/kindle/dashboard_touch.png')
+        def get_kindle_dashboard_touch():
+            """Generate Kindle Touch dashboard image (600x800 grayscale PNG)."""
+            try:
+                # Test imports first
+                try:
+                    from ..kindle.dashboard_generator import generate_dashboard_image
+                except ImportError as ie:
+                    self.logger.error(f"Failed to import dashboard_generator: {ie}", exc_info=True)
+                    return Response(f"Import error: {ie}", status=500)
+                
+                # Gather receiver status
+                try:
+                    receivers = self._get_receiver_status()
+                    self.logger.info(f"Kindle dashboard: Got {len(receivers)} receivers")
+                except Exception as e:
+                    self.logger.error(f"Error getting receiver status: {e}", exc_info=True)
+                    receivers = []
+                
+                # Gather active sondes
+                try:
+                    sondes = self._get_active_sondes_for_dashboard()
+                    self.logger.info(f"Kindle dashboard: Got {len(sondes)} sondes")
+                except Exception as e:
+                    self.logger.error(f"Error getting sondes: {e}", exc_info=True)
+                    sondes = []
+                
+                # Match sondes to receivers (add sonde_serial to decoding receivers)
+                for rx in receivers:
+                    if rx.get('state') == 'DECODING':
+                        freq_hz = rx.get('frequency')
+                        if freq_hz:
+                            for s in sondes:
+                                if abs(s.get('frequency', 0) - freq_hz) < 50000:  # 50 kHz tolerance
+                                    rx['sonde_serial'] = s.get('serial', '')
+                                    break
+                
+                # Gather system info
+                try:
+                    system_info = self._get_system_info()
+                except Exception as e:
+                    self.logger.error(f"Error getting system info: {e}", exc_info=True)
+                    system_info = {'uptime_seconds': 0, 'cpu_percent': 0, 'memory_percent': 0}
+                
+                # Get station callsign from config
+                station_callsign = self.config.get('station', {}).get('callsign', 'OpenWXSDR')
+                station_name = f"OpenWX ● SDR - {station_callsign} Gateway"
+                
+                # Generate image
+                try:
+                    image_bytes = generate_dashboard_image(
+                        device_type='touch',
+                        station_name=station_name,
+                        receivers=receivers,
+                        sondes=sondes,
+                        system_info=system_info,
+                        version=__version__
+                    )
+                except Exception as e:
+                    self.logger.error(f"Error in generate_dashboard_image: {e}", exc_info=True)
+                    return Response(f"Image generation error: {e}", status=500)
+                
+                return Response(image_bytes, mimetype='image/png')
+                
+            except Exception as e:
+                self.logger.error(f"Error generating Kindle Touch dashboard: {e}", exc_info=True)
+                return Response(f"Error: {e}", status=500)
+
+        @self.app.route('/api/kindle/dashboard_pw.png')
+        def get_kindle_dashboard_paperwhite():
+            """Generate Kindle Paperwhite dashboard image (758x1024 grayscale PNG)."""
+            try:
+                # Test imports first
+                try:
+                    from ..kindle.dashboard_generator import generate_dashboard_image
+                except ImportError as ie:
+                    self.logger.error(f"Failed to import dashboard_generator: {ie}", exc_info=True)
+                    return Response(f"Import error: {ie}", status=500)
+                
+                # Gather receiver status
+                try:
+                    receivers = self._get_receiver_status()
+                    self.logger.info(f"Kindle dashboard: Got {len(receivers)} receivers")
+                except Exception as e:
+                    self.logger.error(f"Error getting receiver status: {e}", exc_info=True)
+                    receivers = []
+                
+                # Gather active sondes
+                try:
+                    sondes = self._get_active_sondes_for_dashboard()
+                    self.logger.info(f"Kindle dashboard: Got {len(sondes)} sondes")
+                except Exception as e:
+                    self.logger.error(f"Error getting sondes: {e}", exc_info=True)
+                    sondes = []
+                
+                # Match sondes to receivers (add sonde_serial to decoding receivers)
+                for rx in receivers:
+                    if rx.get('state') == 'DECODING':
+                        freq_hz = rx.get('frequency')
+                        if freq_hz:
+                            for s in sondes:
+                                if abs(s.get('frequency', 0) - freq_hz) < 50000:  # 50 kHz tolerance
+                                    rx['sonde_serial'] = s.get('serial', '')
+                                    break
+                
+                # Gather system info
+                try:
+                    system_info = self._get_system_info()
+                except Exception as e:
+                    self.logger.error(f"Error getting system info: {e}", exc_info=True)
+                    system_info = {'uptime_seconds': 0, 'cpu_percent': 0, 'memory_percent': 0}
+                
+                # Get station callsign from config
+                station_callsign = self.config.get('station', {}).get('callsign', 'OpenWXSDR')
+                station_name = f"OpenWX ● SDR - {station_callsign} Gateway"
+                
+                # Generate image
+                try:
+                    image_bytes = generate_dashboard_image(
+                        device_type='paperwhite',
+                        station_name=station_name,
+                        receivers=receivers,
+                        sondes=sondes,
+                        system_info=system_info,
+                        version=__version__
+                    )
+                except Exception as e:
+                    self.logger.error(f"Error in generate_dashboard_image: {e}", exc_info=True)
+                    return Response(f"Image generation error: {e}", status=500)
+                
+                return Response(image_bytes, mimetype='image/png')
+                
+            except Exception as e:
+                self.logger.error(f"Error generating Kindle Paperwhite dashboard: {e}", exc_info=True)
+                return Response(f"Error: {e}", status=500)
+
+        @self.app.route('/api/kindle/receiver/<receiver_id>/touch.png')
+        def get_kindle_receiver_detail_touch(receiver_id):
+            """Generate detailed Kindle Touch dashboard for a specific receiver."""
+            try:
+                from ..kindle.dashboard_generator import generate_receiver_detail_image
+                
+                # Get receiver status
+                try:
+                    receivers = self._get_receiver_status()
+                    receiver = None
+                    for rx in receivers:
+                        if rx.get('device_id') == receiver_id:
+                            receiver = rx
+                            break
+                    
+                    if not receiver:
+                        return Response(f"Receiver {receiver_id} not found", status=404)
+                    
+                    # Ensure spectrum data is included
+                    if receiver.get('state') == 'SCANNING' and not receiver.get('spectrum'):
+                        if hasattr(self.decoder_manager, 'get_spectrum_for_receiver'):
+                            try:
+                                spectrum = self.decoder_manager.get_spectrum_for_receiver(f"rtlsdr:{receiver_id}")
+                                if spectrum:
+                                    receiver['spectrum'] = spectrum
+                            except Exception as e:
+                                self.logger.debug(f"Could not get spectrum for {receiver_id}: {e}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error getting receiver status: {e}", exc_info=True)
+                    return Response(f"Error getting receiver status: {e}", status=500)
+                
+                # Get sonde if decoding
+                sonde = None
+                telemetry_history = None
+                if receiver.get('state') == 'DECODING':
+                    try:
+                        sondes = self._get_active_sondes_for_dashboard()
+                        # Find sonde on this receiver's frequency
+                        freq_hz = receiver.get('frequency')
+                        if freq_hz:
+                            for s in sondes:
+                                if abs(s.get('frequency', 0) - freq_hz) < 50000:  # 50 kHz tolerance
+                                    sonde = s
+                                    # Get telemetry history for this sonde
+                                    serial = s.get('serial')
+                                    if serial and serial in self.sondes:
+                                        telemetry_history = self.sondes[serial][-100:]  # Last 100 points
+                                    break
+                    except Exception as e:
+                        self.logger.error(f"Error getting sonde: {e}", exc_info=True)
+                
+                # Get system info
+                try:
+                    system_info = self._get_system_info()
+                except Exception as e:
+                    self.logger.error(f"Error getting system info: {e}", exc_info=True)
+                    system_info = {'uptime_seconds': 0, 'cpu_percent': 0, 'memory_percent': 0}
+                
+                # Get station name
+                station_callsign = self.config.get('station', {}).get('callsign', 'OpenWXSDR')
+                station_name = f"OpenWX ● SDR - {station_callsign} Gateway"
+                
+                # Generate image
+                try:
+                    image_bytes = generate_receiver_detail_image(
+                        device_type='touch',
+                        station_name=station_name,
+                        receiver=receiver,
+                        sonde=sonde,
+                        system_info=system_info,
+                        version=__version__,
+                        telemetry_history=telemetry_history
+                    )
+                except Exception as e:
+                    self.logger.error(f"Error generating receiver detail: {e}", exc_info=True)
+                    return Response(f"Image generation error: {e}", status=500)
+                
+                return Response(image_bytes, mimetype='image/png')
+                
+            except Exception as e:
+                self.logger.error(f"Error generating receiver detail: {e}", exc_info=True)
+                return Response(f"Error: {e}", status=500)
+
+        @self.app.route('/api/kindle/receiver/<receiver_id>/pw.png')
+        def get_kindle_receiver_detail_paperwhite(receiver_id):
+            """Generate detailed Kindle Paperwhite dashboard for a specific receiver."""
+            try:
+                from ..kindle.dashboard_generator import generate_receiver_detail_image
+                
+                # Get receiver status
+                try:
+                    receivers = self._get_receiver_status()
+                    receiver = None
+                    for rx in receivers:
+                        if rx.get('device_id') == receiver_id:
+                            receiver = rx
+                            break
+                    
+                    if not receiver:
+                        return Response(f"Receiver {receiver_id} not found", status=404)
+                    
+                    # Ensure spectrum data is included
+                    if receiver.get('state') == 'SCANNING' and not receiver.get('spectrum'):
+                        if hasattr(self.decoder_manager, 'get_spectrum_for_receiver'):
+                            try:
+                                spectrum = self.decoder_manager.get_spectrum_for_receiver(f"rtlsdr:{receiver_id}")
+                                if spectrum:
+                                    receiver['spectrum'] = spectrum
+                            except Exception as e:
+                                self.logger.debug(f"Could not get spectrum for {receiver_id}: {e}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error getting receiver status: {e}", exc_info=True)
+                    return Response(f"Error getting receiver status: {e}", status=500)
+                
+                # Get sonde if decoding
+                sonde = None
+                telemetry_history = None
+                if receiver.get('state') == 'DECODING':
+                    try:
+                        sondes = self._get_active_sondes_for_dashboard()
+                        # Find sonde on this receiver's frequency
+                        freq_hz = receiver.get('frequency')
+                        if freq_hz:
+                            for s in sondes:
+                                if abs(s.get('frequency', 0) - freq_hz) < 50000:  # 50 kHz tolerance
+                                    sonde = s
+                                    # Get telemetry history for this sonde
+                                    serial = s.get('serial')
+                                    if serial and serial in self.sondes:
+                                        telemetry_history = self.sondes[serial][-100:]  # Last 100 points
+                                    break
+                    except Exception as e:
+                        self.logger.error(f"Error getting sonde: {e}", exc_info=True)
+                
+                # Get system info
+                try:
+                    system_info = self._get_system_info()
+                except Exception as e:
+                    self.logger.error(f"Error getting system info: {e}", exc_info=True)
+                    system_info = {'uptime_seconds': 0, 'cpu_percent': 0, 'memory_percent': 0}
+                
+                # Get station name
+                station_callsign = self.config.get('station', {}).get('callsign', 'OpenWXSDR')
+                station_name = f"OpenWX ● SDR - {station_callsign} Gateway"
+                
+                # Generate image
+                try:
+                    image_bytes = generate_receiver_detail_image(
+                        device_type='paperwhite',
+                        station_name=station_name,
+                        receiver=receiver,
+                        sonde=sonde,
+                        system_info=system_info,
+                        version=__version__,
+                        telemetry_history=telemetry_history
+                    )
+                except Exception as e:
+                    self.logger.error(f"Error generating receiver detail: {e}", exc_info=True)
+                    return Response(f"Image generation error: {e}", status=500)
+                
+                return Response(image_bytes, mimetype='image/png')
+                
+            except Exception as e:
+                self.logger.error(f"Error generating receiver detail: {e}", exc_info=True)
+                return Response(f"Error: {e}", status=500)
+
+        @self.app.route('/api/kindle/sonde/<sonde_serial>/touch.png')
+        def get_kindle_sonde_detail_touch(sonde_serial):
+            """Generate detailed Kindle Touch dashboard for a specific sonde."""
+            try:
+                from ..kindle.dashboard_generator import generate_receiver_detail_image
+                
+                # Get sonde by serial
+                sonde = None
+                try:
+                    # First try active sondes
+                    sondes = self._get_active_sondes_for_dashboard()
+                    for s in sondes:
+                        if s.get('serial') == sonde_serial:
+                            sonde = s
+                            break
+                    
+                    # If not in active sondes, try to construct from historical data in memory
+                    if not sonde and sonde_serial in self.sondes and len(self.sondes[sonde_serial]) > 0:
+                        # Get last telemetry point
+                        last_telem = self.sondes[sonde_serial][-1]
+                        
+                        # Construct sonde dict from historical data
+                        sonde = {
+                            'serial': sonde_serial,
+                            'type': last_telem.get('type', 'Unknown'),
+                            'frequency': last_telem.get('frequency', 0) * 1e6 if last_telem.get('frequency', 0) < 1000 else last_telem.get('frequency', 0),
+                            'latitude': last_telem.get('lat', 0),
+                            'longitude': last_telem.get('lon', 0),
+                            'altitude': last_telem.get('alt', 0),
+                            'velocity_h': last_telem.get('vel_h', 0),
+                            'velocity_v': last_telem.get('vel_v', 0),
+                            'heading': last_telem.get('heading', 0),
+                            'rssi': last_telem.get('rssi', 0),
+                            'snr': last_telem.get('snr', 0),
+                            'sats': last_telem.get('sats', 0),
+                            'battery': last_telem.get('batt', 0),
+                            'frame': last_telem.get('frame', 0),
+                            'last_update': time.time(),  # Current time as fallback
+                        }
+                        self.logger.info(f"Kindle view: Using in-memory historical data for sonde {sonde_serial}")
+                    
+                    # If still not found, try loading from log files
+                    if not sonde:
+                        sonde = self._load_sonde_from_logs(sonde_serial)
+                    
+                    if not sonde:
+                        return Response(f"Sonde {sonde_serial} not found (not active, not in memory, no log files)", status=404)
+                    
+                except Exception as e:
+                    self.logger.error(f"Error getting sonde: {e}", exc_info=True)
+                    return Response(f"Error getting sonde: {e}", status=500)
+                
+                # Find receiver decoding this sonde
+                receiver = None
+                try:
+                    receivers = self._get_receiver_status()
+                    sonde_freq = sonde.get('frequency', 0)
+                    for rx in receivers:
+                        if rx.get('state') == 'DECODING':
+                            rx_freq = rx.get('frequency', 0)
+                            if abs(sonde_freq - rx_freq) < 50000:  # 50 kHz tolerance
+                                receiver = rx
+                                receiver['sonde_serial'] = sonde_serial
+                                break
+                    
+                    # If no receiver found, create a minimal one
+                    if not receiver:
+                        receiver = {
+                            'device_id': 'Unknown',
+                            'state': 'DECODING',
+                            'frequency': sonde_freq,
+                            'freq_label': f"{sonde_freq/1e6:.3f} MHz",
+                            'sonde_type': sonde.get('type', 'Unknown'),
+                            'sonde_serial': sonde_serial
+                        }
+                except Exception as e:
+                    self.logger.error(f"Error getting receivers: {e}", exc_info=True)
+                    # Create minimal receiver
+                    receiver = {
+                        'device_id': 'Unknown',
+                        'state': 'DECODING',
+                        'frequency': sonde.get('frequency', 0),
+                        'freq_label': f"{sonde.get('frequency', 0)/1e6:.3f} MHz",
+                        'sonde_type': sonde.get('type', 'Unknown'),
+                        'sonde_serial': sonde_serial
+                    }
+                
+                # Get telemetry history for this sonde
+                telemetry_history = None
+                log_receiver_name = None
+                if sonde_serial in self.sondes and len(self.sondes[sonde_serial]) > 0:
+                    telemetry_history = self.sondes[sonde_serial][-100:]  # Last 100 points
+                elif sonde and sonde.get('serial') == sonde_serial:
+                    # If sonde was loaded from log files, load full history too
+                    log_dir = 'data/logs'
+                    if os.path.exists(log_dir):
+                        sonde_logs = []
+                        for fname in os.listdir(log_dir):
+                            if fname.startswith(f"{sonde_serial}-") and fname.endswith('.log'):
+                                sonde_logs.append(os.path.join(log_dir, fname))
+                        if sonde_logs:
+                            logfile = sorted(sonde_logs)[-1]
+                            telemetry_history = self._load_history_from_log(logfile, sonde_serial, sonde.get('type', 'Unknown'))
+                            # Try to extract receiver name from log header
+                            try:
+                                with open(logfile, 'r', encoding='utf-8', errors='ignore') as f:
+                                    for line in f:
+                                        if line.startswith('Receiver:'):
+                                            log_receiver_name = line.split(':', 1)[1].strip()
+                                            break
+                                        # Stop after first few lines (header only)
+                                        if line.startswith('==='):
+                                            break
+                            except Exception:
+                                pass
+                            if telemetry_history:
+                                self.logger.info(f"Loaded {len(telemetry_history)} history points from log for Kindle view")
+                
+                # Update receiver device_id from log if found (prioritize log receiver name for historical sondes)
+                if log_receiver_name:
+                    receiver['device_id'] = log_receiver_name
+                    self.logger.info(f"Updated receiver device_id to {log_receiver_name} from log file")
+                
+                # Get system info
+                try:
+                    system_info = self._get_system_info()
+                except Exception as e:
+                    self.logger.error(f"Error getting system info: {e}", exc_info=True)
+                    system_info = {'uptime_seconds': 0, 'cpu_percent': 0, 'memory_percent': 0}
+                
+                # Get station name
+                station_callsign = self.config.get('station', {}).get('callsign', 'OpenWXSDR')
+                station_name = f"OpenWX ● SDR - {station_callsign} Gateway"
+                
+                # Generate image
+                try:
+                    image_bytes = generate_receiver_detail_image(
+                        device_type='touch',
+                        station_name=station_name,
+                        receiver=receiver,
+                        sonde=sonde,
+                        system_info=system_info,
+                        version=__version__,
+                        telemetry_history=telemetry_history
+                    )
+                except Exception as e:
+                    self.logger.error(f"Error generating sonde detail: {e}", exc_info=True)
+                    return Response(f"Image generation error: {e}", status=500)
+                
+                return Response(image_bytes, mimetype='image/png')
+                
+            except Exception as e:
+                self.logger.error(f"Error generating sonde detail: {e}", exc_info=True)
+                return Response(f"Error: {e}", status=500)
+
+        @self.app.route('/api/kindle/sonde/<sonde_serial>/pw.png')
+        def get_kindle_sonde_detail_paperwhite(sonde_serial):
+            """Generate detailed Kindle Paperwhite dashboard for a specific sonde."""
+            try:
+                from ..kindle.dashboard_generator import generate_receiver_detail_image
+                
+                # Get sonde by serial
+                sonde = None
+                try:
+                    # First try active sondes
+                    sondes = self._get_active_sondes_for_dashboard()
+                    for s in sondes:
+                        if s.get('serial') == sonde_serial:
+                            sonde = s
+                            break
+                    
+                    # If not in active sondes, try to construct from historical data in memory
+                    if not sonde and sonde_serial in self.sondes and len(self.sondes[sonde_serial]) > 0:
+                        # Get last telemetry point
+                        last_telem = self.sondes[sonde_serial][-1]
+                        
+                        # Construct sonde dict from historical data
+                        sonde = {
+                            'serial': sonde_serial,
+                            'type': last_telem.get('type', 'Unknown'),
+                            'frequency': last_telem.get('frequency', 0) * 1e6 if last_telem.get('frequency', 0) < 1000 else last_telem.get('frequency', 0),
+                            'latitude': last_telem.get('lat', 0),
+                            'longitude': last_telem.get('lon', 0),
+                            'altitude': last_telem.get('alt', 0),
+                            'velocity_h': last_telem.get('vel_h', 0),
+                            'velocity_v': last_telem.get('vel_v', 0),
+                            'heading': last_telem.get('heading', 0),
+                            'rssi': last_telem.get('rssi', 0),
+                            'snr': last_telem.get('snr', 0),
+                            'sats': last_telem.get('sats', 0),
+                            'battery': last_telem.get('batt', 0),
+                            'frame': last_telem.get('frame', 0),
+                            'last_update': time.time(),  # Current time as fallback
+                        }
+                        self.logger.info(f"Kindle view: Using in-memory historical data for sonde {sonde_serial}")
+                    
+                    # If still not found, try loading from log files
+                    if not sonde:
+                        sonde = self._load_sonde_from_logs(sonde_serial)
+                    
+                    if not sonde:
+                        return Response(f"Sonde {sonde_serial} not found (not active, not in memory, no log files)", status=404)
+                    
+                except Exception as e:
+                    self.logger.error(f"Error getting sonde: {e}", exc_info=True)
+                    return Response(f"Error getting sonde: {e}", status=500)
+                
+                # Find receiver decoding this sonde
+                receiver = None
+                try:
+                    receivers = self._get_receiver_status()
+                    sonde_freq = sonde.get('frequency', 0)
+                    for rx in receivers:
+                        if rx.get('state') == 'DECODING':
+                            rx_freq = rx.get('frequency', 0)
+                            if abs(sonde_freq - rx_freq) < 50000:  # 50 kHz tolerance
+                                receiver = rx
+                                receiver['sonde_serial'] = sonde_serial
+                                break
+                    
+                    # If no receiver found, create a minimal one
+                    if not receiver:
+                        receiver = {
+                            'device_id': 'Unknown',
+                            'state': 'DECODING',
+                            'frequency': sonde_freq,
+                            'freq_label': f"{sonde_freq/1e6:.3f} MHz",
+                            'sonde_type': sonde.get('type', 'Unknown'),
+                            'sonde_serial': sonde_serial
+                        }
+                except Exception as e:
+                    self.logger.error(f"Error getting receivers: {e}", exc_info=True)
+                    # Create minimal receiver
+                    receiver = {
+                        'device_id': 'Unknown',
+                        'state': 'DECODING',
+                        'frequency': sonde.get('frequency', 0),
+                        'freq_label': f"{sonde.get('frequency', 0)/1e6:.3f} MHz",
+                        'sonde_type': sonde.get('type', 'Unknown'),
+                        'sonde_serial': sonde_serial
+                    }
+                
+                # Get telemetry history for this sonde
+                telemetry_history = None
+                log_receiver_name = None
+                if sonde_serial in self.sondes and len(self.sondes[sonde_serial]) > 0:
+                    telemetry_history = self.sondes[sonde_serial][-100:]  # Last 100 points
+                elif sonde and sonde.get('serial') == sonde_serial:
+                    # If sonde was loaded from log files, load full history too
+                    log_dir = 'data/logs'
+                    if os.path.exists(log_dir):
+                        sonde_logs = []
+                        for fname in os.listdir(log_dir):
+                            if fname.startswith(f"{sonde_serial}-") and fname.endswith('.log'):
+                                sonde_logs.append(os.path.join(log_dir, fname))
+                        if sonde_logs:
+                            logfile = sorted(sonde_logs)[-1]
+                            telemetry_history = self._load_history_from_log(logfile, sonde_serial, sonde.get('type', 'Unknown'))
+                            # Try to extract receiver name from log header
+                            try:
+                                with open(logfile, 'r', encoding='utf-8', errors='ignore') as f:
+                                    for line in f:
+                                        if line.startswith('Receiver:'):
+                                            log_receiver_name = line.split(':', 1)[1].strip()
+                                            break
+                                        # Stop after first few lines (header only)
+                                        if line.startswith('==='):
+                                            break
+                            except Exception:
+                                pass
+                            if telemetry_history:
+                                self.logger.info(f"Loaded {len(telemetry_history)} history points from log for Kindle view")
+                
+                # Update receiver device_id from log if found (prioritize log receiver name for historical sondes)
+                if log_receiver_name:
+                    receiver['device_id'] = log_receiver_name
+                    self.logger.info(f"Updated receiver device_id to {log_receiver_name} from log file")
+                
+                # Get system info
+                try:
+                    system_info = self._get_system_info()
+                except Exception as e:
+                    self.logger.error(f"Error getting system info: {e}", exc_info=True)
+                    system_info = {'uptime_seconds': 0, 'cpu_percent': 0, 'memory_percent': 0}
+                
+                # Get station name
+                station_callsign = self.config.get('station', {}).get('callsign', 'OpenWXSDR')
+                station_name = f"OpenWX ● SDR - {station_callsign} Gateway"
+                
+                # Generate image
+                try:
+                    image_bytes = generate_receiver_detail_image(
+                        device_type='paperwhite',
+                        station_name=station_name,
+                        receiver=receiver,
+                        sonde=sonde,
+                        system_info=system_info,
+                        version=__version__,
+                        telemetry_history=telemetry_history
+                    )
+                except Exception as e:
+                    self.logger.error(f"Error generating sonde detail: {e}", exc_info=True)
+                    return Response(f"Image generation error: {e}", status=500)
+                
+                return Response(image_bytes, mimetype='image/png')
+                
+            except Exception as e:
+                self.logger.error(f"Error generating sonde detail: {e}", exc_info=True)
+                return Response(f"Error: {e}", status=500)
 
         @self.app.route('/api/service_status')
         def get_service_status():
@@ -1178,6 +2036,401 @@ class WebUI:
                 self.logger.error(f"Error parsing logfile history: {e}")
                 return jsonify({'error': str(e)}), 500
         
+        @self.app.route('/api/logfile/<filename>/rx_statistics')
+        def get_rx_statistics(filename):
+            """Parse activity logfile and return receiver statistics"""
+            try:
+                log_dir = 'data/logs'
+                # Security: prevent directory traversal
+                if '..' in filename or '/' in filename or '\\' in filename:
+                    return jsonify({'error': 'Invalid filename'}), 400
+                
+                filepath = os.path.join(log_dir, filename)
+                if not os.path.exists(filepath):
+                    return jsonify({'error': 'File not found'}), 404
+                
+                # Must be an activity log
+                if not filename.startswith('openwxsdr_'):
+                    return jsonify({'error': 'Not an activity log'}), 400
+                
+                # Parse JSON activity log
+                decoder_events = []
+                sonde_events = []
+                sonde_stopped_events = []
+                rssi_values = []
+                sats_values = []
+                # Map frequency to sonde type from decoder_start events
+                freq_to_sonde_type = {}
+                
+                with open(filepath, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                            event_type = event.get('action')  # Changed from 'event' to 'action'
+                            timestamp = event.get('datetime')  # Changed from 'timestamp' to 'datetime'
+                            
+                            # Decoder start/stop events
+                            if event_type in ['decoder_start', 'decoder_stop']:
+                                freq = event.get('data', {}).get('frequency_mhz')
+                                stype = event.get('data', {}).get('sonde_type')
+                                
+                                # Store frequency → sonde_type mapping from decoder_start
+                                if event_type == 'decoder_start' and freq and stype:
+                                    freq_to_sonde_type[round(freq, 2)] = stype
+                                
+                                decoder_events.append({
+                                    'timestamp': timestamp,
+                                    'event': event_type,
+                                    'frequency': freq,
+                                    'sonde_type': stype
+                                })
+                            
+                            # Sonde first frame events
+                            elif event_type == 'sonde_first_frame':
+                                data = event.get('data', {})
+                                stype = data.get('sonde_type', '').strip()
+                                freq = data.get('frequency_mhz')
+                                serial = data.get('serial', '')
+                                
+                                # If sonde_type is empty, try to determine from frequency mapping
+                                if not stype and freq:
+                                    freq_rounded = round(freq, 2)
+                                    stype = freq_to_sonde_type.get(freq_rounded, '')
+                                
+                                # If still empty, use serial pattern as fallback
+                                # NOTE: Serial IDs no longer have M10-/M20-/DFM-/iMet- prefixes
+                                if not stype and serial:
+                                    # M10/M20: Often contains hyphens like "310-2-02647"
+                                    if '-' in serial and serial[0].isdigit():
+                                        stype = 'M20'  # Default to M20 for hyphenated numeric serials
+                                    # DFM: 8 digits (no prefix anymore)
+                                    elif serial.isdigit() and len(serial) == 8:
+                                        stype = 'DFM'
+                                    # RS41: Starts with letter followed by 7-8 digits
+                                    elif serial[0].isalpha() and serial[1:].isdigit() and len(serial) in (8, 9):
+                                        stype = 'RS41'
+                                    # iMet: Often numeric or alphanumeric
+                                    elif serial.startswith('iMet') or serial.startswith('IMET'):
+                                        stype = 'iMet'
+                                    else:
+                                        stype = 'Unknown'
+                                
+                                sonde_events.append({
+                                    'timestamp': timestamp,
+                                    'serial': serial,
+                                    'sonde_type': stype,
+                                    'frequency': freq,
+                                    'rssi': data.get('rssi'),
+                                    'snr': data.get('snr'),
+                                    'sats': data.get('sats'),
+                                    'alt': data.get('alt')  # Include altitude
+                                })
+                                
+                                # Collect RSSI and sats values
+                                if data.get('rssi') is not None:
+                                    rssi_values.append(data.get('rssi'))
+                                if data.get('sats') is not None:
+                                    sats_values.append(data.get('sats'))
+                            
+                            # Sonde stopped events (for frame counts)
+                            elif event_type == 'sonde_stopped':
+                                data = event.get('data', {})
+                                sonde_stopped_events.append({
+                                    'timestamp': timestamp,
+                                    'serial': data.get('serial'),
+                                    'total_frames': data.get('total_frames', 0)
+                                })
+                        
+                        except json.JSONDecodeError:
+                            continue
+                
+                # Calculate statistics - count unique sondes by serial
+                total_sondes = len(set(sonde['serial'] for sonde in sonde_events if sonde.get('serial')))
+                avg_rssi = sum(rssi_values) / len(rssi_values) if rssi_values else 0
+                avg_sats = sum(sats_values) / len(sats_values) if sats_values else 0
+                
+                # Group sondes by day for timeline (count unique sondes per day)
+                sondes_by_day = {}
+                for sonde in sonde_events:
+                    try:
+                        # Parse datetime in format: '2026-06-17 12:34:56'
+                        dt = datetime.strptime(sonde['timestamp'], '%Y-%m-%d %H:%M:%S')
+                        day_key = dt.strftime('%Y-%m-%d')
+                        if day_key not in sondes_by_day:
+                            sondes_by_day[day_key] = set()
+                        sondes_by_day[day_key].add(sonde['serial'])
+                    except:
+                        pass
+                
+                # Convert sets to counts
+                sonde_timeline = {day: len(serials) for day, serials in sondes_by_day.items()}
+                
+                # Calculate number of recorded days
+                recorded_days = len(sondes_by_day)
+                
+                # Calculate max sondes per day with date
+                max_sondes_per_day = 0
+                max_sondes_date = None
+                if sonde_timeline:
+                    max_day = max(sonde_timeline.items(), key=lambda x: (x[1], x[0]))  # Sort by count, then by date (latest)
+                    max_sondes_per_day = max_day[1]
+                    max_sondes_date = max_day[0]
+                
+                # Calculate frames per day from sonde_stopped events
+                frames_by_day = {}
+                total_frames_from_stopped = 0
+                for stopped in sonde_stopped_events:
+                    try:
+                        dt = datetime.strptime(stopped['timestamp'], '%Y-%m-%d %H:%M:%S')
+                        day_key = dt.strftime('%Y-%m-%d')
+                        frames = stopped.get('total_frames', 0)
+                        if day_key not in frames_by_day:
+                            frames_by_day[day_key] = 0
+                        frames_by_day[day_key] += frames
+                        total_frames_from_stopped += frames
+                    except:
+                        pass
+                
+                # Group sonde types by unique serials (not total events)
+                sonde_types_serials = {}
+                for sonde in sonde_events:
+                    stype = sonde.get('sonde_type', 'Unknown')
+                    serial = sonde.get('serial')
+                    if serial:
+                        if stype not in sonde_types_serials:
+                            sonde_types_serials[stype] = set()
+                        sonde_types_serials[stype].add(serial)
+                
+                # Convert sets to counts
+                sonde_types = {stype: len(serials) for stype, serials in sonde_types_serials.items()}
+                
+                # Get unique frequencies (rounded to 2 decimals) with dates
+                from datetime import date as date_class
+                today = date_class.today().strftime('%Y-%m-%d')
+                frequencies_with_dates = {}
+                for sonde in sonde_events:
+                    freq = sonde.get('frequency')
+                    timestamp = sonde.get('timestamp')
+                    if freq is not None and timestamp:
+                        freq_rounded = round(freq, 2)
+                        try:
+                            dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+                            day_key = dt.strftime('%Y-%m-%d')
+                            if freq_rounded not in frequencies_with_dates:
+                                frequencies_with_dates[freq_rounded] = {'total': 0, 'today': 0}
+                            frequencies_with_dates[freq_rounded]['total'] += 1
+                            if day_key == today:
+                                frequencies_with_dates[freq_rounded]['today'] += 1
+                        except:
+                            pass
+                
+                # Get first frame altitude per sonde serial (for altitude chart)
+                # Read ACTUAL first frame from sonde logfiles, not from activity log
+                sonde_altitudes_dict = {}
+                last_sonde_altitudes_dict = {}
+                
+                # Build set of unique serials from sonde_events
+                unique_serials = set(s.get('serial') for s in sonde_events if s.get('serial'))
+                
+                log_dir = 'data/logs'
+                if os.path.exists(log_dir):
+                    # CRITICAL: list the directory ONCE, not once per unique serial.
+                    # This endpoint re-listed data/logs inside the loop below for
+                    # every distinct sonde ever seen in the activity log — on a
+                    # gateway with a long tracking history (hundreds of serials),
+                    # that's hundreds of redundant directory listings and was the
+                    # main reason RX statistics got slower the longer a gateway
+                    # had been running.
+                    all_log_files = os.listdir(log_dir)
+
+                    for serial in unique_serials:
+                        # Find log files for this serial
+                        prefix = f"{serial}-"
+                        sonde_logs = [
+                            os.path.join(log_dir, fname) for fname in all_log_files
+                            if fname.startswith(prefix) and fname.endswith('.log')
+                        ]
+
+                        if not sonde_logs:
+                            continue
+                        
+                        # Sort logs by filename (contains timestamp)
+                        sorted_logs = sorted(sonde_logs)
+                        oldest_log = sorted_logs[0]   # First session
+                        newest_log = sorted_logs[-1]  # Last/most recent session
+                        
+                        sonde_type = 'Unknown'
+                        
+                        # Read FIRST frame altitude from OLDEST logfile
+                        try:
+                            first_alt = None
+                            
+                            with open(oldest_log, 'r', encoding='utf-8', errors='ignore') as f:
+                                in_frame = False
+                                for line in f:
+                                    line = line.strip()
+                                    
+                                    # Extract sonde type from header
+                                    if line.startswith('Sonde:') and '(' in line:
+                                        try:
+                                            sonde_type = line.split('(')[1].split(')')[0].strip()
+                                        except:
+                                            pass
+                                    
+                                    # Detect frame start
+                                    if line.startswith('Frame '):
+                                        in_frame = True
+                                    
+                                    # Extract altitude (only store FIRST occurrence)
+                                    elif in_frame and line.startswith('Altitude:'):
+                                        try:
+                                            frame_alt = float(line.split(':')[1].replace('m', '').strip())
+                                            if first_alt is None:
+                                                first_alt = frame_alt  # Store FIRST altitude only
+                                                break  # Stop after finding first altitude
+                                        except:
+                                            pass
+                            
+                            # Store first altitude
+                            if first_alt is not None:
+                                sonde_altitudes_dict[serial] = {
+                                    'serial': serial,
+                                    'altitude': first_alt,
+                                    'sonde_type': sonde_type
+                                }
+                        except Exception as e:
+                            self.logger.warning(f"Error reading first altitude from {oldest_log}: {e}")
+                        
+                        # Read LAST frame altitude from NEWEST logfile.
+                        # CRITICAL: only scan the trailing chunk of the file, not the
+                        # whole thing. A long flight can produce tens of thousands of
+                        # frame lines; reading every line just to keep overwriting
+                        # last_alt until EOF made this endpoint's cost scale with the
+                        # total size of every sonde's logfile ever recorded — the
+                        # other dominant cost alongside the listdir-per-serial issue
+                        # above. A frame block is a few hundred bytes at most, so the
+                        # last complete one is always well within the final 32 KB.
+                        try:
+                            last_alt = None
+                            file_size = os.path.getsize(newest_log)
+
+                            # The "Sonde: ... (TYPE)" header only ever appears near the
+                            # TOP of the file, which the tail-only read below would miss
+                            # for a large newest_log if sonde_type wasn't already resolved
+                            # from oldest_log (multi-session sonde, different type per
+                            # session). Read a small bounded head chunk just for that.
+                            if sonde_type == 'Unknown':
+                                with open(newest_log, 'rb') as f:
+                                    head_data = f.read(4096)
+                                for line in head_data.decode('utf-8', errors='ignore').splitlines():
+                                    line = line.strip()
+                                    if line.startswith('Sonde:') and '(' in line:
+                                        try:
+                                            sonde_type = line.split('(')[1].split(')')[0].strip()
+                                        except:
+                                            pass
+                                        break
+
+                            tail_bytes = 32768
+                            with open(newest_log, 'rb') as f:
+                                f.seek(max(0, file_size - tail_bytes))
+                                tail_data = f.read()
+                            tail_text = tail_data.decode('utf-8', errors='ignore')
+
+                            in_frame = False
+                            for line in tail_text.splitlines():
+                                line = line.strip()
+
+                                # Detect frame start
+                                if line.startswith('Frame '):
+                                    in_frame = True
+
+                                # Extract altitude (always update to get LAST occurrence)
+                                elif in_frame and line.startswith('Altitude:'):
+                                    try:
+                                        last_alt = float(line.split(':')[1].replace('m', '').strip())
+                                    except:
+                                        pass
+
+                            # Store last altitude
+                            if last_alt is not None:
+                                last_sonde_altitudes_dict[serial] = {
+                                    'serial': serial,
+                                    'altitude': last_alt,
+                                    'sonde_type': sonde_type
+                                }
+                        except Exception as e:
+                            self.logger.warning(f"Error reading last altitude from {newest_log}: {e}")
+                
+                # Fallback: use altitude from activity log if logfile read failed
+                # NOTE: Only fallback for FIRST frame altitude, not last
+                # (last frame requires actual logfile data to be meaningful)
+                for sonde in sonde_events:
+                    serial = sonde.get('serial')
+                    alt = sonde.get('alt')
+                    sonde_type = sonde.get('sonde_type', 'Unknown')
+                    if serial and alt is not None:
+                        # Add to first frame altitude if no logfile data
+                        if serial not in sonde_altitudes_dict:
+                            sonde_altitudes_dict[serial] = {
+                                'serial': serial,
+                                'altitude': alt,
+                                'sonde_type': sonde_type
+                            }
+                        # DO NOT add to last frame altitude - only show sondes with logfiles
+                        # This prevents showing identical first/last values for sondes without logfiles
+                
+                # Convert to lists
+                sonde_altitudes = list(sonde_altitudes_dict.values())
+                last_sonde_altitudes = list(last_sonde_altitudes_dict.values())
+                
+                # Create RSSI timeline (RSSI values with timestamps)
+                rssi_timeline = []
+                for sonde in sonde_events:
+                    if sonde.get('rssi') is not None:
+                        rssi_timeline.append({
+                            'timestamp': sonde.get('timestamp'),
+                            'rssi': sonde.get('rssi'),
+                            'serial': sonde.get('serial')
+                        })
+                
+                # Get today's frame count from frames_by_day (using 'today' calculated earlier)
+                frames_today = frames_by_day.get(today, 0)
+                
+                return jsonify({
+                    'success': True,
+                    'decoder_events': decoder_events,
+                    'sonde_events': sonde_events,
+                    'sonde_timeline': sonde_timeline,
+                    'frames_timeline': frames_by_day,
+                    'rssi_values': rssi_values,
+                    'rssi_timeline': rssi_timeline,
+                    'sats_values': sats_values,
+                    'sonde_types': sonde_types,
+                    'frequencies': frequencies_with_dates,
+                    'sonde_altitudes': sonde_altitudes,
+                    'last_sonde_altitudes': last_sonde_altitudes,
+                    'statistics': {
+                        'total_sondes': total_sondes,
+                        'total_decoder_starts': len([e for e in decoder_events if e['event'] == 'decoder_start']),
+                        'avg_rssi': round(avg_rssi, 1),
+                        'avg_sats': round(avg_sats, 1),
+                        'total_frames': frames_today,
+                        'total_frames_from_stopped': total_frames_from_stopped,
+                        'recorded_days': recorded_days,
+                        'max_sondes_per_day': max_sondes_per_day,
+                        'max_sondes_date': max_sondes_date
+                    }
+                })
+            except Exception as e:
+                self.logger.error(f"Error parsing RX statistics: {e}")
+                import traceback
+                traceback.print_exc()
+                return jsonify({'error': str(e)}), 500
+        
         @self.app.route('/api/export_action_log')
         def export_action_log():
             """Export the structured action log for download"""
@@ -1281,11 +2534,12 @@ class WebUI:
             self.logger.error(f"Error applying logging levels: {e}")
     
     def set_components(self, spectrum_analyzer=None, decoder_manager=None, flux242_receiver=None,
-                       mqtt_output=None, sondehub_output=None):
+                       ka9q_receiver=None, mqtt_output=None, sondehub_output=None):
         """Set references to other components for health monitoring"""
         self.spectrum_analyzer = spectrum_analyzer
         self.decoder_manager = decoder_manager
         self.flux242_receiver = flux242_receiver
+        self.ka9q_receiver = ka9q_receiver
         self.mqtt_output = mqtt_output
         self.sondehub_output = sondehub_output
         self._connected_serials_cache: Set[str] = set()
@@ -1343,6 +2597,315 @@ class WebUI:
             # If rtl_test fails, fall back to showing all configured devices
             return None
     
+    def _get_receiver_status(self) -> List[Dict]:
+        """Gather current receiver status for Kindle dashboard.
+        
+        Returns:
+            List of receiver status dicts with keys:
+                - device_id: str (e.g. "RTL00001")
+                - state: str ("SCANNING", "DECODING", "IDLE", etc.)
+                - frequency: Optional[float] in Hz
+                - freq_label: str (formatted frequency or range)
+                - sonde_type: Optional[str] sonde type being decoded
+                - spectrum: Optional[Dict] spectrum data if scanning
+        """
+        receivers = []
+        
+        # Check if using RTL-SDR device manager
+        if self.decoder_manager and hasattr(self.decoder_manager, 'get_worker_status'):
+            try:
+                worker_statuses = self.decoder_manager.get_worker_status()
+                for ws in worker_statuses:
+                    state_map = {
+                        'idle': 'IDLE',
+                        'scanning': 'SCANNING',
+                        'decoding': 'DECODING'
+                    }
+                    # Convert frequency from MHz to Hz if present
+                    freq_hz = None
+                    if ws.get('frequency'):
+                        freq_hz = ws['frequency'] * 1e6  # MHz -> Hz
+                    
+                    state = state_map.get(ws.get('state', 'idle').lower(), 'IDLE')
+                    device_id = ws.get('serial', 'Unknown')
+                    
+                    rx_dict = {
+                        'device_id': device_id,
+                        'state': state,
+                        'frequency': freq_hz,
+                        'freq_label': ws.get('freq_label', ''),
+                        'sonde_type': ws.get('sonde_type'),
+                    }
+                    
+                    # Add spectrum data if scanning
+                    if state == 'SCANNING' and hasattr(self.decoder_manager, 'get_spectrum_for_receiver'):
+                        try:
+                            receiver_id = f"rtlsdr:{device_id}"
+                            spectrum = self.decoder_manager.get_spectrum_for_receiver(receiver_id)
+                            if spectrum and spectrum.get('freqs_mhz'):
+                                rx_dict['spectrum'] = spectrum
+                        except Exception as e:
+                            self.logger.debug(f"Could not get spectrum for {device_id}: {e}")
+                    
+                    receivers.append(rx_dict)
+            except Exception as e:
+                self.logger.error(f"Error getting worker status: {e}")
+        
+        # Fallback: create placeholder receivers if none found
+        if not receivers:
+            for i in range(4):  # Assume 4 RTL-SDR devices
+                receivers.append({
+                    'device_id': f"RTL{i:05d}",
+                    'state': 'IDLE',
+                    'frequency': None,
+                    'freq_label': '',
+                    'sonde_type': None,
+                })
+        
+        return receivers
+    
+    def _get_active_sondes_for_dashboard(self) -> List[Dict]:
+        """Gather active sonde telemetry for Kindle dashboard.
+        
+        Returns:
+            List of sonde dicts with simplified telemetry data
+        """
+        sondes = []
+        now_iso = datetime.utcnow().isoformat() + 'Z'
+        
+        with self.lock:
+            for serial, telemetry_list in self.sondes.items():
+                if not telemetry_list:
+                    continue
+                
+                # Get latest telemetry point
+                latest = telemetry_list[-1]
+                
+                # Check if sonde is still active using reception_time
+                reception_time_str = latest.get('reception_time', latest.get('timestamp', ''))
+                if not reception_time_str:
+                    continue
+                
+                try:
+                    # Parse ISO format datetime
+                    reception_dt = datetime.fromisoformat(reception_time_str.replace('Z', '+00:00'))
+                    now_dt = datetime.fromisoformat(now_iso.replace('Z', '+00:00'))
+                    age_seconds = (now_dt - reception_dt).total_seconds()
+                    
+                    # Skip if older than retention time
+                    if age_seconds > self.sonde_retention_time:
+                        continue
+                        
+                    last_update = time.time() - age_seconds
+                except Exception:
+                    # If datetime parsing fails, skip this sonde
+                    continue
+                
+                # Extract relevant data using correct field names from to_dict()
+                sondes.append({
+                    'serial': serial,
+                    'type': latest.get('type', '?'),
+                    'frequency': latest.get('frequency', 0) * 1e6,  # Convert MHz to Hz
+                    'altitude': latest.get('alt', 0),
+                    'latitude': latest.get('lat', 0),
+                    'longitude': latest.get('lon', 0),
+                    'temperature': latest.get('temp'),
+                    'humidity': latest.get('humidity'),
+                    'pressure': latest.get('pressure'),
+                    'velocity_v': latest.get('vel_v', 0),
+                    'velocity_h': latest.get('vel_h', 0),
+                    'heading': latest.get('heading', 0),
+                    'battery': latest.get('batt', 0),
+                    'sats': latest.get('sats', 0),
+                    'snr': latest.get('snr', 0),
+                    'rssi': latest.get('rssi', 0),
+                    'last_update': last_update,
+                })
+        
+        # Sort by most recent first
+        sondes.sort(key=lambda s: s.get('last_update', 0), reverse=True)
+        
+        return sondes
+    
+    def _load_sonde_from_logs(self, sonde_serial: str) -> Optional[Dict]:
+        """Load sonde data from log files when not in active memory.
+        
+        Args:
+            sonde_serial: Sonde serial number to search for
+            
+        Returns:
+            Sonde dict with telemetry data, or None if not found
+        """
+        log_dir = 'data/logs'
+        if not os.path.exists(log_dir):
+            return None
+        
+        # Find log files for this sonde
+        sonde_logs = []
+        try:
+            for fname in os.listdir(log_dir):
+                if fname.startswith(f"{sonde_serial}-") and fname.endswith('.log'):
+                    sonde_logs.append(os.path.join(log_dir, fname))
+        except Exception as e:
+            self.logger.error(f"Error reading log directory: {e}")
+            return None
+        
+        if not sonde_logs:
+            self.logger.debug(f"No log files found for sonde {sonde_serial}")
+            return None
+        
+        # Use most recent log file
+        logfile = sorted(sonde_logs)[-1]
+        self.logger.info(f"Loading sonde {sonde_serial} from log file: {logfile}")
+        
+        # Parse log file to extract telemetry
+        sonde_data = {
+            'serial': sonde_serial,
+            'type': 'Unknown',
+            'frequency': 0,
+            'latitude': 0,
+            'longitude': 0,
+            'altitude': 0,
+            'velocity_h': 0,
+            'velocity_v': 0,
+            'heading': 0,
+            'rssi': None,
+            'snr': None,
+            'sats': 0,
+            'battery': 0,
+            'frame': 0,
+            'last_update': time.time(),
+        }
+        
+        try:
+            with open(logfile, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+                
+                # Extract sonde type from header
+                for line in lines[:10]:
+                    if line.startswith('Sonde:'):
+                        match = re.search(r'\((\w+)\)', line)
+                        if match:
+                            sonde_data['type'] = match.group(1)
+                            break
+                
+                # Parse last complete frame
+                frame_count = 0
+                for i, line in enumerate(lines):
+                    line = line.strip()
+                    
+                    if line.startswith('Frame '):
+                        frame_count += 1
+                        sonde_data['frame'] = frame_count
+                        
+                    elif line.startswith('Position:'):
+                        try:
+                            parts = line.split(':', 1)[1].strip().split(',')
+                            sonde_data['latitude'] = float(parts[0].strip())
+                            sonde_data['longitude'] = float(parts[1].strip())
+                        except Exception:
+                            pass
+                            
+                    elif line.startswith('Altitude:'):
+                        try:
+                            sonde_data['altitude'] = float(line.split(':', 1)[1].replace('m', '').strip())
+                        except Exception:
+                            pass
+                            
+                    elif line.startswith('Velocity H/V:'):
+                        try:
+                            parts = line.split(':', 1)[1].strip().split('/')
+                            sonde_data['velocity_h'] = float(parts[0].strip())
+                            sonde_data['velocity_v'] = float(parts[1].replace('m/s', '').strip())
+                        except Exception:
+                            pass
+                            
+                    elif line.startswith('Heading:'):
+                        try:
+                            sonde_data['heading'] = float(line.split(':', 1)[1].replace('°', '').strip())
+                        except Exception:
+                            pass
+                            
+                    elif line.startswith('Frequency:'):
+                        try:
+                            freq_mhz = float(line.split(':', 1)[1].replace('MHz', '').strip())
+                            sonde_data['frequency'] = freq_mhz * 1e6  # Convert to Hz
+                        except Exception:
+                            pass
+                            
+                    elif line.startswith('RSSI:'):
+                        try:
+                            sonde_data['rssi'] = float(line.split(':', 1)[1].replace('dB', '').strip())
+                        except Exception:
+                            pass
+                            
+                    elif line.startswith('SNR:'):
+                        try:
+                            sonde_data['snr'] = float(line.split(':', 1)[1].replace('dB', '').strip())
+                        except Exception:
+                            pass
+                            
+                    elif line.startswith('Satellites:'):
+                        try:
+                            sonde_data['sats'] = int(line.split(':', 1)[1].strip())
+                        except Exception:
+                            pass
+                            
+                    elif line.startswith('Battery:'):
+                        try:
+                            sonde_data['battery'] = float(line.split(':', 1)[1].replace('V', '').strip())
+                        except Exception:
+                            pass
+                
+                # Check if we got valid position data
+                if sonde_data['latitude'] == 0 and sonde_data['longitude'] == 0:
+                    self.logger.warning(f"No valid position data found in log for {sonde_serial}")
+                    return None
+                    
+                return sonde_data
+                
+        except Exception as e:
+            self.logger.error(f"Error parsing log file {logfile}: {e}")
+            return None
+    
+    def _get_system_info(self) -> Dict:
+        """Gather system information for Kindle dashboard.
+        
+        Returns:
+            Dict with uptime_seconds, cpu_percent, memory_percent
+        """
+        system_info = {}
+        
+        try:
+            if PSUTIL_AVAILABLE:
+                # Get system uptime
+                boot_time = psutil.boot_time()
+                system_info['uptime_seconds'] = time.time() - boot_time
+                
+                # Get CPU and memory usage
+                system_info['cpu_percent'] = psutil.cpu_percent(interval=0.1)
+                system_info['memory_percent'] = psutil.virtual_memory().percent
+            else:
+                # Fallback: read uptime from /proc (Linux only)
+                try:
+                    with open('/proc/uptime', 'r') as f:
+                        uptime_seconds = float(f.readline().split()[0])
+                        system_info['uptime_seconds'] = uptime_seconds
+                except:
+                    system_info['uptime_seconds'] = 0
+                
+                system_info['cpu_percent'] = 0
+                system_info['memory_percent'] = 0
+        except Exception as e:
+            self.logger.error(f"Error gathering system info: {e}")
+            system_info = {
+                'uptime_seconds': 0,
+                'cpu_percent': 0,
+                'memory_percent': 0,
+            }
+        
+        return system_info
+    
     def start(self):
         """Start Flask server in background thread"""
         if not self.enabled:
@@ -1397,9 +2960,15 @@ class WebUI:
         with self.lock:
             serial = telemetry.serial
             
+            # Increment frame count for this sonde
+            if serial not in self.sonde_frame_counts:
+                self.sonde_frame_counts[serial] = 0
+            self.sonde_frame_counts[serial] += 1
+            
             # Initialize list for new sonde
             if serial not in self.sondes:
                 self.sondes[serial] = []
+                self.total_sondes_received += 1  # Increment unique sonde counter
                 
                 # Only log and create file for valid serials
                 if self._is_valid_serial(serial):
@@ -1438,6 +3007,8 @@ class WebUI:
                             with open(logfile, 'w') as f:
                                 f.write(f"OpenWXSDR Sonde Log\n")
                                 f.write(f"Sonde: {serial} ({telemetry.sonde_type})\n")
+                                receiver_name = telemetry.receiver_device if telemetry.receiver_device else 'Unknown'
+                                f.write(f"Receiver: {receiver_name}\n")
                                 f.write(f"Started: {datetime.now().isoformat()}\n")
                                 f.write(f"{'='*80}\n\n")
                         except Exception as e:
@@ -1470,8 +3041,10 @@ class WebUI:
                             f.write(f"  Position: {data['lat']:.5f}, {data['lon']:.5f}\n")
                         if data.get('alt') is not None:
                             f.write(f"  Altitude: {data['alt']:.1f} m\n")
+                        # CRITICAL: Write vel_v only if it exists, don't default to 0
                         if data.get('vel_h') is not None:
-                            f.write(f"  Velocity H/V: {data['vel_h']:.1f}/{data.get('vel_v', 0):.1f} m/s\n")
+                            vel_v_str = f"{data['vel_v']:.1f}" if data.get('vel_v') is not None else "N/A"
+                            f.write(f"  Velocity H/V: {data['vel_h']:.1f}/{vel_v_str} m/s\n")
                         if data.get('heading') is not None:
                             f.write(f"  Heading: {data['heading']:.0f}°\n")
                         if data.get('frequency'):
@@ -1510,6 +3083,7 @@ class WebUI:
                         'lon': round(data.get('lon', 0), 5),
                         'alt': round(data.get('alt', 0), 1) if data.get('alt') else None,
                         'frame': data.get('frame', 0),
+                        'total_frames': self.sonde_frame_counts.get(serial, 0),
                         'sats': data.get('sats', 0),
                         'rssi': round(data.get('rssi', 0), 1) if data.get('rssi') else None,
                         'snr': round(data.get('snr', 0), 1) if data.get('snr') else None,
@@ -1560,17 +3134,23 @@ class WebUI:
                         # Log last frame before removal
                         if serial in self.sonde_last_frames:
                             last_data = self.sonde_last_frames[serial]
+                            # Calculate total frames for this sonde
+                            total_frames = self.sonde_frame_counts.get(serial, 0)
                             self._log_action('sonde_stopped', {
                                 'serial': serial,
                                 'frequency_mhz': round(last_data.get('frequency', 0), 3),
                                 'sonde_type': last_data.get('sonde_type', ''),
                                 'last_frame': last_data.get('frame', 0),
+                                'total_frames': total_frames,
                                 'lat': round(last_data.get('lat', 0), 5) if last_data.get('lat') else None,
                                 'lon': round(last_data.get('lon', 0), 5) if last_data.get('lon') else None,
                                 'alt': round(last_data.get('alt', 0), 1) if last_data.get('alt') else None,
                                 'reason': 'signal_lost'
                             })
                             del self.sonde_last_frames[serial]
+                            # Also remove frame count when sonde is removed
+                            if serial in self.sonde_frame_counts:
+                                del self.sonde_frame_counts[serial]
                 except:
                     pass
         
@@ -1785,7 +3365,7 @@ class WebUI:
         return ''.join(lines)
 
     def _load_history_from_log(self, logfile: str, serial: str, sonde_type: str) -> List[dict]:
-        """Load historical telemetry points from existing log for track continuity."""
+        """Load historical telemetry points from existing log for track continuity and Kindle graphs."""
         history: List[dict] = []
         try:
             if not os.path.exists(logfile):
@@ -1797,7 +3377,14 @@ class WebUI:
                 'lat': None,
                 'lon': None,
                 'alt': None,
+                'vel_h': None,
+                'vel_v': None,
+                'heading': None,
                 'frequency': None,
+                'rssi': None,
+                'snr': None,
+                'sats': None,
+                'batt': None,
                 'timestamp': None,
             }
 
@@ -1817,7 +3404,14 @@ class WebUI:
                             'lat': None,
                             'lon': None,
                             'alt': None,
+                            'vel_h': None,
+                            'vel_v': None,
+                            'heading': None,
                             'frequency': None,
+                            'rssi': None,
+                            'snr': None,
+                            'sats': None,
+                            'batt': None,
                             'timestamp': ts,
                         }
                     elif line.startswith('Position:'):
@@ -1833,9 +3427,41 @@ class WebUI:
                             current['alt'] = float(line.split(':', 1)[1].replace('m', '').strip())
                         except Exception:
                             pass
+                    elif line.startswith('Velocity H/V:'):
+                        try:
+                            parts = line.split(':', 1)[1].strip().split('/')
+                            current['vel_h'] = float(parts[0].strip())
+                            current['vel_v'] = float(parts[1].replace('m/s', '').strip())
+                        except Exception:
+                            pass
+                    elif line.startswith('Heading:'):
+                        try:
+                            current['heading'] = float(line.split(':', 1)[1].replace('°', '').strip())
+                        except Exception:
+                            pass
                     elif line.startswith('Frequency:'):
                         try:
                             current['frequency'] = float(line.split(':', 1)[1].replace('MHz', '').strip())
+                        except Exception:
+                            pass
+                    elif line.startswith('RSSI:'):
+                        try:
+                            current['rssi'] = float(line.split(':', 1)[1].replace('dB', '').strip())
+                        except Exception:
+                            pass
+                    elif line.startswith('SNR:'):
+                        try:
+                            current['snr'] = float(line.split(':', 1)[1].replace('dB', '').strip())
+                        except Exception:
+                            pass
+                    elif line.startswith('Satellites:'):
+                        try:
+                            current['sats'] = int(line.split(':', 1)[1].strip())
+                        except Exception:
+                            pass
+                    elif line.startswith('Battery:'):
+                        try:
+                            current['batt'] = float(line.split(':', 1)[1].replace('V', '').strip())
                         except Exception:
                             pass
 
@@ -1852,7 +3478,7 @@ class WebUI:
                 history = history[-self.max_track_points:]
 
             if history:
-                self.logger.info(f"Loaded {len(history)} historical points for {serial} from {logfile}")
+                self.logger.info(f"Loaded {len(history)} historical points for {serial} from {logfile} (with full telemetry)")
         except Exception as e:
             self.logger.warning(f"Failed to load history from {logfile}: {e}")
         return history
@@ -2012,29 +3638,5 @@ class WebUI:
         return {
             'hostname': hostname,
             'ip_address': ip_address,
-            'hardware': self._detect_host_hardware(),
+            'hardware': detect_host_hardware(),
         }
-
-    def _detect_host_hardware(self) -> str:
-        """Best-effort hardware description for the host machine."""
-        for path in ('/sys/firmware/devicetree/base/model', '/proc/device-tree/model'):
-            try:
-                if os.path.exists(path):
-                    with open(path, 'r', encoding='utf-8', errors='ignore') as handle:
-                        model = handle.read().strip('\x00\n\r ')
-                        if model:
-                            return model
-            except Exception:
-                pass
-
-        processor = platform.processor().strip()
-        machine = platform.machine().strip()
-        system_name = platform.system().strip()
-        release = platform.release().strip()
-
-        details = ' '.join(part for part in [processor, machine] if part)
-        if not details:
-            details = machine or system_name or 'Unknown hardware'
-        if system_name or release:
-            details = f"{details} ({system_name} {release})".strip()
-        return details
