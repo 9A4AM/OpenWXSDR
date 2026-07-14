@@ -46,6 +46,7 @@ import tempfile
 import os
 import re
 import time
+import math
 from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
 
@@ -99,6 +100,19 @@ class DftDetector:
         self.sample_duration = sample_duration
         self.logger = logging.getLogger('DftDetector')
         self.debug_mode = False  # Can be enabled for detailed correlation parsing logs
+
+        # CRITICAL: install.sh clones rs1729/RS unpinned (plain `git clone` / `git pull`,
+        # no fixed commit or tag), so the exact dft_detect CLI convention actually
+        # installed on a given host is unknown at code-time. Older builds expect
+        # `dft_detect <file> <rate> 16 --iq 0.0 --dc`; newer ("Vigor's fork") builds
+        # expect `dft_detect --dc --iq 0.0 - <rate> 16` reading the samples from
+        # stdin instead of a filename argument. Passing the wrong convention doesn't
+        # error cleanly — the binary tries to parse an argument as if it were sample
+        # data, which is exactly consistent with the "exit code 206 (corrupted input
+        # data)" / "error: wav header" failures seen on every single invocation in
+        # the field. We probe both formats on first use and cache whichever actually
+        # produces parseable output, so this self-adapts to whatever is installed.
+        self._working_format: Optional[str] = None  # 'legacy' or 'modern' once known
         
         # Check if dft_detect is available
         self.available = self._check_availability()
@@ -126,7 +140,7 @@ class DftDetector:
         device_serial: str = "0",
         sample_rate: int = 48000,
         bandwidth: Optional[float] = None
-    ) -> Optional[str]:
+    ) -> Optional[Tuple[str, float]]:
         """
         Detect sonde type using correlation analysis.
         
@@ -142,7 +156,8 @@ class DftDetector:
             bandwidth: Optional bandwidth hint in Hz (for fallback)
             
         Returns:
-            Sonde type string (e.g., 'RS41', 'DFM', 'RS92') or None if no match
+            Tuple of (sonde_type, frequency_offset_hz) or None if no match
+            Example: ('RS41', -125.0) means RS41 detected 125 Hz below center
         """
         if not self.available:
             self.logger.debug("dft_detect not available, skipping correlation detection")
@@ -165,10 +180,11 @@ class DftDetector:
                 if best_match:
                     self.logger.info(
                         f"Detected {best_match.sonde_type} with correlation {best_match.correlation:.3f} "
-                        f"(threshold: {self.THRESHOLDS.get(best_match.sonde_type, 0.5):.3f})"
+                        f"(threshold: {self.THRESHOLDS.get(best_match.sonde_type, 0.5):.3f}), "
+                        f"frequency offset: {best_match.frequency:.1f} Hz"
                     )
-                    return best_match.sonde_type
-                else:
+                    # Return tuple: (sonde_type, frequency_offset) for frequency correction
+                    return (best_match.sonde_type, best_match.frequency)
                     self.logger.info("No sonde type exceeded correlation threshold")
             else:
                 self.logger.warning("dft_detect returned no results")
@@ -306,65 +322,115 @@ class DftDetector:
                 pass
             return None
     
+    def _build_dft_cmd_legacy(self, iq_file: str, sample_rate: int) -> list:
+        """Older rs1729/RS build: dft_detect <file> <rate> 16 --iq 0.0 --dc"""
+        return [
+            self.dft_detect_path,
+            iq_file,
+            str(sample_rate),
+            '16',
+            '--iq',
+            '0.0',
+            '--dc',
+        ]
+
+    def _build_dft_cmd_modern(self, sample_rate: int) -> list:
+        """Newer ("Vigor's fork") build: dft_detect --dc --iq 0.0 - <rate> 16,
+        reading samples from stdin (the '-' placeholder) instead of a filename."""
+        return [
+            self.dft_detect_path,
+            '--dc',
+            '--iq',
+            '0.0',
+            '-',
+            str(sample_rate),
+            '16',
+        ]
+
+    def _run_dft_detect_once(self, iq_file: str, sample_rate: int, fmt: str):
+        """Run a single dft_detect attempt with the given CLI convention.
+        Returns (raw_output, results_dict). A non-empty results_dict is the
+        only reliable signal that we used the CLI convention this binary
+        expects — a clean returncode alone doesn't guarantee that, and a
+        206/non-zero exit code alone doesn't rule it out."""
+        if fmt == 'modern':
+            cmd = self._build_dft_cmd_modern(sample_rate)
+            stdin_file = open(iq_file, 'rb')
+        else:
+            cmd = self._build_dft_cmd_legacy(iq_file, sample_rate)
+            stdin_file = None
+
+        self.logger.debug(f"Running dft_detect ({fmt}): {' '.join(cmd)}")
+        try:
+            result = subprocess.run(
+                cmd,
+                stdin=stdin_file,
+                capture_output=True,
+                timeout=10.0,
+                text=True,
+            )
+        finally:
+            if stdin_file:
+                stdin_file.close()
+
+        if result.returncode != 0:
+            if result.returncode == 206:
+                self.logger.debug(
+                    f"dft_detect ({fmt}) exit code 206 (corrupted input data / "
+                    f"CLI convention mismatch)"
+                )
+            else:
+                self.logger.debug(f"dft_detect ({fmt}) returned non-zero exit code: {result.returncode}")
+            if result.stderr:
+                self.logger.debug(f"dft_detect ({fmt}) stderr: {result.stderr[:200]}")
+
+        output = result.stdout + result.stderr
+        results = self._parse_dft_output(output)
+        return output, results
+
     def _run_dft_detect(self, iq_file: str, sample_rate: int) -> Dict[str, Tuple[float, float]]:
         """
-        Run dft_detect on captured IQ samples.
-        
+        Run dft_detect on captured IQ samples, self-adapting to whichever CLI
+        convention (legacy filename-arg vs. modern stdin) the installed binary
+        actually expects — see the note in __init__ for why this is necessary.
+
         Args:
             iq_file: Path to IQ sample file
             sample_rate: Sample rate in Hz
-            
+
         Returns:
-            Dictionary of {sonde_type: correlation_score}
+            Dictionary of {sonde_type: (correlation_score, frequency_offset)}
         """
+        formats_to_try = (
+            [self._working_format] if self._working_format
+            else ['legacy', 'modern']
+        )
+
         try:
-            # dft_detect command (rs1729/RS format):
-            # Positional args FIRST: input_file sample_rate bits
-            # Options LAST: --iq 0.0 --dc
-            cmd = [
-                self.dft_detect_path,
-                iq_file,          # Input file (MUST be first positional arg)
-                str(sample_rate), # Sample rate (48000 Hz)
-                '16',             # Bit depth (16-bit signed)
-                '--iq', '0.0',    # IQ mode with offset (options come AFTER positional args)
-                '--dc'            # DC offset removal
-            ]
-            
-            self.logger.debug(f"Running dft_detect: {' '.join(cmd)}")
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=10.0,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                # Exit code 206 typically means corrupted/insufficient input data
-                # Often caused by PLL lock failures or USB issues in rtl_fm capture
-                if result.returncode == 206:
-                    self.logger.warning(
-                        f"dft_detect exit code 206 (corrupted input data) - "
-                        f"likely RTL-SDR USB/PLL issue"
-                    )
-                else:
-                    self.logger.warning(f"dft_detect returned non-zero exit code: {result.returncode}")
-                
-                # Log stderr for debugging
-                if result.stderr:
-                    self.logger.debug(f"dft_detect stderr: {result.stderr[:200]}")
-            
-            # Parse output for correlation results
-            # Expected format: "RS41: 0.653" or "DFM: 0.701"
-            output = result.stdout + result.stderr
+            output = ""
+            results: Dict[str, Tuple[float, float]] = {}
+            for fmt in formats_to_try:
+                output, results = self._run_dft_detect_once(iq_file, sample_rate, fmt)
+                if results:
+                    if self._working_format != fmt:
+                        self.logger.info(
+                            f"dft_detect CLI convention detected: '{fmt}' "
+                            f"(caching for subsequent calls)"
+                        )
+                        self._working_format = fmt
+                    break
+
             self.logger.info(f"Correlation output: {output}")
-            results = self._parse_dft_output(output)
-            
             if results:
                 self.logger.info(f"Correlation results: {results}")
-            
+            else:
+                self.logger.warning(
+                    "dft_detect returned no parseable results "
+                    f"(tried format(s): {', '.join(formats_to_try)})"
+                )
+
             return results
-            
+
         except subprocess.TimeoutExpired:
             self.logger.error("dft_detect timed out")
             return {}
@@ -426,7 +492,8 @@ class DftDetector:
 
         for sonde_type, (correlation, freq_offset) in results.items():
             threshold = self.THRESHOLDS.get(sonde_type, 0.6)
-            if correlation < threshold:
+            # CRITICAL: Use math.fabs() to handle negative correlations (M10/M20 phase inversion)
+            if math.fabs(correlation) < threshold:
                 if self.debug_mode:
                     self.logger.debug(
                         f"Rejecting {sonde_type}: corr={correlation:.3f} < threshold={threshold:.3f}, offset={freq_offset:.1f} Hz"

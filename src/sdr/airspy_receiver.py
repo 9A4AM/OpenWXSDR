@@ -954,8 +954,8 @@ class AirspyScanner:
                     f"(ranges={[(lo/1e6,hi/1e6) for lo,hi in self.freq_ranges]})"
                 )
                 continue
-            # Blacklist check
-            if any(abs(freq - bl) < 20_000 for bl in self.blacklist_hz):
+            # Blacklist check (±2.5 kHz tolerance)
+            if any(abs(freq - bl) < 2_500 for bl in self.blacklist_hz):
                 continue
             # De-duplicate nearby peaks
             if any(abs(freq - s.frequency) < MIN_SEP for s in signals):
@@ -1061,7 +1061,7 @@ class AirspyReceiver:
         self._ppm           = int(airspy_cfg.get('ppm_correction', 0))
         self._scan_interval = det_cfg.get('airspy_scan_interval',
                               rx_cfg.get('scan_interval', 15))
-        self._idle_timeout  = 300   # seconds without frames → back to scan
+        self._idle_timeout  = dec_cfg.get('max_idle_time', 300)   # seconds without frames → back to scan
         self._startup_timeout = int(dec_cfg.get('startup_timeout', 10))
 
         # Runtime-mutable: can be changed from the web UI without restart
@@ -2013,6 +2013,7 @@ class AirspyReceiver:
                 serial=sonde_id,
                 frame_number=frame_number,
                 subtype=frame_data.get('subtype'),
+                dfmcode=frame_data.get('dfmcode'),  # DFM type code (e.g., "0xC")
                 position=position,
                 velocity=velocity,
                 environment=environment,

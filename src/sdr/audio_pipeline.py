@@ -210,11 +210,31 @@ class AudioPipeline:
         self._pump_thread = None
 
         if self.rtl_process:
+            # CRITICAL: always confirm the process has actually been reaped
+            # before discarding our reference. Previously, if rtl_fm didn't
+            # exit within 2s of SIGTERM, we sent SIGKILL but never waited for
+            # it to take effect — stop() could return and log "stopped" while
+            # the kernel hadn't yet released rtl_fm's USB interface claim,
+            # causing the *next* device open to fail with
+            # "usb_claim_interface error -6" / LIBUSB_ERROR_BUSY.
             try:
                 self.rtl_process.terminate()
                 self.rtl_process.wait(timeout=2)
-            except:
+            except subprocess.TimeoutExpired:
+                self.logger.warning(
+                    f"rtl_fm (PID {self.rtl_process.pid}) did not exit within 2s "
+                    "of SIGTERM, sending SIGKILL"
+                )
                 self.rtl_process.kill()
+                try:
+                    self.rtl_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.logger.error(
+                        f"rtl_fm (PID {self.rtl_process.pid}) still not reaped "
+                        "after SIGKILL — USB interface may remain busy"
+                    )
+            except Exception as e:
+                self.logger.debug(f"Error terminating rtl_fm: {e}")
             self.rtl_process = None
     
     def stop(self):

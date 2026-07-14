@@ -70,7 +70,7 @@ class DetectedSignal:
 class SpectrumAnalyzer:
     """Analyzes spectrum and detects radiosonde signals"""
     
-    def __init__(self, config: dict, device_config: dict = None):
+    def __init__(self, config: dict, device_config: dict = None, frequency_blacklist: list = None):
         """
         Initialize spectrum analyzer
         
@@ -78,6 +78,7 @@ class SpectrumAnalyzer:
             config: Full application config
             device_config: Specific device configuration (from rtlsdr.devices list)
                           If None, uses first device from config
+            frequency_blacklist: List of frequencies (Hz) to ignore during detection
         """
         self.config = config
         self.logger = logging.getLogger('SpectrumAnalyzer')
@@ -85,6 +86,9 @@ class SpectrumAnalyzer:
         self.running = False
         self.detected_signals: List[DetectedSignal] = []
         self.lock = threading.Lock()
+        
+        # Frequency blacklist (Hz) - ignore these frequencies in detection
+        self.frequency_blacklist = frequency_blacklist or []
         
         # Get device configuration
         if device_config is None:
@@ -223,6 +227,14 @@ class SpectrumAnalyzer:
                 right_idx += 1
             
             bandwidth = abs(freqs[right_idx] - freqs[left_idx])
+            
+            # Check blacklist (±2.5 kHz tolerance)
+            is_blacklisted = any(abs(freq - bl) < 2_500 for bl in self.frequency_blacklist)
+            if is_blacklisted:
+                self.logger.debug(
+                    f"Rejected signal (blacklisted): {freq/1e6:.4f} MHz, SNR: {strength:.1f} dB, BW: {bandwidth/1e3:.1f} kHz"
+                )
+                continue
             
             # Filter by radiosonde typical bandwidth (4-20 kHz)
             if 2000 < bandwidth < 30000:
