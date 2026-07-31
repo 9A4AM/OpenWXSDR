@@ -3,9 +3,48 @@
 A lightweight, efficient radiosonde decoder for Raspberry Pi, designed to work with RTL-SDR, Airspy and KA9Q radio receivers. 
 Using the excellent rs1729/RS decoders embedded into this framework.
 
-## Current Version:** 1.0.52 (July 10, 2026) available:
+## Next Version:** 1.0.60/1.0.61 (July 27, 2026) available soon:
 
-⚠ <u>Important notice:</u> With update to version 1.0.52 upload of radiosonde telemetry to sondehub.org has been further improved.
+⚠ <u>Important notice:</u> From version 1.0.60 and higher upload of radiosonde telemetry to sondehub.org is now available for this sondetypes:
+- RS41
+- DFM06
+- DFM09
+- DFM17
+- M20
+
+We have also uploaded M10 logfiles for a check by sondehub.org and waiting for permission. After this has been granted, the new release will be available soon.
+
+✨ What's New in v1.0.61
+
+#### 📊 Band sweep mode with Frequency repository
+
+- **Band sweep mode**: Scan the complete sondeband with a single SDR
+- **Frequency repository**: Detected frequencies are stored within the session for later decoding
+- **Detection cascade fixed**: Wrong detected sondetype will be skipped for a cooldown period
+
+✨ What's New in v1.0.60
+
+#### 📡 SondeHub Upload Correctness completed, uploaded is being granted with >= V1.0.60)
+
+#### 🎯 Detection Sensivity (optional softchain input)
+
+#### 📊 Inline iq_dec DC removal
+- New decoders.iq_dc_block (default false) routes rtl_fm -M raw cs16 IQ through rs1729 iq_dec (--bo 16, +--IFbw for >80 kHz) before the --IQ decoder (learned from auto_rx)
+
+#### 🔧 Important bugfixes:
+- PTU Data Handling fixed (there was a stupid bug in the recent versions!)
+- Fixed gain:0 deafness, auto-gain was implemented wrong 
+- Incomplete handling of import from api.v2.sondehub.org fixed - distance filter was not working
+
+#### ⚙️ Improved USB Device handling and optional USB reset if device failed during the day
+- Stucked devices will be handle by watchdog and restarted in configured
+
+
+# Please use versions below only standalone! #
+
+## Version:** 1.0.52 (July 10, 2026):
+
+Notice:</u> With update to version 1.0.52 we worked on several improvements of radiosonde telemetry upload to sondehub.org, but you need >= V1.0.60!
 
 ✨ What's New in v1.0.52
 
@@ -15,7 +54,7 @@ Using the excellent rs1729/RS decoders embedded into this framework.
 
 #### 🎯 Detection Accuracy
 
-#### 📡 SondeHub Upload Correctness
+#### 📡 SondeHub Upload Correctness (part 1 / 2 - uploaded is granted with >= V1.0.60)
 
 Following feedback from a SondeHub maintainer, both upload paths
 (`sondehub_queue.py` and `sondehub_output.py`) were brought in line with
