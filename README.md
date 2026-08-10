@@ -3,13 +3,14 @@
 A lightweight, efficient radiosonde decoder for Raspberry Pi, designed to work with RTL-SDR, Airspy and KA9Q radio receivers. 
 Using the excellent rs1729/RS decoders embedded into this framework.
 
-## Next Version:** 1.0.60/1.0.61 (July 27, 2026) available soon:
+## Current Version:** 1.0.61 (July 24, 2026):
 
 ⚠ <u>Important notice:</u> From version 1.0.60 and higher upload of radiosonde telemetry to sondehub.org is now available for this sondetypes:
 - RS41
 - DFM06
 - DFM09
 - DFM17
+- M10 (confirmed, but still blocked)
 - M20
 
 We have also uploaded M10 logfiles for a check by sondehub.org and waiting for permission. After this has been granted, the new release will be available soon.
@@ -27,6 +28,7 @@ We have also uploaded M10 logfiles for a check by sondehub.org and waiting for p
 #### 📡 SondeHub Upload Correctness completed, uploaded is being granted with >= V1.0.60)
 
 #### 🎯 Detection Sensivity (optional softchain input)
+- Using decoders softin mode like radiosonde_auto_rx you get 2dB improved signal sensitivy
 
 #### 📊 Inline iq_dec DC removal
 - New decoders.iq_dc_block (default false) routes rtl_fm -M raw cs16 IQ through rs1729 iq_dec (--bo 16, +--IFbw for >80 kHz) before the --IQ decoder (learned from auto_rx)
