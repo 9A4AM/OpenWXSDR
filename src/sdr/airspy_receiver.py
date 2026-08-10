@@ -63,7 +63,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from math import gcd
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy import signal as scipy_signal
@@ -490,7 +490,7 @@ class AirspyChannelizer:
                 pass
             self.logger.info(f"Channel removed: {frequency/1e6:.4f} MHz")
 
-    def get_channel_metrics_snapshot(self, frequency: float) -> tuple[Optional[float], Optional[float]]:
+    def get_channel_metrics_snapshot(self, frequency: float) -> Tuple[Optional[float], Optional[float]]:
         """Return latest (rssi_dbm, snr_db) for a channel frequency."""
         with self._ch_lock:
             ch = self._channels.get(frequency)
@@ -744,6 +744,12 @@ class AirspyScanner:
         self.last_spectrum: dict = {}
         # Percent of int16 IQ samples near full-scale; used to detect front-end clipping.
         self.last_clip_ratio_pct: float = 0.0
+        # True if the last scan() call couldn't get any usable IQ at all (e.g.
+        # airspy_open() failed / device not found) — distinct from a healthy
+        # capture that simply found zero signals. AirspyReceiver uses this to
+        # tell "device is broken" apart from "band is quiet" and surface a
+        # proper error state instead of showing "Scanning" forever.
+        self.last_capture_failed: bool = False
 
     def scan(self) -> List[DetectedSignal]:
         """Capture IQ data and return detected signal peaks."""
@@ -754,10 +760,13 @@ class AirspyScanner:
                     f"Capture too short ({len(iq) if iq is not None else 0} samples) "
                     f"for {self.fft_chunk_size}-point FFT — scan skipped"
                 )
+                self.last_capture_failed = True
                 return []
+            self.last_capture_failed = False
             return self._detect_signals(iq)
         except Exception as exc:
             self.logger.error(f"Scan failed: {exc}", exc_info=True)
+            self.last_capture_failed = True
             return []
 
     def _capture_iq(self, duration_s: float) -> Optional[np.ndarray]:
@@ -1023,6 +1032,17 @@ class AirspyReceiver:
     STATE_IDLE     = 'idle'
     STATE_SCANNING = 'scanning'
     STATE_DECODING = 'decoding'
+    STATE_ERROR    = 'error'  # airspy_rx can't open the device; not actually scanning
+
+    # A handful of retries (~1-2 min at the ~15s scan cadence) before we stop
+    # quietly retrying forever and surface a clear error to the web UI —
+    # matches RTLSDRDeviceManager's DeviceWorker.MAX_CONSECUTIVE_OPEN_FAILURES
+    # in spirit, but WITHOUT the self-restart escalation: unlike RTL-SDR's
+    # LIBUSB_ERROR_BUSY (a leaked USB claim only a process exit releases),
+    # AIRSPY_ERROR_NOT_FOUND means the device genuinely isn't there/claimable
+    # right now — restarting the process wouldn't fix that, so we just keep
+    # retrying in the background while showing the true state.
+    MAX_CONSECUTIVE_SCAN_FAILURES = 4
 
     def __init__(self, config: dict,
                  telemetry_callback: Callable[[SondeTelemetry], None]):
@@ -1031,6 +1051,7 @@ class AirspyReceiver:
         self.logger             = logging.getLogger('AirspyReceiver')
         self.running            = False
         self.lock               = threading.Lock()   # web_server.py compatibility
+        self._consecutive_scan_failures = 0
 
         airspy_cfg = config.get('sdr', {}).get('airspy', {})
         det_cfg    = config.get('detection', {})
@@ -1457,7 +1478,7 @@ class AirspyReceiver:
                 if self._transitioning:
                     time.sleep(0.1)
                     continue
-                if self._state in (self.STATE_IDLE, self.STATE_SCANNING):
+                if self._state in (self.STATE_IDLE, self.STATE_SCANNING, self.STATE_ERROR):
                     self._scan_cycle()
                 elif self._state == self.STATE_DECODING:
                     self._decode_cycle()
@@ -1489,6 +1510,22 @@ class AirspyReceiver:
             f"±{self._sample_rate/2e6:.1f} MHz"
         )
         signals = scanner.scan()
+
+        if scanner.last_capture_failed:
+            self._consecutive_scan_failures += 1
+            if self._consecutive_scan_failures >= self.MAX_CONSECUTIVE_SCAN_FAILURES:
+                self._state = self.STATE_ERROR
+                self.logger.error(
+                    f"Airspy device not reachable after {self._consecutive_scan_failures} "
+                    "consecutive scan failures (airspy_open() failed / not found) — "
+                    "showing error state in the web UI, will keep retrying in the background"
+                )
+            time.sleep(self._scan_interval)
+            return
+
+        if self._consecutive_scan_failures >= self.MAX_CONSECUTIVE_SCAN_FAILURES:
+            self.logger.info("Airspy device recovered — resuming normal scanning")
+        self._consecutive_scan_failures = 0
 
         # A decoder may have been started while this scan was in progress.
         if self._decoders or self._transitioning:

@@ -41,11 +41,15 @@
 
 import json
 import logging
+import os
 import ssl
 import threading
+import time
+import platform
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Set, Dict
 
+from .. import __version__
 from ..decoders.models import SondeTelemetry
 
 
@@ -79,6 +83,25 @@ class MQTTOutput:
         # Read debug_mqtt flag – suppresses keep-alive PING noise unless enabled
         log_cfg = config.get('logging', {})
         self._debug_mqtt = bool(log_cfg.get('debug_mqtt', False))
+
+        # Gateway status tracking
+        station_cfg = config.get('station', {})
+        self._gateway_id = station_cfg.get('callsign', 'OPENWXSDR')
+        self._gateway_lat = station_cfg.get('lat', 0.0)
+        self._gateway_lon = station_cfg.get('lon', 0.0)
+        self._receiver = station_cfg.get('receiver', 'Unknown')
+        self._antenna = station_cfg.get('antenna', 'Unknown')
+        self._upload_position = station_cfg.get('upload_position', False)
+        self._upload_interval_minutes = max(15, min(720, int(station_cfg.get('upload_interval', 15))))
+        
+        self._start_time = time.time()
+        self._total_frames = 0
+        self._active_sondes: Set[str] = set()
+        self._sonde_last_seen: Dict[str, float] = {}  # Track last frame time per sonde
+        self._gateway_thread = None
+        self._gateway_running = False
+        self._hardware_info = self._get_hardware_info()
+        self._version = self._get_version()
 
         if self.enabled:
             self._initialize()
@@ -148,6 +171,10 @@ class MQTTOutput:
                     f"MQTT connect timeout after {self.connect_timeout}s "
                     f"to {self.server}:{self.port}"
                 )
+            
+            # Start gateway status publishing thread if upload_position is enabled
+            if self._upload_position:
+                self._start_gateway_status_thread()
 
         except Exception as e:
             self.logger.error(f"Failed to initialize MQTT client: {e}")
@@ -207,6 +234,127 @@ class MQTTOutput:
             self.logger.info(f"MQTT: {buf}")
 
     # ------------------------------------------------------------------
+    # Gateway status methods
+    # ------------------------------------------------------------------
+
+    def _get_hardware_info(self) -> str:
+        """Detect hardware platform information."""
+        try:
+            # Try to read Raspberry Pi model from /proc/cpuinfo
+            with open('/proc/cpuinfo', 'r') as f:
+                for line in f:
+                    if line.startswith('Model'):
+                        return line.split(':', 1)[1].strip()
+            
+            # Fallback to platform info
+            return f"{platform.system()} {platform.machine()}"
+        except Exception:
+            return f"{platform.system()} {platform.machine()}"
+
+    def _get_version(self) -> str:
+        """Get OpenWXSDR version from the package's single source of truth."""
+        return f"OpenWXSDR V{__version__}"
+
+    def _start_gateway_status_thread(self):
+        """Start background thread for publishing gateway status."""
+        if self._gateway_running:
+            return
+        
+        self._gateway_running = True
+        self._gateway_thread = threading.Thread(
+            target=self._gateway_status_loop,
+            daemon=True,
+            name="MQTT-Gateway-Status"
+        )
+        self._gateway_thread.start()
+        self.logger.info(
+            f"Gateway status publishing started (interval: {self._upload_interval_minutes} min)"
+        )
+
+    def _gateway_status_loop(self):
+        """Background thread that publishes gateway status at configured interval."""
+        # Publish initial status immediately
+        time.sleep(5)  # Give system time to start up
+        if self._connected:
+            self._publish_gateway_status()
+        
+        while self._gateway_running and self.enabled:
+            try:
+                # Sleep for the configured interval
+                time.sleep(self._upload_interval_minutes * 60)
+                
+                if not self._connected:
+                    continue
+                
+                # Clean up stale sondes (not seen in last 5 minutes)
+                self._cleanup_stale_sondes()
+                
+                # Build and publish gateway status
+                self._publish_gateway_status()
+                
+            except Exception as e:
+                self.logger.error(f"Error in gateway status loop: {e}", exc_info=True)
+                time.sleep(60)  # Wait 1 minute before retry on error
+
+    def _cleanup_stale_sondes(self, timeout_seconds: int = 300):
+        """Remove sondes from active set that haven't sent frames recently."""
+        try:
+            with self._lock:
+                current_time = time.time()
+                stale_sondes = [
+                    serial for serial, last_seen in self._sonde_last_seen.items()
+                    if current_time - last_seen > timeout_seconds
+                ]
+                for serial in stale_sondes:
+                    self._active_sondes.discard(serial)
+                    del self._sonde_last_seen[serial]
+                
+                if stale_sondes:
+                    self.logger.debug(f"Cleaned up {len(stale_sondes)} stale sondes: {stale_sondes}")
+        except Exception as e:
+            self.logger.error(f"Error cleaning up stale sondes: {e}")
+
+    def _publish_gateway_status(self):
+        """Publish gateway status message to MQTT broker."""
+        if not self._connected or not self._client:
+            return
+        
+        try:
+            uptime_seconds = int(time.time() - self._start_time)
+            
+            status = {
+                "gateway_id": self._gateway_id,
+                "online": True,
+                "last_seen": int(time.time()),
+                "receiver": self._receiver,
+                "antenna": self._antenna,
+                "lat": round(self._gateway_lat, 5),
+                "lon": round(self._gateway_lon, 5),
+                "total_frames": self._total_frames,
+                "active_sondes": len(self._active_sondes),
+                "hardware": self._hardware_info,
+                "active": uptime_seconds,
+                "version": self._version
+            }
+            
+            # Publish to OPENWXSDR/{gateway_id}/status
+            topic = f"OPENWXSDR/{self._gateway_id}/status"
+            json_data = json.dumps(status, separators=(',', ':'))
+            
+            result = self._client.publish(topic, json_data, qos=0, retain=True)
+            
+            if result.rc == 0:
+                self.logger.info(
+                    f"Gateway status published: uptime={uptime_seconds}s, "
+                    f"frames={self._total_frames}, active_sondes={len(self._active_sondes)}"
+                )
+            else:
+                self.logger.warning(f"Gateway status publish failed (rc={result.rc})")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to publish gateway status: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
@@ -233,6 +381,13 @@ class MQTTOutput:
             return
 
         try:
+            # Track statistics for gateway status
+            with self._lock:
+                self._total_frames += 1
+                if telemetry.serial:
+                    self._active_sondes.add(telemetry.serial)
+                    self._sonde_last_seen[telemetry.serial] = time.time()
+            
             payload = self._build_payload(telemetry)
             
             # Skip if payload is empty (malformed serial rejected)
@@ -263,8 +418,17 @@ class MQTTOutput:
 
     def close(self):
         """Disconnect from the broker and stop the network loop."""
+        # Stop gateway status thread
+        self._gateway_running = False
+        if self._gateway_thread and self._gateway_thread.is_alive():
+            self._gateway_thread.join(timeout=2)
+        
         if self._client:
             try:
+                # Publish final offline status before disconnecting
+                if self._connected and self._upload_position:
+                    self._publish_offline_status()
+                
                 self._client.loop_stop()
                 self._client.disconnect()
             except Exception:
@@ -272,6 +436,32 @@ class MQTTOutput:
             self._client = None
         self._connected = False
         self.logger.info("MQTT output closed")
+
+    def _publish_offline_status(self):
+        """Publish offline status before shutdown."""
+        try:
+            uptime_seconds = int(time.time() - self._start_time)
+            status = {
+                "gateway_id": self._gateway_id,
+                "online": False,
+                "last_seen": int(time.time()),
+                "receiver": self._receiver,
+                "antenna": self._antenna,
+                "lat": round(self._gateway_lat, 5),
+                "lon": round(self._gateway_lon, 5),
+                "total_frames": self._total_frames,
+                "active_sondes": 0,
+                "hardware": self._hardware_info,
+                "active": uptime_seconds,
+                "version": self._version
+            }
+            
+            topic = f"OPENWXSDR/{self._gateway_id}/status"
+            json_data = json.dumps(status, separators=(',', ':'))
+            self._client.publish(topic, json_data, qos=0, retain=True)
+            self.logger.info("Published offline status")
+        except Exception as e:
+            self.logger.error(f"Failed to publish offline status: {e}")
 
     def get_status(self) -> dict:
         """Return MQTT connection state for health endpoints."""

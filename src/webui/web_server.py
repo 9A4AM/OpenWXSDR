@@ -47,8 +47,10 @@
 import os
 import socket
 import subprocess
+import shutil
 import json
 import time
+import uuid
 
 # Import version info from package
 from .. import __version__, __build_date__
@@ -60,7 +62,7 @@ import re
 from flask import Flask, render_template, jsonify, request, send_file, send_from_directory, Response
 from flask_cors import CORS
 from typing import Dict, List, Set, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     import psutil
@@ -69,6 +71,13 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 from ..decoders.models import SondeTelemetry
+
+
+class _RxStatsError(Exception):
+    """Carries an HTTP status code alongside the message for _compute_rx_statistics()."""
+    def __init__(self, message: str, status_code: int = 400):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class WebUI:
@@ -92,7 +101,23 @@ class WebUI:
         
         # Per-sonde log files
         self.sonde_logfiles: Dict[str, str] = {}  # serial -> log file path
-        
+
+        # Background RX-statistics jobs (job_id -> progress/result dict), so the web UI
+        # can poll for "processing file X/Y" progress on gateways with a large sonde log
+        # history instead of the request just hanging with no feedback.
+        self._rx_stats_jobs: Dict[str, dict] = {}
+        self._rx_stats_jobs_lock = threading.Lock()
+
+        # Persistent RX-statistics cache: historical sonde logfiles never change once a
+        # session is over, and the activity log only ever grows by appending — so both are
+        # cached and only the diff (new bytes / new-or-changed files) gets (re-)read on each
+        # call, instead of rescanning the entire log history from scratch every time.
+        self._rx_stats_cache_lock = threading.Lock()
+        self._rx_stats_activity_cache: Dict[str, dict] = {}   # activity logfile name -> parsed events + byte offset
+        self._rx_stats_file_cache: Dict[str, dict] = {}       # sonde logfile path -> frame/altitude scan result
+        self._rx_stats_cache_path = os.path.join('data', 'logs', '.rx_stats_cache.json')
+        self._load_rx_stats_cache()
+
         # Sonde retention time (seconds) - how long to keep sondes on map after last update
         self.sonde_retention_time = config.get('webui', {}).get('sonde_retention_time', 600)  # Default 10 minutes
         self.logger.info(f"Sonde retention time: {self.sonde_retention_time} seconds")
@@ -176,8 +201,9 @@ class WebUI:
                                  callsign=station_cfg.get('callsign', ''),
                                  version=__version__,
                                  build_date=__build_date__,
+                                 static_js_v=self._static_js_version(),
                                  enable_config=self.enable_config)
-        
+
         @self.app.route('/dashboard')
         def dashboard():
             """System dashboard overview page"""
@@ -185,8 +211,27 @@ class WebUI:
                                  version=__version__,
                                  callsign=self.config['station']['callsign'],
                                  build_date=__build_date__,
+                                 static_js_v=self._static_js_version(),
                                  enable_config=self.enable_config)
-        
+
+        @self.app.route('/testresult')
+        @self.app.route('/testresults')
+        def testresult():
+            """Serve the decode test harness report (testscripts/rs_decode_test.py).
+            The harness writes this self-contained HTML; here it is handed to the
+            browser so results can be viewed with the service running. NOTE: during
+            a live test the service is stopped to free the SDR, so for LIVE viewing
+            use the harness's own built-in HTTP server (http_server in
+            test_input.yaml). Path is configurable via webui.testresult_path."""
+            cfg_path = self.config.get('webui', {}).get(
+                'testresult_path', 'testscripts/testresults/testresult.html')
+            path = cfg_path if os.path.isabs(cfg_path) else os.path.join(os.getcwd(), cfg_path)
+            if not os.path.isfile(path):
+                return (f"<h3>No test result yet</h3><p>Run "
+                        f"<code>python3 testscripts/rs_decode_test.py</code> first.<br>"
+                        f"Expected file: <code>{path}</code></p>"), 404
+            return send_file(path)
+
         @self.app.route('/api/sondes')
         def get_sondes():
             """Get all active sondes with their telemetry"""
@@ -458,6 +503,8 @@ class WebUI:
                             'active_sondes': 1 if state == 'decoding' else 0,
                             'present':      present,
                             'scan_return_eta_s': ws.get('scan_return_eta_s'),
+                            'decode_source': ws.get('decode_source'),
+                            'sweep_enabled': ws.get('sweep_enabled', False),
                         })
                 else:
                     # Legacy DecoderManager
@@ -498,6 +545,58 @@ class WebUI:
                 'devices': [d for d in devices if d.get('present', True)],
                 'timestamp': datetime.utcnow().isoformat() + 'Z'
             })
+
+        @self.app.route('/api/frequency_repository')
+        def get_frequency_repository():
+            """Parse the newest logs/sdrfreq_*.log into a per-frequency summary
+            for the repository modal. Aggregates rows by 10 kHz channel: a
+            frequency is 'confirmed' if any decode produced telemetry there,
+            else 'detected'. Returns nearest-first-agnostic list sorted by freq."""
+            import glob, os
+            try:
+                files = sorted(glob.glob(os.path.join('logs', 'sdrfreq_*.log')))
+                if not files:
+                    return jsonify({'file': None, 'frequencies': []})
+                path = files[-1]  # newest session
+                agg = {}  # 10 kHz channel key -> dict
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#') or line.startswith('datetime_utc'):
+                            continue
+                        parts = line.split(',')
+                        if len(parts) < 9:
+                            continue
+                        dt, event, freq_s, stype, serial, snr, rssi, alt, device = parts[:9]
+                        try:
+                            freq = float(freq_s)
+                        except ValueError:
+                            continue
+                        key = round(freq * 100)  # 10 kHz bucket on MHz
+                        e = agg.setdefault(key, {
+                            'frequency_mhz': freq, 'status': 'detected', 'type': '',
+                            'serial': '', 'snr_db': '', 'rssi_dbm': '', 'alt_m': '',
+                            'device': '', 'first_seen': dt, 'last_seen': dt, 'count': 0,
+                        })
+                        e['count'] += 1
+                        e['last_seen'] = dt
+                        if device:
+                            e['device'] = device
+                        if snr:
+                            e['snr_db'] = snr
+                        if event == 'confirmed':
+                            e['status'] = 'confirmed'
+                            if stype:  e['type'] = stype
+                            if serial: e['serial'] = serial
+                            if rssi:   e['rssi_dbm'] = rssi
+                            if alt:    e['alt_m'] = alt
+                        elif not e['type'] and stype:
+                            e['type'] = stype
+                freqs = sorted(agg.values(), key=lambda x: x['frequency_mhz'])
+                return jsonify({'file': os.path.basename(path), 'frequencies': freqs})
+            except Exception as e:
+                self.logger.error(f"Error in /api/frequency_repository: {e}", exc_info=True)
+                return jsonify({'error': str(e), 'frequencies': []}), 500
 
         @self.app.route('/api/receivers')
         def get_receivers():
@@ -566,9 +665,11 @@ class WebUI:
                             'freq_label': ws.get('freq_label'),  # Add scan range label
                             'sonde_type': ws['sonde_type'] or None,
                             'sonde_serial': ws.get('sonde_serial'),
+                            'gain': ws.get('gain'),  # 0 = auto, else dB value
                             'decoder_mode': ws.get('decoder_mode', 'legacy'),  # 'legacy' or 'channelizer'
                             'channelizer_active': ws.get('channelizer_active', 0),  # Active channels
                             'channelizer_max': ws.get('channelizer_max', 0),  # Max channels
+                            'sweep_enabled': ws.get('sweep_enabled', False),  # band-sweep active
                         }
                         receivers.append(receiver_info)
                 
@@ -832,20 +933,26 @@ class WebUI:
                 if not hasattr(self.decoder_manager, '_workers'):
                     return jsonify({'success': False, 'error': 'Start scanning not supported for this SDR type'})
 
-                from ..sdr.device_manager import DeviceWorker
+                # Pick up any config.yaml detection-tuning edits (scan_check_time,
+                # max_peaks, channel_spacing_hz, etc.) before the forced restart,
+                # so "Start Scan" doubles as a lightweight apply-without-restart.
+                if hasattr(self.decoder_manager, 'reload_detection_config'):
+                    self.decoder_manager.reload_detection_config()
+
                 for worker in self.decoder_manager._workers:
                     if device_serial and worker.device_serial != device_serial:
                         continue
-                    if worker.state in (DeviceWorker.STATE_IDLE, DeviceWorker.STATE_DECODING):
-                        worker.stop_decode_and_scan()
-                        self.logger.info(f"Triggered scanning on device {worker.device_serial}")
-                        self._log_action('decoder_stop', {
-                            'device': worker.device_serial,
-                            'reason': 'manual_scan_requested'
-                        })
-                        return jsonify({'success': True, 'device': worker.device_serial})
-                    elif worker.state == DeviceWorker.STATE_SCANNING:
-                        return jsonify({'success': True, 'device': worker.device_serial, 'message': 'Already scanning'})
+                    # Force a clean restart regardless of current state
+                    # (idle/scanning/decoding/error) — stops any active
+                    # decode, discards any existing analyzer so the next
+                    # scan cycle builds a fresh one with the reloaded config.
+                    worker.force_clean_scan_restart()
+                    self.logger.info(f"Forced clean scan restart on device {worker.device_serial}")
+                    self._log_action('decoder_stop', {
+                        'device': worker.device_serial,
+                        'reason': 'manual_scan_requested'
+                    })
+                    return jsonify({'success': True, 'device': worker.device_serial})
 
                 return jsonify({'success': False, 'error': 'Device not found'})
 
@@ -1820,11 +1927,16 @@ class WebUI:
             try:
                 status_info = self._get_service_status_info(lines=8)
                 host_info = self._get_host_info()
+                mem_disk_info = self._get_memory_disk_info()
 
                 return jsonify({
                     'success': True,
                     **status_info,
                     **host_info,
+                    **mem_disk_info,
+                    'version': __version__,
+                    'build_date': __build_date__,
+                    'station': self.config.get('station', {}).get('callsign', ''),
                 })
             except Exception as e:
                 self.logger.error(f"Error reading service status: {e}")
@@ -2038,399 +2150,63 @@ class WebUI:
         
         @self.app.route('/api/logfile/<filename>/rx_statistics')
         def get_rx_statistics(filename):
-            """Parse activity logfile and return receiver statistics"""
+            """Parse activity logfile and return receiver statistics (synchronous, no progress)"""
             try:
-                log_dir = 'data/logs'
-                # Security: prevent directory traversal
-                if '..' in filename or '/' in filename or '\\' in filename:
-                    return jsonify({'error': 'Invalid filename'}), 400
-                
-                filepath = os.path.join(log_dir, filename)
-                if not os.path.exists(filepath):
-                    return jsonify({'error': 'File not found'}), 404
-                
-                # Must be an activity log
-                if not filename.startswith('openwxsdr_'):
-                    return jsonify({'error': 'Not an activity log'}), 400
-                
-                # Parse JSON activity log
-                decoder_events = []
-                sonde_events = []
-                sonde_stopped_events = []
-                rssi_values = []
-                sats_values = []
-                # Map frequency to sonde type from decoder_start events
-                freq_to_sonde_type = {}
-                
-                with open(filepath, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            event = json.loads(line)
-                            event_type = event.get('action')  # Changed from 'event' to 'action'
-                            timestamp = event.get('datetime')  # Changed from 'timestamp' to 'datetime'
-                            
-                            # Decoder start/stop events
-                            if event_type in ['decoder_start', 'decoder_stop']:
-                                freq = event.get('data', {}).get('frequency_mhz')
-                                stype = event.get('data', {}).get('sonde_type')
-                                
-                                # Store frequency → sonde_type mapping from decoder_start
-                                if event_type == 'decoder_start' and freq and stype:
-                                    freq_to_sonde_type[round(freq, 2)] = stype
-                                
-                                decoder_events.append({
-                                    'timestamp': timestamp,
-                                    'event': event_type,
-                                    'frequency': freq,
-                                    'sonde_type': stype
-                                })
-                            
-                            # Sonde first frame events
-                            elif event_type == 'sonde_first_frame':
-                                data = event.get('data', {})
-                                stype = data.get('sonde_type', '').strip()
-                                freq = data.get('frequency_mhz')
-                                serial = data.get('serial', '')
-                                
-                                # If sonde_type is empty, try to determine from frequency mapping
-                                if not stype and freq:
-                                    freq_rounded = round(freq, 2)
-                                    stype = freq_to_sonde_type.get(freq_rounded, '')
-                                
-                                # If still empty, use serial pattern as fallback
-                                # NOTE: Serial IDs no longer have M10-/M20-/DFM-/iMet- prefixes
-                                if not stype and serial:
-                                    # M10/M20: Often contains hyphens like "310-2-02647"
-                                    if '-' in serial and serial[0].isdigit():
-                                        stype = 'M20'  # Default to M20 for hyphenated numeric serials
-                                    # DFM: 8 digits (no prefix anymore)
-                                    elif serial.isdigit() and len(serial) == 8:
-                                        stype = 'DFM'
-                                    # RS41: Starts with letter followed by 7-8 digits
-                                    elif serial[0].isalpha() and serial[1:].isdigit() and len(serial) in (8, 9):
-                                        stype = 'RS41'
-                                    # iMet: Often numeric or alphanumeric
-                                    elif serial.startswith('iMet') or serial.startswith('IMET'):
-                                        stype = 'iMet'
-                                    else:
-                                        stype = 'Unknown'
-                                
-                                sonde_events.append({
-                                    'timestamp': timestamp,
-                                    'serial': serial,
-                                    'sonde_type': stype,
-                                    'frequency': freq,
-                                    'rssi': data.get('rssi'),
-                                    'snr': data.get('snr'),
-                                    'sats': data.get('sats'),
-                                    'alt': data.get('alt')  # Include altitude
-                                })
-                                
-                                # Collect RSSI and sats values
-                                if data.get('rssi') is not None:
-                                    rssi_values.append(data.get('rssi'))
-                                if data.get('sats') is not None:
-                                    sats_values.append(data.get('sats'))
-                            
-                            # Sonde stopped events (for frame counts)
-                            elif event_type == 'sonde_stopped':
-                                data = event.get('data', {})
-                                sonde_stopped_events.append({
-                                    'timestamp': timestamp,
-                                    'serial': data.get('serial'),
-                                    'total_frames': data.get('total_frames', 0)
-                                })
-                        
-                        except json.JSONDecodeError:
-                            continue
-                
-                # Calculate statistics - count unique sondes by serial
-                total_sondes = len(set(sonde['serial'] for sonde in sonde_events if sonde.get('serial')))
-                avg_rssi = sum(rssi_values) / len(rssi_values) if rssi_values else 0
-                avg_sats = sum(sats_values) / len(sats_values) if sats_values else 0
-                
-                # Group sondes by day for timeline (count unique sondes per day)
-                sondes_by_day = {}
-                for sonde in sonde_events:
-                    try:
-                        # Parse datetime in format: '2026-06-17 12:34:56'
-                        dt = datetime.strptime(sonde['timestamp'], '%Y-%m-%d %H:%M:%S')
-                        day_key = dt.strftime('%Y-%m-%d')
-                        if day_key not in sondes_by_day:
-                            sondes_by_day[day_key] = set()
-                        sondes_by_day[day_key].add(sonde['serial'])
-                    except:
-                        pass
-                
-                # Convert sets to counts
-                sonde_timeline = {day: len(serials) for day, serials in sondes_by_day.items()}
-                
-                # Calculate number of recorded days
-                recorded_days = len(sondes_by_day)
-                
-                # Calculate max sondes per day with date
-                max_sondes_per_day = 0
-                max_sondes_date = None
-                if sonde_timeline:
-                    max_day = max(sonde_timeline.items(), key=lambda x: (x[1], x[0]))  # Sort by count, then by date (latest)
-                    max_sondes_per_day = max_day[1]
-                    max_sondes_date = max_day[0]
-                
-                # Calculate frames per day from sonde_stopped events
-                frames_by_day = {}
-                total_frames_from_stopped = 0
-                for stopped in sonde_stopped_events:
-                    try:
-                        dt = datetime.strptime(stopped['timestamp'], '%Y-%m-%d %H:%M:%S')
-                        day_key = dt.strftime('%Y-%m-%d')
-                        frames = stopped.get('total_frames', 0)
-                        if day_key not in frames_by_day:
-                            frames_by_day[day_key] = 0
-                        frames_by_day[day_key] += frames
-                        total_frames_from_stopped += frames
-                    except:
-                        pass
-                
-                # Group sonde types by unique serials (not total events)
-                sonde_types_serials = {}
-                for sonde in sonde_events:
-                    stype = sonde.get('sonde_type', 'Unknown')
-                    serial = sonde.get('serial')
-                    if serial:
-                        if stype not in sonde_types_serials:
-                            sonde_types_serials[stype] = set()
-                        sonde_types_serials[stype].add(serial)
-                
-                # Convert sets to counts
-                sonde_types = {stype: len(serials) for stype, serials in sonde_types_serials.items()}
-                
-                # Get unique frequencies (rounded to 2 decimals) with dates
-                from datetime import date as date_class
-                today = date_class.today().strftime('%Y-%m-%d')
-                frequencies_with_dates = {}
-                for sonde in sonde_events:
-                    freq = sonde.get('frequency')
-                    timestamp = sonde.get('timestamp')
-                    if freq is not None and timestamp:
-                        freq_rounded = round(freq, 2)
-                        try:
-                            dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
-                            day_key = dt.strftime('%Y-%m-%d')
-                            if freq_rounded not in frequencies_with_dates:
-                                frequencies_with_dates[freq_rounded] = {'total': 0, 'today': 0}
-                            frequencies_with_dates[freq_rounded]['total'] += 1
-                            if day_key == today:
-                                frequencies_with_dates[freq_rounded]['today'] += 1
-                        except:
-                            pass
-                
-                # Get first frame altitude per sonde serial (for altitude chart)
-                # Read ACTUAL first frame from sonde logfiles, not from activity log
-                sonde_altitudes_dict = {}
-                last_sonde_altitudes_dict = {}
-                
-                # Build set of unique serials from sonde_events
-                unique_serials = set(s.get('serial') for s in sonde_events if s.get('serial'))
-                
-                log_dir = 'data/logs'
-                if os.path.exists(log_dir):
-                    # CRITICAL: list the directory ONCE, not once per unique serial.
-                    # This endpoint re-listed data/logs inside the loop below for
-                    # every distinct sonde ever seen in the activity log — on a
-                    # gateway with a long tracking history (hundreds of serials),
-                    # that's hundreds of redundant directory listings and was the
-                    # main reason RX statistics got slower the longer a gateway
-                    # had been running.
-                    all_log_files = os.listdir(log_dir)
-
-                    for serial in unique_serials:
-                        # Find log files for this serial
-                        prefix = f"{serial}-"
-                        sonde_logs = [
-                            os.path.join(log_dir, fname) for fname in all_log_files
-                            if fname.startswith(prefix) and fname.endswith('.log')
-                        ]
-
-                        if not sonde_logs:
-                            continue
-                        
-                        # Sort logs by filename (contains timestamp)
-                        sorted_logs = sorted(sonde_logs)
-                        oldest_log = sorted_logs[0]   # First session
-                        newest_log = sorted_logs[-1]  # Last/most recent session
-                        
-                        sonde_type = 'Unknown'
-                        
-                        # Read FIRST frame altitude from OLDEST logfile
-                        try:
-                            first_alt = None
-                            
-                            with open(oldest_log, 'r', encoding='utf-8', errors='ignore') as f:
-                                in_frame = False
-                                for line in f:
-                                    line = line.strip()
-                                    
-                                    # Extract sonde type from header
-                                    if line.startswith('Sonde:') and '(' in line:
-                                        try:
-                                            sonde_type = line.split('(')[1].split(')')[0].strip()
-                                        except:
-                                            pass
-                                    
-                                    # Detect frame start
-                                    if line.startswith('Frame '):
-                                        in_frame = True
-                                    
-                                    # Extract altitude (only store FIRST occurrence)
-                                    elif in_frame and line.startswith('Altitude:'):
-                                        try:
-                                            frame_alt = float(line.split(':')[1].replace('m', '').strip())
-                                            if first_alt is None:
-                                                first_alt = frame_alt  # Store FIRST altitude only
-                                                break  # Stop after finding first altitude
-                                        except:
-                                            pass
-                            
-                            # Store first altitude
-                            if first_alt is not None:
-                                sonde_altitudes_dict[serial] = {
-                                    'serial': serial,
-                                    'altitude': first_alt,
-                                    'sonde_type': sonde_type
-                                }
-                        except Exception as e:
-                            self.logger.warning(f"Error reading first altitude from {oldest_log}: {e}")
-                        
-                        # Read LAST frame altitude from NEWEST logfile.
-                        # CRITICAL: only scan the trailing chunk of the file, not the
-                        # whole thing. A long flight can produce tens of thousands of
-                        # frame lines; reading every line just to keep overwriting
-                        # last_alt until EOF made this endpoint's cost scale with the
-                        # total size of every sonde's logfile ever recorded — the
-                        # other dominant cost alongside the listdir-per-serial issue
-                        # above. A frame block is a few hundred bytes at most, so the
-                        # last complete one is always well within the final 32 KB.
-                        try:
-                            last_alt = None
-                            file_size = os.path.getsize(newest_log)
-
-                            # The "Sonde: ... (TYPE)" header only ever appears near the
-                            # TOP of the file, which the tail-only read below would miss
-                            # for a large newest_log if sonde_type wasn't already resolved
-                            # from oldest_log (multi-session sonde, different type per
-                            # session). Read a small bounded head chunk just for that.
-                            if sonde_type == 'Unknown':
-                                with open(newest_log, 'rb') as f:
-                                    head_data = f.read(4096)
-                                for line in head_data.decode('utf-8', errors='ignore').splitlines():
-                                    line = line.strip()
-                                    if line.startswith('Sonde:') and '(' in line:
-                                        try:
-                                            sonde_type = line.split('(')[1].split(')')[0].strip()
-                                        except:
-                                            pass
-                                        break
-
-                            tail_bytes = 32768
-                            with open(newest_log, 'rb') as f:
-                                f.seek(max(0, file_size - tail_bytes))
-                                tail_data = f.read()
-                            tail_text = tail_data.decode('utf-8', errors='ignore')
-
-                            in_frame = False
-                            for line in tail_text.splitlines():
-                                line = line.strip()
-
-                                # Detect frame start
-                                if line.startswith('Frame '):
-                                    in_frame = True
-
-                                # Extract altitude (always update to get LAST occurrence)
-                                elif in_frame and line.startswith('Altitude:'):
-                                    try:
-                                        last_alt = float(line.split(':')[1].replace('m', '').strip())
-                                    except:
-                                        pass
-
-                            # Store last altitude
-                            if last_alt is not None:
-                                last_sonde_altitudes_dict[serial] = {
-                                    'serial': serial,
-                                    'altitude': last_alt,
-                                    'sonde_type': sonde_type
-                                }
-                        except Exception as e:
-                            self.logger.warning(f"Error reading last altitude from {newest_log}: {e}")
-                
-                # Fallback: use altitude from activity log if logfile read failed
-                # NOTE: Only fallback for FIRST frame altitude, not last
-                # (last frame requires actual logfile data to be meaningful)
-                for sonde in sonde_events:
-                    serial = sonde.get('serial')
-                    alt = sonde.get('alt')
-                    sonde_type = sonde.get('sonde_type', 'Unknown')
-                    if serial and alt is not None:
-                        # Add to first frame altitude if no logfile data
-                        if serial not in sonde_altitudes_dict:
-                            sonde_altitudes_dict[serial] = {
-                                'serial': serial,
-                                'altitude': alt,
-                                'sonde_type': sonde_type
-                            }
-                        # DO NOT add to last frame altitude - only show sondes with logfiles
-                        # This prevents showing identical first/last values for sondes without logfiles
-                
-                # Convert to lists
-                sonde_altitudes = list(sonde_altitudes_dict.values())
-                last_sonde_altitudes = list(last_sonde_altitudes_dict.values())
-                
-                # Create RSSI timeline (RSSI values with timestamps)
-                rssi_timeline = []
-                for sonde in sonde_events:
-                    if sonde.get('rssi') is not None:
-                        rssi_timeline.append({
-                            'timestamp': sonde.get('timestamp'),
-                            'rssi': sonde.get('rssi'),
-                            'serial': sonde.get('serial')
-                        })
-                
-                # Get today's frame count from frames_by_day (using 'today' calculated earlier)
-                frames_today = frames_by_day.get(today, 0)
-                
-                return jsonify({
-                    'success': True,
-                    'decoder_events': decoder_events,
-                    'sonde_events': sonde_events,
-                    'sonde_timeline': sonde_timeline,
-                    'frames_timeline': frames_by_day,
-                    'rssi_values': rssi_values,
-                    'rssi_timeline': rssi_timeline,
-                    'sats_values': sats_values,
-                    'sonde_types': sonde_types,
-                    'frequencies': frequencies_with_dates,
-                    'sonde_altitudes': sonde_altitudes,
-                    'last_sonde_altitudes': last_sonde_altitudes,
-                    'statistics': {
-                        'total_sondes': total_sondes,
-                        'total_decoder_starts': len([e for e in decoder_events if e['event'] == 'decoder_start']),
-                        'avg_rssi': round(avg_rssi, 1),
-                        'avg_sats': round(avg_sats, 1),
-                        'total_frames': frames_today,
-                        'total_frames_from_stopped': total_frames_from_stopped,
-                        'recorded_days': recorded_days,
-                        'max_sondes_per_day': max_sondes_per_day,
-                        'max_sondes_date': max_sondes_date
-                    }
-                })
+                days = request.args.get('days', type=int)
+                return jsonify(self._compute_rx_statistics(filename, days=days))
+            except _RxStatsError as e:
+                return jsonify({'error': str(e)}), e.status_code
             except Exception as e:
                 self.logger.error(f"Error parsing RX statistics: {e}")
                 import traceback
                 traceback.print_exc()
                 return jsonify({'error': str(e)}), 500
-        
+
+        @self.app.route('/api/logfile/<filename>/rx_statistics/start', methods=['POST'])
+        def start_rx_statistics_job(filename):
+            """Kick off RX statistics computation in a background thread and return a job_id
+            the client can poll via /api/rx_statistics_job/<job_id> for per-file progress —
+            scanning every sonde logfile can take a while on a gateway with a long history."""
+            days = request.args.get('days', type=int)
+            job_id = uuid.uuid4().hex
+            with self._rx_stats_jobs_lock:
+                # Opportunistic cleanup of old finished/abandoned jobs so this dict doesn't
+                # grow unbounded on a gateway whose web UI is polled/refreshed a lot.
+                now = time.time()
+                for stale_id in [jid for jid, j in self._rx_stats_jobs.items()
+                                  if now - j.get('created_at', now) > 300]:
+                    del self._rx_stats_jobs[stale_id]
+
+                self._rx_stats_jobs[job_id] = {
+                    'current': 0, 'total': 0, 'filename': '',
+                    'done': False, 'error': None, 'result': None,
+                    'created_at': now,
+                }
+            threading.Thread(
+                target=self._run_rx_statistics_job, args=(job_id, filename, days), daemon=True
+            ).start()
+            return jsonify({'job_id': job_id})
+
+        @self.app.route('/api/rx_statistics_job/<job_id>')
+        def get_rx_statistics_job(job_id):
+            """Poll progress/result of a background RX statistics job."""
+            with self._rx_stats_jobs_lock:
+                job = self._rx_stats_jobs.get(job_id)
+                if job is None:
+                    return jsonify({'error': 'Job not found'}), 404
+                response = {
+                    'current': job['current'],
+                    'total': job['total'],
+                    'filename': job['filename'],
+                    'done': job['done'],
+                }
+                if job['done']:
+                    if job['error']:
+                        response['error'] = job['error']
+                    else:
+                        response['result'] = job['result']
+            return jsonify(response)
+
         @self.app.route('/api/export_action_log')
         def export_action_log():
             """Export the structured action log for download"""
@@ -2447,7 +2223,550 @@ class WebUI:
             except Exception as e:
                 self.logger.error(f"Error exporting action log: {e}")
                 return str(e), 500
-    
+
+    def _run_rx_statistics_job(self, job_id: str, filename: str, days: Optional[int] = None):
+        """Background-thread target for /api/logfile/<filename>/rx_statistics/start."""
+        def progress_cb(current, total, current_filename):
+            with self._rx_stats_jobs_lock:
+                job = self._rx_stats_jobs.get(job_id)
+                if job is not None:
+                    job['current'] = current
+                    job['total'] = total
+                    job['filename'] = current_filename
+
+        try:
+            result = self._compute_rx_statistics(filename, days=days, progress_cb=progress_cb)
+            with self._rx_stats_jobs_lock:
+                job = self._rx_stats_jobs.get(job_id)
+                if job is not None:
+                    job['done'] = True
+                    job['result'] = result
+        except Exception as e:
+            self.logger.error(f"Error in RX statistics job {job_id}: {e}")
+            with self._rx_stats_jobs_lock:
+                job = self._rx_stats_jobs.get(job_id)
+                if job is not None:
+                    job['done'] = True
+                    job['error'] = str(e)
+
+    def _static_js_version(self) -> int:
+        """mtime of rx-statistics-common.js, used as a cache-busting query string on the
+        <script> tag. Without this, browsers happily keep serving a stale cached copy of
+        this file after a deploy — the .html changes (so new markup like the range
+        selector shows up), but clicks/selections silently keep running old JS logic that
+        never sends the new request parameters, which looks exactly like "the server is
+        ignoring my selection" even though the server-side code is correct."""
+        try:
+            return int(os.path.getmtime(os.path.join('static', 'js', 'rx-statistics-common.js')))
+        except OSError:
+            return 0
+
+    def _load_rx_stats_cache(self):
+        """Best-effort load of the persistent RX-statistics cache from disk."""
+        try:
+            with open(self._rx_stats_cache_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self._rx_stats_activity_cache = data.get('activity', {})
+            self._rx_stats_file_cache = data.get('files', {})
+            self.logger.info(
+                f"Loaded RX statistics cache: {len(self._rx_stats_file_cache)} sonde logfiles, "
+                f"{len(self._rx_stats_activity_cache)} activity log(s)"
+            )
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            self.logger.warning(f"Failed to load RX statistics cache, starting fresh: {e}")
+
+    def _save_rx_stats_cache(self):
+        """Best-effort persist of the RX-statistics cache (atomic replace)."""
+        try:
+            with self._rx_stats_cache_lock:
+                payload = {'activity': self._rx_stats_activity_cache, 'files': self._rx_stats_file_cache}
+            tmp_path = self._rx_stats_cache_path + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f)
+            os.replace(tmp_path, self._rx_stats_cache_path)
+        except Exception as e:
+            self.logger.warning(f"Failed to save RX statistics cache: {e}")
+
+    def _scan_sonde_logfile(self, log_path: str, need_first_alt: bool, need_last_alt: bool):
+        """Single sequential pass over one sonde logfile: per-day frame counts, the sonde
+        type header, and (if requested) the first/last altitude seen. Frame-day counting
+        requires reading the whole file anyway, so first/last altitude are extracted from
+        that same pass instead of the extra separate reads used previously."""
+        frames_by_day = {}
+        sonde_type = 'Unknown'
+        first_alt = None
+        last_alt = None
+        in_frame = False
+        try:
+            with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('Sonde:') and '(' in line:
+                        if sonde_type == 'Unknown':
+                            try:
+                                sonde_type = line.split('(')[1].split(')')[0].strip()
+                            except Exception:
+                                pass
+                        continue
+                    if line.startswith('Frame '):
+                        in_frame = True
+                        parts = line.split(' - ', 1)
+                        if len(parts) == 2:
+                            try:
+                                dt = datetime.fromisoformat(parts[1].strip().rstrip('Z'))
+                                if dt.year >= 2020:
+                                    # (years < 2020 are excluded below in the caller's
+                                    # merge step too; kept here so cached per-file results
+                                    # never contain the glitch date in the first place)
+                                    day_key = dt.strftime('%Y-%m-%d')
+                                    frames_by_day[day_key] = frames_by_day.get(day_key, 0) + 1
+                            except ValueError:
+                                pass
+                        continue
+                    if in_frame and line.startswith('Altitude:'):
+                        try:
+                            alt = float(line.split(':')[1].replace('m', '').strip())
+                            if need_first_alt and first_alt is None:
+                                first_alt = alt
+                            if need_last_alt:
+                                last_alt = alt
+                        except Exception:
+                            pass
+        except Exception as e:
+            self.logger.warning(f"Error scanning sonde logfile {log_path}: {e}")
+        return frames_by_day, sonde_type, first_alt, last_alt
+
+    def _compute_rx_statistics(self, filename: str, days: Optional[int] = None, progress_cb=None) -> dict:
+        """Parse an activity logfile and return receiver statistics.
+
+        If progress_cb is given, it's called as progress_cb(current, total, filename)
+        once per sonde logfile scanned, so a caller (e.g. a background job) can report
+        "processing file X/Y" — scanning every sonde logfile for frame counts is the
+        dominant cost on a gateway with a long tracking history.
+
+        Historical sonde logfiles never change once a session is over, and the activity
+        log only ever grows by appending — so both are cached (self._rx_stats_file_cache /
+        self._rx_stats_activity_cache) and only new-or-changed files / new bytes get
+        (re-)read on each call, instead of rescanning the entire history from scratch.
+
+        If days is given, only data from the last `days` days is included in the result
+        (and drives which sonde logfiles even need to be looked at) — this both narrows
+        the returned charts to the requested range and, on a gateway with a long history,
+        is the main lever for making an *uncached* first-ever request fast: a short range
+        means far fewer serials/logfiles to touch.
+        """
+        log_dir = 'data/logs'
+        # Security: prevent directory traversal
+        if '..' in filename or '/' in filename or '\\' in filename:
+            raise _RxStatsError('Invalid filename', 400)
+
+        filepath = os.path.join(log_dir, filename)
+        if not os.path.exists(filepath):
+            raise _RxStatsError('File not found', 404)
+
+        # Must be an activity log
+        if not filename.startswith('openwxsdr_'):
+            raise _RxStatsError('Not an activity log', 400)
+
+        # --- Parse JSON activity log, incrementally -------------------------------
+        # The file is append-only (new events are only ever added at the end), so we
+        # resume from the byte offset we stopped at last time and only parse new lines,
+        # merging them onto the cached event lists from earlier calls.
+        with self._rx_stats_cache_lock:
+            cached_activity = self._rx_stats_activity_cache.get(filename)
+
+        file_size = os.path.getsize(filepath)
+        if cached_activity is not None and cached_activity.get('offset', 0) <= file_size:
+            start_offset = cached_activity['offset']
+            decoder_events = list(cached_activity.get('decoder_events', []))
+            sonde_events = list(cached_activity.get('sonde_events', []))
+            sonde_stopped_events = list(cached_activity.get('sonde_stopped_events', []))
+            freq_to_sonde_type = dict(cached_activity.get('freq_to_sonde_type', {}))
+        else:
+            # No usable cache, or the file got shorter than our last-known offset
+            # (e.g. rotated/truncated) — fall back to a full re-parse from scratch.
+            start_offset = 0
+            decoder_events = []
+            sonde_events = []
+            sonde_stopped_events = []
+            freq_to_sonde_type = {}
+
+        with open(filepath, 'rb') as f:
+            f.seek(start_offset)
+            committed_offset = start_offset
+            for raw_line in f:
+                if not raw_line.endswith(b'\n'):
+                    # Partial line still being written — stop here and re-read it
+                    # complete (from committed_offset) on the next call.
+                    break
+                committed_offset += len(raw_line)
+                line = raw_line.decode('utf-8', errors='ignore').strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    event_type = event.get('action')  # Changed from 'event' to 'action'
+                    timestamp = event.get('datetime')  # Changed from 'timestamp' to 'datetime'
+
+                    # Decoder start/stop events
+                    if event_type in ['decoder_start', 'decoder_stop']:
+                        freq = event.get('data', {}).get('frequency_mhz')
+                        stype = event.get('data', {}).get('sonde_type')
+
+                        # Store frequency → sonde_type mapping from decoder_start.
+                        # Key as a string (not float) so this dict round-trips cleanly
+                        # through the JSON cache file without a key-type mismatch.
+                        if event_type == 'decoder_start' and freq and stype:
+                            freq_to_sonde_type[str(round(freq, 2))] = stype
+
+                        decoder_events.append({
+                            'timestamp': timestamp,
+                            'event': event_type,
+                            'frequency': freq,
+                            'sonde_type': stype
+                        })
+
+                    # Sonde first frame events
+                    elif event_type == 'sonde_first_frame':
+                        data = event.get('data', {})
+                        stype = data.get('sonde_type', '').strip()
+                        freq = data.get('frequency_mhz')
+                        serial = data.get('serial', '')
+
+                        # If sonde_type is empty, try to determine from frequency mapping
+                        if not stype and freq:
+                            stype = freq_to_sonde_type.get(str(round(freq, 2)), '')
+
+                        # If still empty, use serial pattern as fallback
+                        # NOTE: Serial IDs no longer have M10-/M20-/DFM-/iMet- prefixes
+                        if not stype and serial:
+                            # M10/M20: Often contains hyphens like "310-2-02647"
+                            if '-' in serial and serial[0].isdigit():
+                                stype = 'M20'  # Default to M20 for hyphenated numeric serials
+                            # DFM: 8 digits (no prefix anymore)
+                            elif serial.isdigit() and len(serial) == 8:
+                                stype = 'DFM'
+                            # RS41: Starts with letter followed by 7-8 digits
+                            elif serial[0].isalpha() and serial[1:].isdigit() and len(serial) in (8, 9):
+                                stype = 'RS41'
+                            # iMet: Often numeric or alphanumeric
+                            elif serial.startswith('iMet') or serial.startswith('IMET'):
+                                stype = 'iMet'
+                            else:
+                                stype = 'Unknown'
+
+                        sonde_events.append({
+                            'timestamp': timestamp,
+                            'serial': serial,
+                            'sonde_type': stype,
+                            'frequency': freq,
+                            'rssi': data.get('rssi'),
+                            'snr': data.get('snr'),
+                            'sats': data.get('sats'),
+                            'alt': data.get('alt')  # Include altitude
+                        })
+
+                    # Sonde stopped events (for frame counts)
+                    elif event_type == 'sonde_stopped':
+                        data = event.get('data', {})
+                        sonde_stopped_events.append({
+                            'timestamp': timestamp,
+                            'serial': data.get('serial'),
+                            'total_frames': data.get('total_frames', 0)
+                        })
+
+                except json.JSONDecodeError:
+                    continue
+
+        # Retain at most ~110 days of event history in the cache — comfortably more than
+        # the longest selectable range (3 months / ~92 days) the web UI ever requests, so
+        # this bounds the cache's on-disk size indefinitely without affecting any range
+        # actually shown. The underlying sonde logfiles on disk are untouched either way.
+        cache_retention_cutoff = (datetime.now() - timedelta(days=110)).strftime('%Y-%m-%d %H:%M:%S')
+
+        def _not_too_old(ts):
+            return not ts or ts >= cache_retention_cutoff
+
+        with self._rx_stats_cache_lock:
+            self._rx_stats_activity_cache[filename] = {
+                'offset': committed_offset,
+                'decoder_events': [e for e in decoder_events if _not_too_old(e.get('timestamp'))],
+                'sonde_events': [e for e in sonde_events if _not_too_old(e.get('timestamp'))],
+                'sonde_stopped_events': [e for e in sonde_stopped_events if _not_too_old(e.get('timestamp'))],
+                'freq_to_sonde_type': freq_to_sonde_type,
+            }
+
+        # --- Apply the requested time range (view-level filter over the full cached
+        # history — the cache above always keeps ~110 days regardless of what's asked
+        # for here, so switching the dropdown to a wider range never needs a re-scan). --
+        if days is not None:
+            cutoff_str = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+
+            def _in_range(ts):
+                return bool(ts) and ts >= cutoff_str
+
+            decoder_events = [e for e in decoder_events if _in_range(e.get('timestamp'))]
+            sonde_events = [e for e in sonde_events if _in_range(e.get('timestamp'))]
+            sonde_stopped_events = [e for e in sonde_stopped_events if _in_range(e.get('timestamp'))]
+
+        # RSSI/sats values are derived from (already time-filtered) sonde_events rather
+        # than accumulated during parsing, so they stay correct across cached/incremental
+        # parses and different day-range selections without needing their own cache entry.
+        rssi_values = [s['rssi'] for s in sonde_events if s.get('rssi') is not None]
+        sats_values = [s['sats'] for s in sonde_events if s.get('sats') is not None]
+
+        # Calculate statistics - count unique sondes by serial
+        total_sondes = len(set(sonde['serial'] for sonde in sonde_events if sonde.get('serial')))
+        avg_rssi = sum(rssi_values) / len(rssi_values) if rssi_values else 0
+        avg_sats = sum(sats_values) / len(sats_values) if sats_values else 0
+
+        # Group sondes by day for timeline (count unique sondes per day)
+        sondes_by_day = {}
+        for sonde in sonde_events:
+            try:
+                # Parse datetime in format: '2026-06-17 12:34:56'
+                dt = datetime.strptime(sonde['timestamp'], '%Y-%m-%d %H:%M:%S')
+                day_key = dt.strftime('%Y-%m-%d')
+                if day_key not in sondes_by_day:
+                    sondes_by_day[day_key] = set()
+                sondes_by_day[day_key].add(sonde['serial'])
+            except:
+                pass
+
+        # Convert sets to counts
+        sonde_timeline = {day: len(serials) for day, serials in sondes_by_day.items()}
+
+        # Calculate number of recorded days
+        recorded_days = len(sondes_by_day)
+
+        # Calculate max sondes per day with date
+        max_sondes_per_day = 0
+        max_sondes_date = None
+        if sonde_timeline:
+            max_day = max(sonde_timeline.items(), key=lambda x: (x[1], x[0]))  # Sort by count, then by date (latest)
+            max_sondes_per_day = max_day[1]
+            max_sondes_date = max_day[0]
+
+        # 'total_frames_from_stopped' is a distinct, informational "completed
+        # sessions" stat — kept exactly as before. It must NOT be used to build the
+        # "Total Frames per Day" chart: 'sonde_stopped' events were only added to
+        # the activity logger in a later software version, so older activity logs
+        # have zero sonde_stopped events for weeks/months of otherwise-valid sonde
+        # history. Relying on them for frames_by_day silently dropped every earlier
+        # day from that chart while "Received Sondes per Day" (built from
+        # 'sonde_first_frame' events, which always existed) kept showing the full
+        # range. frames_by_day itself is computed below directly from each sonde's
+        # logfile instead, so it always covers the same range.
+        total_frames_from_stopped = sum(s.get('total_frames', 0) for s in sonde_stopped_events)
+        frames_by_day = {}
+
+        # Group sonde types by unique serials (not total events)
+        sonde_types_serials = {}
+        for sonde in sonde_events:
+            stype = sonde.get('sonde_type', 'Unknown')
+            serial = sonde.get('serial')
+            if serial:
+                if stype not in sonde_types_serials:
+                    sonde_types_serials[stype] = set()
+                sonde_types_serials[stype].add(serial)
+
+        # Convert sets to counts
+        sonde_types = {stype: len(serials) for stype, serials in sonde_types_serials.items()}
+
+        # Get unique frequencies (rounded to 2 decimals) with dates
+        from datetime import date as date_class
+        today = date_class.today().strftime('%Y-%m-%d')
+        frequencies_with_dates = {}
+        for sonde in sonde_events:
+            freq = sonde.get('frequency')
+            timestamp = sonde.get('timestamp')
+            if freq is not None and timestamp:
+                freq_rounded = round(freq, 2)
+                try:
+                    dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+                    day_key = dt.strftime('%Y-%m-%d')
+                    if freq_rounded not in frequencies_with_dates:
+                        frequencies_with_dates[freq_rounded] = {'total': 0, 'today': 0}
+                    frequencies_with_dates[freq_rounded]['total'] += 1
+                    if day_key == today:
+                        frequencies_with_dates[freq_rounded]['today'] += 1
+                except:
+                    pass
+
+        # Get first frame altitude per sonde serial (for altitude chart)
+        # Read ACTUAL first frame from sonde logfiles, not from activity log
+        sonde_altitudes_dict = {}
+        last_sonde_altitudes_dict = {}
+
+        # Build set of unique serials from sonde_events
+        unique_serials = set(s.get('serial') for s in sonde_events if s.get('serial'))
+
+        if os.path.exists(log_dir):
+            # CRITICAL: list the directory ONCE, not once per unique serial.
+            # This endpoint re-listed data/logs inside the loop below for
+            # every distinct sonde ever seen in the activity log — on a
+            # gateway with a long tracking history (hundreds of serials),
+            # that's hundreds of redundant directory listings and was the
+            # main reason RX statistics got slower the longer a gateway
+            # had been running.
+            all_log_files = os.listdir(log_dir)
+
+            # Resolve each serial's logfile list up front so total_log_files (used for
+            # progress reporting) is known before the scan starts. Restricting to
+            # unique_serials (already time-range filtered above) means a short range
+            # naturally skips almost all of a large gateway's log history entirely.
+            serial_logs_map = {}
+            total_log_files = 0
+            for serial in unique_serials:
+                prefix = f"{serial}-"
+                sonde_logs = [
+                    os.path.join(log_dir, fname) for fname in all_log_files
+                    if fname.startswith(prefix) and fname.endswith('.log')
+                ]
+                if sonde_logs:
+                    serial_logs_map[serial] = sonde_logs
+                    total_log_files += len(sonde_logs)
+
+            file_index = 0
+            for serial, sonde_logs in serial_logs_map.items():
+                sorted_logs = sorted(sonde_logs)  # filename contains the session timestamp
+                oldest_log = sorted_logs[0]
+                newest_log = sorted_logs[-1]
+                sonde_type = 'Unknown'
+
+                for log_path in sorted_logs:
+                    file_index += 1
+                    if progress_cb is not None:
+                        try:
+                            progress_cb(file_index, total_log_files, os.path.basename(log_path))
+                        except Exception:
+                            pass
+
+                    need_first_alt = (log_path == oldest_log)
+                    need_last_alt = (log_path == newest_log)
+
+                    try:
+                        st = os.stat(log_path)
+                        mtime, fsize = st.st_mtime, st.st_size
+                    except OSError as e:
+                        self.logger.warning(f"Error accessing sonde logfile {log_path}: {e}")
+                        continue
+
+                    with self._rx_stats_cache_lock:
+                        cached = self._rx_stats_file_cache.get(log_path)
+
+                    # A closed session's logfile never changes again, so an mtime+size
+                    # match means the cached scan result is still accurate — skip the
+                    # (potentially large) file read entirely. A currently-active sonde's
+                    # newest logfile keeps growing between calls, so it naturally fails
+                    # this check every time and gets rescanned fresh, without the closed
+                    # sessions around it (typically almost all of them) paying that cost.
+                    if cached is not None and cached.get('mtime') == mtime and cached.get('size') == fsize:
+                        file_frames = cached.get('frames_by_day', {})
+                        file_sonde_type = cached.get('sonde_type', 'Unknown')
+                        first_alt = cached.get('first_alt')
+                        last_alt = cached.get('last_alt')
+                    else:
+                        file_frames, file_sonde_type, first_alt, last_alt = self._scan_sonde_logfile(
+                            log_path, need_first_alt=need_first_alt, need_last_alt=need_last_alt
+                        )
+                        with self._rx_stats_cache_lock:
+                            self._rx_stats_file_cache[log_path] = {
+                                'mtime': mtime, 'size': fsize,
+                                'frames_by_day': file_frames,
+                                'sonde_type': file_sonde_type,
+                                'first_alt': first_alt,
+                                'last_alt': last_alt,
+                            }
+
+                    for day, count in file_frames.items():
+                        frames_by_day[day] = frames_by_day.get(day, 0) + count
+
+                    if file_sonde_type and file_sonde_type != 'Unknown':
+                        sonde_type = file_sonde_type
+
+                    if need_first_alt and first_alt is not None:
+                        sonde_altitudes_dict[serial] = {
+                            'serial': serial, 'altitude': first_alt, 'sonde_type': sonde_type
+                        }
+                    if need_last_alt and last_alt is not None:
+                        last_sonde_altitudes_dict[serial] = {
+                            'serial': serial, 'altitude': last_alt, 'sonde_type': sonde_type
+                        }
+
+            # Persist the (possibly updated) file/activity cache for next time. Best-effort:
+            # a failed save just means the next call re-scans a bit more, nothing is lost.
+            self._save_rx_stats_cache()
+
+        if days is not None:
+            # Clip any day that leaked in from a session logfile spanning further back
+            # than the requested range (e.g. a flight that started just before the
+            # cutoff), so the chart's x-axis never extends past what was asked for.
+            frames_by_day = {d: c for d, c in frames_by_day.items() if d >= cutoff_str[:10]}
+
+        # Fallback: use altitude from activity log if logfile read failed
+        # NOTE: Only fallback for FIRST frame altitude, not last
+        # (last frame requires actual logfile data to be meaningful)
+        for sonde in sonde_events:
+            serial = sonde.get('serial')
+            alt = sonde.get('alt')
+            sonde_type = sonde.get('sonde_type', 'Unknown')
+            if serial and alt is not None:
+                # Add to first frame altitude if no logfile data
+                if serial not in sonde_altitudes_dict:
+                    sonde_altitudes_dict[serial] = {
+                        'serial': serial,
+                        'altitude': alt,
+                        'sonde_type': sonde_type
+                    }
+                # DO NOT add to last frame altitude - only show sondes with logfiles
+                # This prevents showing identical first/last values for sondes without logfiles
+
+        # Convert to lists
+        sonde_altitudes = list(sonde_altitudes_dict.values())
+        last_sonde_altitudes = list(last_sonde_altitudes_dict.values())
+
+        # Create RSSI timeline (RSSI values with timestamps)
+        rssi_timeline = []
+        for sonde in sonde_events:
+            if sonde.get('rssi') is not None:
+                rssi_timeline.append({
+                    'timestamp': sonde.get('timestamp'),
+                    'rssi': sonde.get('rssi'),
+                    'serial': sonde.get('serial')
+                })
+
+        # Get today's frame count from frames_by_day (using 'today' calculated earlier)
+        frames_today = frames_by_day.get(today, 0)
+
+        return {
+            'success': True,
+            'decoder_events': decoder_events,
+            'sonde_events': sonde_events,
+            'sonde_timeline': sonde_timeline,
+            'frames_timeline': frames_by_day,
+            'rssi_values': rssi_values,
+            'rssi_timeline': rssi_timeline,
+            'sats_values': sats_values,
+            'sonde_types': sonde_types,
+            'frequencies': frequencies_with_dates,
+            'sonde_altitudes': sonde_altitudes,
+            'last_sonde_altitudes': last_sonde_altitudes,
+            'statistics': {
+                'total_sondes': total_sondes,
+                'total_decoder_starts': len([e for e in decoder_events if e['event'] == 'decoder_start']),
+                'avg_rssi': round(avg_rssi, 1),
+                'avg_sats': round(avg_sats, 1),
+                'total_frames': frames_today,
+                'total_frames_from_stopped': total_frames_from_stopped,
+                'recorded_days': recorded_days,
+                'max_sondes_per_day': max_sondes_per_day,
+                'max_sondes_date': max_sondes_date
+            }
+        }
+
     def _setup_action_logger(self):
         """Setup JSON action logger"""
         import json
@@ -3611,6 +3930,52 @@ class WebUI:
             'tasks_line': tasks_line,
             'cpu_line': cpu_line,
             'console_status': '\n'.join(console_lines),
+        }
+
+    @staticmethod
+    def _human_bytes(num_bytes) -> str:
+        """Format a byte count as a compact human-readable string (e.g. 7.7 GB)."""
+        try:
+            n = float(num_bytes)
+        except (TypeError, ValueError):
+            return 'n/a'
+        for unit in ('B', 'KB', 'MB', 'GB', 'TB', 'PB'):
+            if abs(n) < 1024.0:
+                return f"{n:.0f} {unit}" if unit in ('B', 'KB') else f"{n:.1f} {unit}"
+            n /= 1024.0
+        return f"{n:.1f} EB"
+
+    def _get_memory_disk_info(self) -> dict:
+        """Total RAM plus root-filesystem disk total/free, human-readable.
+        Uses psutil for RAM when available (falls back to /proc/meminfo); disk
+        uses stdlib shutil.disk_usage so it works without psutil."""
+        ram_total = None
+        if PSUTIL_AVAILABLE:
+            try:
+                ram_total = psutil.virtual_memory().total
+            except Exception:
+                ram_total = None
+        if ram_total is None:
+            try:
+                with open('/proc/meminfo') as fh:
+                    for line in fh:
+                        if line.startswith('MemTotal:'):
+                            ram_total = int(line.split()[1]) * 1024  # kB → bytes
+                            break
+            except Exception:
+                ram_total = None
+
+        disk_total = disk_free = None
+        try:
+            usage = shutil.disk_usage('/')
+            disk_total, disk_free = usage.total, usage.free
+        except Exception:
+            pass
+
+        return {
+            'ram_total': self._human_bytes(ram_total) if ram_total else 'n/a',
+            'disk_total': self._human_bytes(disk_total) if disk_total else 'n/a',
+            'disk_free': self._human_bytes(disk_free) if disk_free else 'n/a',
         }
 
     def _get_host_info(self) -> dict:

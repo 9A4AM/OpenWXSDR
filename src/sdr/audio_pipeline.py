@@ -65,22 +65,32 @@ class AudioPipeline:
     RSSI_CALIBRATION_DB = -14.0
     AUTO_GAIN_ESTIMATE_DB = 35.0
     
-    def __init__(self, frequency: float, sample_rate: int = 48000, device_serial: str = "0", gain: int = 0, ppm_correction: int = 0):
+    def __init__(self, frequency: float, sample_rate: int = 48000, device_serial: str = "0", gain: int = 0, ppm_correction: int = 0,
+                 enable_metrics: bool = False):
         """
         Initialize audio pipeline
-        
+
         Args:
             frequency: Center frequency in Hz
             sample_rate: Output sample rate (default 48000 Hz for RS41)
             device_serial: RTL-SDR device serial number (or index as string, e.g., "0", "1")
             gain: Tuner gain (0 = auto, or specific value 0-50)
             ppm_correction: PPM frequency correction (default 0)
+            enable_metrics: If True, insert a Python pump thread between rtl_fm
+                and the decoder to compute live RSSI/SNR from the IQ stream.
+                If False (default), the decoder reads rtl_fm's stdout DIRECTLY
+                (V1.0.50 topology) — no Python thread in the signal path. The
+                pump is a prime suspect for the V1.0.52→60 RS41 frame-yield
+                regression: under CPU load it stalls, rtl_fm's stdout buffer
+                fills, librtlsdr silently drops samples, and the decoder loses
+                bit sync with no error anywhere.
         """
         self.frequency = frequency
         self.sample_rate = sample_rate
         self.device_serial = device_serial
         self.gain = gain
         self.ppm_correction = ppm_correction
+        self.enable_metrics = enable_metrics
         self.logger = logging.getLogger(f'AudioPipeline.{frequency/1e6:.3f}')
         
         self.rtl_process: Optional[subprocess.Popen] = None
@@ -117,10 +127,22 @@ class AudioPipeline:
                 '-M', 'raw',
                 '-s', f'{self.sample_rate//1000}k',
                 '-f', f'{self.frequency/1e6:.2f}M',
-                '-g', str(self.gain),
-                '-E', 'dc',
-                '-'
             ]
+            # CRITICAL: gain 0 means AUTO (per config docs: "gain: 0 = auto"),
+            # but rtl_fm treats '-g 0' as MANUAL 0 dB — near-minimum gain, which
+            # makes the decoder deaf and produces zero frames even on a strong
+            # 30 dB+ signal (field: RTL00001/RTL00003 configured gain 0 decoded
+            # nothing). rtl_fm only uses its automatic gain when -g is OMITTED
+            # entirely. So pass -g only for a real manual gain; drop it for auto.
+            try:
+                gain_val = float(self.gain)
+            except (TypeError, ValueError):
+                gain_val = 0.0
+            if gain_val > 0.0:
+                rtl_cmd += ['-g', str(self.gain)]
+            else:
+                self.logger.info("Tuner gain 0 → using rtl_fm automatic gain (omitting -g)")
+            rtl_cmd += ['-E', 'dc', '-']
             
             self.logger.info(f"Starting rtl_fm: {' '.join(rtl_cmd)}")
             
@@ -148,18 +170,24 @@ class AudioPipeline:
             
             self.running = True
 
-            # Create a monitored pipe for decoder stdin and start IQ pump.
-            self._pipe_read_fd, self._pipe_write_fd = os.pipe()
-            self._decoder_stream = open(self._pipe_read_fd, 'rb', closefd=True)
-            self._pipe_read_fd = None
+            if self.enable_metrics:
+                # Metrics mode: monitored pipe + IQ pump thread (adds a Python
+                # thread to the signal path — see enable_metrics docstring)
+                self._pipe_read_fd, self._pipe_write_fd = os.pipe()
+                self._decoder_stream = open(self._pipe_read_fd, 'rb', closefd=True)
+                self._pipe_read_fd = None
 
-            self._pump_thread = threading.Thread(
-                target=self._pump_rtl_iq_to_decoder,
-                daemon=True,
-                name=f"AudioPump.{self.frequency/1e6:.3f}",
-            )
-            self._pump_thread.start()
-            
+                self._pump_thread = threading.Thread(
+                    target=self._pump_rtl_iq_to_decoder,
+                    daemon=True,
+                    name=f"AudioPump.{self.frequency/1e6:.3f}",
+                )
+                self._pump_thread.start()
+            else:
+                # Direct piping (V1.0.50 topology): decoder reads rtl_fm stdout
+                # with zero Python involvement in the signal path
+                self._decoder_stream = self.rtl_process.stdout
+
             # Monitor stderr
             self.rtl_stderr_thread = threading.Thread(
                 target=self._monitor_stderr,
@@ -167,8 +195,11 @@ class AudioPipeline:
                 daemon=True
             )
             self.rtl_stderr_thread.start()
-            
-            self.logger.info(f"Audio pipeline started: rtl_fm raw IQ at {self.sample_rate} Hz")
+
+            self.logger.info(
+                f"Audio pipeline started: rtl_fm raw IQ at {self.sample_rate} Hz "
+                f"({'metrics pump' if self.enable_metrics else 'direct pipe'})"
+            )
             return True
             
         except FileNotFoundError as e:
@@ -253,7 +284,11 @@ class AudioPipeline:
         return None
 
     def get_signal_metrics_snapshot(self):
-        """Return latest rolling (rssi_dbfs, snr_db) from live decoder IQ stream."""
+        """Return latest rolling (rssi_dbfs, snr_db) from live decoder IQ stream.
+        Returns (None, None) in direct-pipe mode — callers already fall back
+        to the scan-time signal strength."""
+        if not self.enable_metrics:
+            return (None, None)
         return self.metrics.snapshot()
     
     def is_alive(self) -> bool:

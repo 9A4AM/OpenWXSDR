@@ -44,10 +44,90 @@
 """
 
 import logging
+import os
 import signal
 import sys
+import threading
 import time
+from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
+
+
+class FrequencyRepository:
+    """Per-session log of radiosonde band activity → logs/sdrfreq_<ts>.log.
+
+    Two row types (per the "Both" design):
+      * detected  — a sonde-like peak the scanner found (freq/SNR, no serial)
+      * confirmed — a decode produced real telemetry (freq/type/serial/SNR/RSSI)
+    Deduped so the file stays compact: one 'detected' row per 10 kHz channel and
+    one 'confirmed' row per sonde serial per session. The web UI reads the file
+    back (glob newest sdrfreq_*.log) to show the repository modal.
+    """
+
+    HEADER = "datetime_utc,event,frequency_mhz,type,serial,snr_db,rssi_dbm,alt_m,device\n"
+
+    def __init__(self, logdir: str = "logs"):
+        self.logger = logging.getLogger("FreqRepo")
+        self._logdir = logdir
+        self._lock = threading.Lock()
+        self._path: Optional[str] = None
+        self._detected_keys = set()       # 10 kHz channel buckets
+        self._confirmed_serials = set()
+        self._filename = f"sdrfreq_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    @staticmethod
+    def _key(freq_hz: float) -> int:
+        return round(freq_hz / 10_000.0)   # 10 kHz channel bucket
+
+    def _row(self, event, freq_hz, sonde_type="", serial="", snr=None, rssi=None, alt=None, device=""):
+        def num(v, spec):
+            try:
+                return spec.format(v) if (v is not None and v != 0.0) else ""
+            except Exception:
+                return ""
+        dt = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return (f"{dt},{event},{freq_hz/1e6:.3f},{sonde_type or ''},{serial or ''},"
+                f"{num(snr, '{:.1f}')},{num(rssi, '{:.1f}')},{num(alt, '{:.0f}')},{device or ''}\n")
+
+    def _append(self, line: str):
+        try:
+            with self._lock:
+                if self._path is None:
+                    os.makedirs(self._logdir, exist_ok=True)
+                    self._path = os.path.join(self._logdir, self._filename)
+                    with open(self._path, "a", encoding="utf-8") as f:
+                        f.write("# OpenWXSDR frequency repository (session)\n")
+                        f.write(self.HEADER)
+                with open(self._path, "a", encoding="utf-8") as f:
+                    f.write(line)
+        except Exception as e:
+            self.logger.debug(f"freq repo write failed: {e}")
+
+    def record_detected(self, freq_hz: float, snr=None, device=""):
+        k = self._key(freq_hz)
+        with self._lock:
+            if k in self._detected_keys:
+                return
+            self._detected_keys.add(k)
+        self._append(self._row("detected", freq_hz, snr=snr, device=device))
+        self.logger.info(f"Freq repo: detected {freq_hz/1e6:.3f} MHz")
+
+    def record_confirmed(self, telemetry):
+        serial = getattr(telemetry, "serial", "") or ""
+        if not serial:
+            return
+        with self._lock:
+            if serial in self._confirmed_serials:
+                return
+            self._confirmed_serials.add(serial)
+        alt = telemetry.position.altitude if getattr(telemetry, "position", None) else None
+        self._append(self._row(
+            "confirmed", telemetry.frequency, sonde_type=telemetry.sonde_type, serial=serial,
+            snr=getattr(telemetry, "snr", None), rssi=getattr(telemetry, "rssi", None),
+            alt=alt, device=getattr(telemetry, "receiver_device", "") or ""))
+        self.logger.info(
+            f"Freq repo: confirmed {telemetry.sonde_type} {serial} @ "
+            f"{telemetry.frequency/1e6:.3f} MHz")
 
 from .sdr.rtlsdr_analyzer import SpectrumAnalyzer
 from .sdr.ka9q_receiver import KA9QReceiver
@@ -60,6 +140,8 @@ from .output.mqtt_output import MQTTOutput
 from .output.http_output import HttpOutput
 from .output.sondehub_output import SondeHubOutput
 from .output.sondehub_queue import SondeHubQueueOutput
+from .output.channelizer_status import ChannelizerStatusOutput
+from .telemetry.telemetry import InstallPing
 from .webui.web_server import WebUI
 
 if TYPE_CHECKING:
@@ -85,8 +167,15 @@ class OpenWXSDR:
         self.mqtt_output: Optional[MQTTOutput] = None
         self.http_output: Optional[HttpOutput] = None
         self.sondehub_output: Optional[object] = None
+        self.channelizer_status_output: Optional[ChannelizerStatusOutput] = None
         self.webui: Optional[WebUI] = None
-        
+        self.install_ping: Optional[InstallPing] = None
+
+        # Per-session repository of detected + confirmed radiosonde frequencies
+        # (logs/sdrfreq_<ts>.log). Populated by the scanner (detected) and the
+        # telemetry handlers (confirmed); read back by the web UI modal.
+        self.frequency_repository = FrequencyRepository()
+
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -96,13 +185,18 @@ class OpenWXSDR:
         self.logger.info("Initializing OpenWXSDR...")
         
         try:
+            # Initialize channelizer status output early (needed by device_manager)
+            self.logger.info("Initializing channelizer status output...")
+            self.channelizer_status_output = ChannelizerStatusOutput(self.config)
+            
             # Initialize SDR
             sdr_type = self.config['sdr']['type']
             
             if sdr_type == 'rtlsdr':
                 self.logger.info("Initializing RTL-SDR device manager...")
                 self.device_manager = RTLSDRDeviceManager(
-                    self.config, self._handle_telemetry
+                    self.config, self._handle_telemetry, self.channelizer_status_output,
+                    frequency_repository=self.frequency_repository
                 )
                 if not self.device_manager.initialize():
                     self.logger.error("Failed to initialize RTL-SDR device manager")
@@ -110,7 +204,7 @@ class OpenWXSDR:
             
             elif sdr_type == 'ka9q':
                 self.logger.info("Initializing KA9Q receiver...")
-                self.ka9q_receiver = KA9QReceiver(self.config)
+                self.ka9q_receiver = KA9QReceiver(self.config, self._handle_ka9q_telemetry)
                 if not self.ka9q_receiver.initialize():
                     self.logger.error("Failed to initialize KA9Q receiver")
                     return False
@@ -160,7 +254,8 @@ class OpenWXSDR:
                 self.decoder_manager = DecoderManager(
                     self.config,
                     self._handle_telemetry,
-                    spectrum_analyzer=None
+                    spectrum_analyzer=None,
+                    ka9q_receiver=self.ka9q_receiver  # Pass KA9Q receiver for status queries
                 )
             
             # Initialize output
@@ -185,6 +280,11 @@ class OpenWXSDR:
                 self.logger.info("SondeHub uploader mode: direct")
                 self.sondehub_output = SondeHubOutput(self.config)
             
+            # Anonymous, opt-out install counter (see telemetry.py docstring
+            # for exactly what is/isn't sent — no callsign/location/credentials)
+            self.logger.info("Initializing anonymous install counter...")
+            self.install_ping = InstallPing(self.config)
+
             # Initialize web UI
             self.logger.info("Initializing web UI...")
             self.webui = WebUI(self.config)
@@ -199,6 +299,7 @@ class OpenWXSDR:
                         self.decoder_manager
                     ),
                     flux242_receiver=self.flux242_receiver,
+                    ka9q_receiver=self.ka9q_receiver,
                     mqtt_output=self.mqtt_output,
                     sondehub_output=self.sondehub_output
                 )
@@ -219,6 +320,10 @@ class OpenWXSDR:
             # Start web UI
             if self.webui:
                 self.webui.start()
+
+            # Start anonymous install ping (no-op if telemetry.enabled: false)
+            if self.install_ping:
+                self.install_ping.start()
             
             # Start decoder manager (only for rtlsdr/ka9q modes)
             if self.decoder_manager:
@@ -303,6 +408,9 @@ class OpenWXSDR:
         self.running = False
         
         # Stop components in reverse order
+        if self.install_ping:
+            self.install_ping.stop()
+
         if self.device_manager:
             self.device_manager.stop()
 
@@ -420,19 +528,48 @@ class OpenWXSDR:
         except Exception as e:
             self.logger.error(f"Error checking priority frequency: {e}", exc_info=True)
     
+    @staticmethod
+    def _format_telemetry_log(telemetry) -> str:
+        """One-line telemetry summary. Optional fields (T/P/H, SNR, RSSI) print
+        N/A when the sonde/receiver supplied no real value — never a fabricated
+        default. Temperature 0 °C is a real value (only None → N/A); SNR/RSSI of
+        None or exactly 0.0 (the unset default) → N/A."""
+        def env(v, spec):
+            return spec.format(v) if v is not None else "N/A"
+        def sig(v, spec):
+            return spec.format(v) if (v is not None and v != 0.0) else "N/A"
+
+        pos = telemetry.position
+        pos_str = ""
+        if pos:
+            pos_str = (f"{pos.latitude:.5f} {pos.longitude:.5f} "
+                       f"{pos.altitude:.0f}m ")
+        vel_str = ""
+        if telemetry.velocity:
+            vel_str = f"Vv:{telemetry.velocity.vertical_speed:+.1f}m/s "
+
+        e = telemetry.environment
+        temp = e.temperature if e else None
+        hum = e.humidity if e else None
+        pres = e.pressure if e else None
+        return (
+            f"{telemetry.sonde_type} {telemetry.serial} "
+            f"{telemetry.frequency/1e6:.3f}MHz "
+            f"#{telemetry.frame_number} "
+            f"{pos_str}{vel_str}"
+            f"T:{env(temp, '{:.1f}C')} P:{env(pres, '{:.1f}hPa')} H:{env(hum, '{:.0f}%')} "
+            f"SNR:{sig(telemetry.snr, '{:.1f}dB')} RSSI:{sig(telemetry.rssi, '{:.1f}dBm')}"
+        )
+
     def _handle_telemetry(self, telemetry: SondeTelemetry):
         """Handle decoded telemetry from decoders (rtlsdr/ka9q modes)"""
         try:
             self.logger.debug(f"[TELEMETRY] Received: serial={telemetry.serial}, type={telemetry.sonde_type}")
-            # Log telemetry
-            self.logger.info(
-                f"Telemetry: {telemetry.sonde_type} {telemetry.serial} "
-                f"F{telemetry.frame_number} "
-                f"{telemetry.position.latitude:.5f},{telemetry.position.longitude:.5f} "
-                f"Alt:{telemetry.position.altitude:.0f}m"
-                if telemetry.position else ""
-            )
-            
+            self.logger.info(self._format_telemetry_log(telemetry))
+
+            # Frequency repository: mark this frequency confirmed (once per serial)
+            self.frequency_repository.record_confirmed(telemetry)
+
             # Send to web UI
             if self.webui:
                 self.webui.add_telemetry(telemetry)
@@ -562,7 +699,101 @@ class OpenWXSDR:
             
         except Exception as e:
             self.logger.error(f"Error handling flux242 telemetry: {e}", exc_info=True)
-    
+
+    def _handle_ka9q_telemetry(self, telemetry_dict: dict):
+        """Handle decoded telemetry from the KA9Q receiver's fsk_demod→decoder
+        pipeline. The rs1729 decoder JSON uses 'id' for the serial and carries
+        no frequency (that comes from the RTP stream/SSRC and is injected by
+        ka9q_receiver before this callback). Mirrors _handle_flux242_telemetry."""
+        try:
+            from .decoders.models import SondePosition, SondeVelocity, SondeEnvironment
+            from datetime import datetime
+
+            serial = str(telemetry_dict.get('id') or telemetry_dict.get('serial') or 'UNKNOWN').strip()
+            # Strip family prefixes the way the RTL path does
+            for prefix in ('RS41-', 'M10-', 'M20-', 'DFM-', 'iMet-', 'IMET-', 'LMS6-', 'MRZ-'):
+                if serial.startswith(prefix):
+                    serial = serial[len(prefix):]
+                    break
+            if not serial or serial == 'UNKNOWN':
+                return  # No usable serial → not a real telemetry frame
+
+            dt = None
+            if telemetry_dict.get('datetime'):
+                try:
+                    dt = datetime.fromisoformat(str(telemetry_dict['datetime']).replace('Z', '+00:00'))
+                except Exception:
+                    dt = datetime.utcnow()
+            else:
+                dt = datetime.utcnow()
+
+            position = None
+            lat = telemetry_dict.get('lat')
+            lon = telemetry_dict.get('lon')
+            alt = telemetry_dict.get('alt')
+            if lat is not None and lon is not None:
+                # Reject obviously invalid fixes (0,0 placeholder / out of range)
+                if not (-90 <= lat <= 90 and -180 <= lon <= 180) or (lat == 0.0 and lon == 0.0):
+                    return
+                position = SondePosition(latitude=lat, longitude=lon,
+                                         altitude=alt if alt is not None else 0, datetime=dt)
+
+            velocity = None
+            if telemetry_dict.get('vel_h') is not None:
+                velocity = SondeVelocity(
+                    horizontal_speed=telemetry_dict['vel_h'],
+                    vertical_speed=telemetry_dict.get('vel_v', 0),
+                    heading=telemetry_dict.get('heading', 0)
+                )
+
+            # PTU (temp/humidity/pressure) from the rs41mod --ptu2 JSON. Use
+            # `is not None` (not truthiness): a genuine 0.0 °C temperature or
+            # 0.0 % humidity is falsy and would otherwise be dropped.
+            environment = None
+            _temp = telemetry_dict.get('temp')
+            _hum = telemetry_dict.get('humidity')
+            _pres = telemetry_dict.get('pressure')
+            if _temp is not None or _hum is not None or _pres is not None:
+                environment = SondeEnvironment(
+                    temperature=_temp,
+                    humidity=_hum,
+                    pressure=_pres
+                )
+
+            frequency_hz = float(telemetry_dict.get('frequency', 0.0))  # injected by ka9q_receiver (Hz)
+
+            telemetry = SondeTelemetry(
+                serial=serial,
+                sonde_type=telemetry_dict.get('type', 'RS41'),
+                frame_number=telemetry_dict.get('frame', 0),
+                position=position,
+                velocity=velocity,
+                environment=environment,
+                satellites=telemetry_dict.get('sats'),
+                frequency=frequency_hz,
+                rssi=telemetry_dict.get('rssi'),
+                snr=telemetry_dict.get('snr'),
+            )
+
+            if telemetry.position:
+                self.logger.info(self._format_telemetry_log(telemetry))
+
+            self.frequency_repository.record_confirmed(telemetry)
+
+            if self.webui:
+                self.webui.add_telemetry(telemetry)
+            if self.udp_output:
+                self.udp_output.send_telemetry(telemetry)
+            if self.mqtt_output:
+                self.mqtt_output.send_telemetry(telemetry)
+            if self.http_output:
+                self.http_output.send_telemetry(telemetry)
+            if self.sondehub_output:
+                self.sondehub_output.send_telemetry(telemetry)
+
+        except Exception as e:
+            self.logger.error(f"Error handling KA9Q telemetry: {e}", exc_info=True)
+
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
         self.logger.info(f"Received signal {signum}, shutting down...")

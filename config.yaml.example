@@ -21,6 +21,17 @@ station:
   antenna: 'QFH'              # Antenna type
   upload_interval: 15         # Gateway status upload interval in minutes (15-720, default: 15)
 
+# Anonymous installation counter — lets the OpenWXSDR project count how many
+# independent installations are active worldwide. Sends ONLY a random install
+# ID (generated once, stored in ./data/.install_id), the OpenWXSDR version,
+# and the configured SDR type (rtlsdr/ka9q/airspy/flux242) — once every
+# `interval_hours`. Never sends callsign, station location, MQTT/SondeHub
+# credentials, or any other station-identifying data. Set enabled: false to
+# opt out completely.
+telemetry:
+  enabled: true
+  interval_hours: 24
+
 # SDR Configuration
 sdr:
   # Type: 'rtlsdr', 'ka9q', 'flux242', or 'airspy'
@@ -81,7 +92,7 @@ sdr:
   ka9q:
     multicast_group: '239.28.97.202'  # RTP multicast address from radiod config
     port: 5004                         # RTP multicast port
-    interface: 'eth0'               # Network interface (0.0.0.0 = all interfaces)
+    interface: 'wlp2s0'               # Network interface (0.0.0.0 = all interfaces)
 
     # Dynamic channel management (requires tune binary from ka9q-radio)
     enable_dynamic_channels: true     # Enable dynamic channel creation/deletion
@@ -157,8 +168,100 @@ detection:
   priority_check_timeout: 30  # Seconds to wait for decoding before starting scanner
   # Signal detection thresholds
   fft_size: 2048
-  detection_threshold: 18   # dB above noise floor for RTL-SDR spectrum scanning
+  detection_threshold: 14   # dB above noise floor for RTL-SDR spectrum scanning
+                            # (14 catches weak RS41; raise toward 18 if you see
+                            # birdies. DC spurs + failed-decode cache filter most.)
   scan_threshold: 10        # dB above noise floor for Airspy FFT scanning (averaged, so lower is fine)
+
+  # RS41 fast-path: a scan peak whose 3 dB width is in this range is treated as
+  # RS41 immediately, skipping the ~15s dft_detect step (which added latency and
+  # sometimes missed weak RS41). dft_detect still runs for wider/ambiguous
+  # signals (DFM subtype, M10 vs M20, iMet). RS92 (2-3 kHz) stays below the range.
+  rs41_fastpath: true
+  rs41_fastpath_bw_min_hz: 3500
+  rs41_fastpath_bw_max_hz: 7000
+
+  # Frequency repository listing (logs/sdrfreq_*.log + Frequencies modal).
+  # repository_threshold_db is a SEPARATE (lower) SNR than detection_threshold so
+  # weak sondes get LISTED for manual selection even though they won't be
+  # auto-decoded. Grid filter for UNCONFIRMED entries (a decoded sonde is logged
+  # 'confirmed' regardless): accept the coarse 100 kHz channel grid everywhere,
+  # PLUS the fine 10 kHz grid only inside repository_dense_ranges — the
+  # 403.0-404.0 DFM/military band routinely uses 10 kHz channels (403.13/403.55).
+  # Elsewhere the 10 kHz grid is rejected to drop RTL spurs (404.040/405.660 …).
+  repository_threshold_db: 8
+  repository_grid_hz: 100000
+  repository_grid_tol_hz: 5000
+  repository_dense_grid_hz: 10000
+  repository_dense_grid_tol_hz: 3000
+  repository_dense_ranges:
+    - [403000000, 404000000]
+
+  # Band sweep (resilience): each SDR starts at its configured center_freq and,
+  # after dwell_empty_cycles scans with no decode, retunes to the next segment
+  # center spanning band_min_hz..band_max_hz. This lets ANY single SDR cover the
+  # whole band over time, so if one dongle fails the others close its gap.
+  # Static centers give fast initial acquisition; the sweep provides fault
+  # tolerance. Opt-in (off) — enable and verify on your hardware.
+  #
+  # Recommended static center_freq per device (sdr.rtlsdr.devices), band
+  # 402.1-405.9 MHz, DC-spur-safe, ~0.8 MHz spacing (each reaches ±1.0 MHz):
+  #   device 1: 402775000   (covers ~401.8-403.8, reaches low edge 402.1)
+  #   device 2: 403625000   (covers ~402.6-404.6)
+  #   device 3: 404425000   (covers ~403.4-405.4)
+  #   device 4: 405225000   (covers ~404.2-406.2, reaches high edge 405.9)
+  band_sweep:
+    enabled: false
+    band_min_hz: 402100000
+    band_max_hz: 405900000
+    step_hz: 1920000          # segment spacing (~0.8 * 2.4 MSPS → overlapping)
+    dwell_empty_cycles: 3     # hop after this many consecutive empty scans
+
+  # Hard wall-clock cap on a single spectrum capture. On contended multi-dongle
+  # Pis a nominal dwell can inflate to minutes and wedge the worker in a libusb
+  # read; this bounds it so the first scan always completes and the device stays
+  # closeable. A wedged-read watchdog quarantines a device that exceeds ~45s.
+  scan_max_wall_s: 8.0
+
+  # Scan tuning (RTL-SDR spectrum scan pipeline): scan_check_time integrates
+  # spectrum over several seconds before peak-picking — a much cleaner peak
+  # list than a single FFT snapshot. channel_spacing_hz is the real-world
+  # minimum spacing between 2 radiosonde channels, used both as the minimum
+  # peak-to-peak distance during detection and as the grid peaks are
+  # quantized to.
+  scan_check_time: 5.0      # seconds of spectrum integration before peak-picking
+                            # (>5s on 4-dongle Pis can inflate to minutes and
+                            # starve running decoders — keep low)
+  channel_spacing_hz: 10000 # minimum peak spacing / quantization grid (Hz)
+  max_peaks: 10             # cap on candidate peaks returned per scan pass
+
+  # Scan backend (Phase 1). 'welch' (default) = pyrtlsdr + Welch per-device
+  # 2.4 MHz segment scan (uses band_sweep to cover more). 'rtl_power' = full-band
+  # rtl_power sweep: one dongle sees the whole band every scan (no sweep gaps),
+  # catching just-launched low sondes sooner. Time-shared with decoding; needs
+  # the rtl_power binary (rtl-sdr package) — auto-falls back to 'welch' if
+  # missing. Same detect_signals()/threshold for both; band_sweep ignored here.
+  scanner:
+    backend: welch            # welch | rtl_power
+    rtl_power_path: rtl_power
+    band_start_hz: 402000000
+    band_stop_hz:  406000000
+    step_hz:       1000       # rtl_power bin width
+    integration_s: 5          # rtl_power -i (weaker signals vs revisit speed)
+    crop_percent:  25
+    wall_timeout_s: 60        # a full-band sweep is ~15-25 s; too low kills the scan
+
+  # Reject candidate peaks that don't land on the channel_spacing_hz raster
+  # (e.g. 401.000-405.990 MHz in 10 kHz steps). A strong signal's own
+  # sidelobes can otherwise show up as a spurious "sonde" a few kHz off its
+  # real channel. Real sondes drift up to ~3 kHz off-raster; set false if
+  # your band plan doesn't use a fixed 10 kHz raster.
+  check_frequency_raster: true
+  raster_tolerance_hz: 3000
+
+  # Short, per-candidate correlation check duration
+  # Falls back to the legacy dft_sample_duration key below if not set.
+  detect_confirm_time: 5.0
 
   # Scan interval override (seconds) — how long to wait between Airspy scans when no signal found
   # Overrides receivers.scan_interval for the Airspy mode.
@@ -179,7 +282,8 @@ detection:
   # Source: https://github.com/rs1729/RS/tree/master/scan
   use_dft_detect: true      # Enable DFT correlation detection (auto-fallback to bandwidth if unavailable)
   dft_detect_path: 'dft_detect'  # Path to dft_detect binary (or just 'dft_detect' if in PATH)
-  dft_sample_duration: 5.0  # Duration of IQ sample capture for analysis (seconds)
+  # Capture duration is set via detection.detect_confirm_time above (falls back
+  # to the older dft_sample_duration key here if detect_confirm_time is absent).
 
   # Supported sonde types (auto-detect)
   sonde_types:
@@ -197,10 +301,31 @@ decoders:
   # Path to rs1729/RS decoder binaries
   rs1729_path: './decoders/rs1729'
 
+  # Inline DC removal via iq_dec (auto_rx method): rtl_fm -M raw → iq_dec --bo 16
+  # → decoder. In the --IQ chain iq_dec feeds the decoder directly; in the soft
+  # chain it precedes fsk_demod. iq_dec strips the residual DC offset (RTL-SDR
+  # centre spike) that sits on the sonde's centre tone, improving weak-signal
+  # yield. Requires the iq_dec binary in decoders/rs1729/ (build from rs1729/RS);
+  # if absent this silently falls back to no DC stage. Default OFF so a new
+  # pipeline stage never changes decode behaviour until verified.
+  iq_dc_block: false
+
   # Decoder timeouts
   startup_timeout: 10       # seconds
   max_idle_time: 300        # seconds without frames before an auto-detected decoder stops and returns to scanning
   manual_idle_time: 1800    # seconds without frames before a manual/imported "decode until lost" decoder gives up (30 min default)
+
+# Device recovery
+recovery:
+  # When an RTL-SDR wedges (a stuck libusb read inside capture_spectrum that the
+  # watchdog quarantines), reset that dongle's USB port to free the read and
+  # bring the device back instead of leaving it dead until a full restart.
+  # Needs the service to run as root (or udev perms for /dev/bus/usb). Default
+  # OFF — validate on your hardware. If the reset fails the device just stays
+  # quarantined (previous behaviour).
+  usb_reset_on_wedge: false
+  usb_reset_settle_s: 8       # wait after reset before the worker reopens the device
+  usb_reset_max_attempts: 3   # per device per session (avoids reset-looping a dead dongle)
 
 # Logging / Debug
 logging:
@@ -260,11 +385,6 @@ output:
 
   # Telemetry update interval
   update_interval: 1        # seconds
-
-# Generate a random install ID (generated once, stored in ./data/.install_id),
-telemetry:
-  enabled: true
-  interval_hours: 24
 
 # Logging Configuration
 logging:

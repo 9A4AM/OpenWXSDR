@@ -48,7 +48,7 @@
 import logging
 import threading
 import time
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -697,9 +697,18 @@ class DecoderManager:
             except Exception:
                 pass
 
-            return self._extract_numeric_db(getattr(active.signal, 'strength', None))
+            # Non-live fallback: absolute peak power (dBFS) is the RSSI proxy.
+            # Do NOT return strength here — that's the SNR, and using it as RSSI
+            # is what made RSSI and SNR identical.
+            pwr = self._extract_numeric_db(getattr(active.signal, 'power_dbfs', None))
+            if pwr is not None and pwr != 0.0:
+                return pwr
+            return None
 
-    def _resolve_frame_db_values(self, frame_data: dict, frequency: float) -> tuple[Optional[float], Optional[float]]:
+    # NOTE: use typing.Tuple, not builtin tuple[...] — the latter needs
+    # Python 3.9+ and crashed on a fresh Python 3.8 install at import time
+    # ("TypeError: 'type' object is not subscriptable").
+    def _resolve_frame_db_values(self, frame_data: dict, frequency: float) -> Tuple[Optional[float], Optional[float]]:
         """Resolve (rssi_db, snr_db) from frame fields with scan-strength fallback."""
         rssi_candidates = (
             frame_data.get('rssi'),
@@ -725,11 +734,19 @@ class DecoderManager:
             if snr_db is not None:
                 break
 
-        scan_db = self._get_scan_signal_strength_db(frequency)
+        # RSSI and SNR must fall back to DIFFERENT scan metrics, else they
+        # display identically. RSSI ← live RSSI or the scan's absolute peak
+        # power (dBFS); SNR ← the scan's SNR (peak above noise floor).
+        with self.lock:
+            active = self.active_decoders.get(frequency)
+            sig = active.signal if (active is not None) else None
+        scan_power = self._get_scan_signal_strength_db(frequency)  # live RSSI or power_dbfs
+        scan_snr = self._extract_numeric_db(getattr(sig, 'strength', None)) if sig is not None else None
+
         if rssi_db is None:
-            rssi_db = scan_db
+            rssi_db = scan_power if scan_power is not None else scan_snr
         if snr_db is None:
-            snr_db = scan_db
+            snr_db = scan_snr
 
         return rssi_db, snr_db
     

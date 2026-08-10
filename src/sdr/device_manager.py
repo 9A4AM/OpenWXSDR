@@ -69,6 +69,7 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
 from .rtlsdr_analyzer import DetectedSignal, SpectrumAnalyzer
+from .rtl_power_scanner import RtlPowerScanner
 from .audio_pipeline import AudioPipeline
 from .dft_detector import DftDetector
 from ..decoders.rs1729_decoder import RS1729Decoder
@@ -163,6 +164,11 @@ class DeviceWorker:
     # device and self-restarting the whole service. LIBUSB_ERROR_BUSY has never
     # been observed to self-recover within the process.
     MAX_CONSECUTIVE_OPEN_FAILURES = 10
+    # If capture_spectrum() stays in-flight longer than this, a libusb read is
+    # wedged (unrecoverable in-process). Well above any healthy capture: the
+    # scan_max_wall_s cap (default 8s) bounds a normal averaged capture, so only
+    # a genuine hung read reaches 45s.
+    CAPTURE_HANG_TIMEOUT_S = 45.0
 
     def __init__(self, device_config: dict, app_config: dict,
                  sonde_registry: SondeRegistry,
@@ -178,9 +184,67 @@ class DeviceWorker:
         self._manager        = manager  # Reference to RTLSDRDeviceManager for fixed_channels check
         self.logger          = logging.getLogger(f'Worker.{self.device_serial}')
 
+        # RS41 bandwidth fast-path (see _identify_sonde_type). Skips the ~15s
+        # dft_detect step for signals whose 3 dB width is unambiguously RS41,
+        # restoring V1.0.50's instant, reliable RS41 start. Tunable via config.
+        det_cfg = app_config.get('detection', {})
+        self.RS41_FASTPATH_ENABLED = bool(det_cfg.get('rs41_fastpath', True))
+        self.RS41_FASTPATH_BW_MIN = float(det_cfg.get('rs41_fastpath_bw_min_hz', 3500))
+        self.RS41_FASTPATH_BW_MAX = float(det_cfg.get('rs41_fastpath_bw_max_hz', 7000))
+
+        # Scan backend (Phase 1): 'welch' (pyrtlsdr + Welch, per-2.4 MHz-segment,
+        # default) or 'rtl_power' (full-band rtl_power sweep — one dongle sees the
+        # whole band every scan, no band-sweep gaps). rtl_power is time-shared
+        # with decoding on the same device; the detect/dispatch path downstream is
+        # identical. Falls back to 'welch' automatically if the binary is missing.
+        scanner_cfg = det_cfg.get('scanner', {}) or {}
+        self._scan_backend = str(scanner_cfg.get('backend', 'welch')).strip().lower()
+        if self._scan_backend not in ('welch', 'rtl_power'):
+            self._scan_backend = 'welch'
+        self._rtl_power_cfg = scanner_cfg
+        self._rtl_power_scanner: Optional[RtlPowerScanner] = None
+        self._rtl_power_fail_streak = 0   # consecutive rtl_power scan failures
+        # A device-less SpectrumAnalyzer used ONLY for detect_signals/config on
+        # the rtl_power arrays (never opens a pyrtlsdr handle).
+        self._detect_analyzer: Optional[SpectrumAnalyzer] = None
+
+        # Band-sweep (opt-in): a device starts at its configured center_freq and,
+        # after dwell_empty_cycles consecutive scans with no decode, retunes to
+        # the next segment center covering the whole radiosonde band. This lets
+        # ANY single device eventually cover the entire band, so if another SDR
+        # fails the survivors close its coverage gap on their own. Off by default
+        # so the tested static-scan path is unchanged until explicitly enabled.
+        self._sweep_cfg = det_cfg.get('band_sweep', {}) or {}
+        self._sweep_enabled = bool(self._sweep_cfg.get('enabled', False))
+        self._sweep_dwell = max(1, int(self._sweep_cfg.get('dwell_empty_cycles', 3)))
+        self._sweep_centers = []        # built lazily once sample_rate is known
+        self._sweep_index = 0
+        self._empty_scan_count = 0
+
+        # Frequency-repository listing: a lower threshold than the decode
+        # threshold so weak candidates get LISTED (not auto-decoded), plus a
+        # channel-grid filter so unconfirmed RTL spurs on odd (non-100 kHz)
+        # frequencies aren't listed. Decoded sondes are logged as 'confirmed'
+        # regardless of grid.
+        self._repo_threshold_db = float(det_cfg.get('repository_threshold_db', 8.0))
+        # Coarse channel grid accepted in EVERY segment (100 kHz sonde channels).
+        self._repo_grid_hz = float(det_cfg.get('repository_grid_hz', 100_000))
+        self._repo_grid_tol_hz = float(det_cfg.get('repository_grid_tol_hz', 5_000))
+        # Fine grid (10 kHz) accepted only inside dense segments — the 403.0-404.0
+        # DFM/military band commonly uses 10 kHz channels (403.13, 403.55, …). The
+        # 404-406/401-403 segments use 10 kHz only rarely, so there we keep to the
+        # coarse grid to reject the RTL's 10 kHz-grid spurs (x.x40/x.x60 …).
+        self._repo_dense_grid_hz = float(det_cfg.get('repository_dense_grid_hz', 10_000))
+        self._repo_dense_grid_tol_hz = float(det_cfg.get('repository_dense_grid_tol_hz', 3_000))
+        self._repo_dense_ranges = [
+            (float(lo), float(hi)) for lo, hi in
+            det_cfg.get('repository_dense_ranges', [[403_000_000, 404_000_000]])
+        ]
+
         self._state          = self.STATE_SCANNING  # Start in SCANNING state (will open USB on first cycle)
         self._running        = False
         self._thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
         self._first_usb_init = True  # Flag to track first USB device open
         self._device_lock = threading.Lock()  # CRITICAL: Prevent USB race conditions
         # Consecutive failed device-open attempts (init failure, test-read timeout/
@@ -191,6 +255,30 @@ class DeviceWorker:
         # of polling a permanently dead device forever. Reset on any successful open.
         self._consecutive_open_failures = 0
         self._manual_decode_pending = threading.Event()  # Signals scan cycle to abort early
+        # True while the worker thread is inside capture_spectrum() (an UNLOCKED
+        # libusb read). Any code that closes the analyzer from another thread
+        # (manual decode teardown) must wait for this to clear first — closing
+        # the device while a read transfer is in flight crashes with SIGBUS.
+        self._capturing = False
+        # Wall-clock time capture_spectrum() was entered. A watchdog thread uses
+        # this to detect a WEDGED capture: on flaky USB, a single libusb read
+        # inside capture_spectrum() can block forever (the scan_max_wall_s cap is
+        # checked BETWEEN reads, so it can't break a hung read). Python can't
+        # interrupt a blocked C read, and the SIGBUS guard (correctly) refuses to
+        # close the device mid-read — so without this watchdog the device stays
+        # dead for the whole process lifetime (observed overnight: RTL00001 stuck
+        # in capture for hours, every Import-API assignment aborting). The
+        # watchdog escalates to os._exit(1) so systemd restarts and releases the
+        # stuck interface — the same clean recovery the old SIGBUS used to force.
+        self._capture_started_at = 0.0
+        # Set once the watchdog quarantines this device (permanently wedged read).
+        # Guards the run loop so the abandoned worker never resumes scanning even
+        # if the stuck read eventually returns.
+        self._wedged = False
+        # True only during a deliberate USB-reset recovery: the in-flight read
+        # will error with LIBUSB_ERROR_NO_DEVICE (expected), so the scan-cycle
+        # handler logs it calmly and does NOT count it as an open failure.
+        self._recovering = False
 
         # Active scanning components
         self._analyzer: Optional[SpectrumAnalyzer] = None
@@ -202,8 +290,13 @@ class DeviceWorker:
         self._decoder:  Optional[RS1729Decoder] = None
         self._cur_freq: Optional[float] = None
         self._cur_type: Optional[str]  = None
+        # True when the current decode's type came from the RS41 BW fast-path
+        # (not dft_detect). If such a decode yields 0 frames, the manager forces
+        # dft_detect on the next detection of that frequency (fixes DFM misID).
+        self._cur_used_fastpath = False
         self._cur_serial: Optional[str] = None
-        self._cur_signal_strength_db: Optional[float] = None
+        self._cur_signal_strength_db: Optional[float] = None   # SNR (dB over noise)
+        self._cur_signal_power_dbfs: Optional[float] = None     # absolute peak power → RSSI
         self._decode_start   = 0.0
         self._last_frame_t   = 0.0
         self._last_state     = self.STATE_IDLE  # Track previous state for transition delays
@@ -221,15 +314,38 @@ class DeviceWorker:
         # Give these a much longer, separately configurable idle timeout
         # instead of none at all.
         self._manual_idle_timeout = cfg_dec.get('manual_idle_time', 1800)  # 30 min default
+
+        # Optional USB-reset auto-recovery for a WEDGED device (default OFF).
+        # A wedged capture_spectrum() is a stuck libusb read that nothing
+        # in-process can interrupt — only a USB port reset frees it. When
+        # enabled, the watchdog resets the dongle's USB port (matched by serial
+        # via sysfs, then USBDEVFS_RESET), which aborts the stuck read, then
+        # un-quarantines the device so its worker reopens it and resumes scanning
+        # instead of staying dead until a full service restart. Attempt-limited
+        # so a chronically-bad dongle can't reset-loop forever.
+        cfg_recovery = app_config.get('recovery', {})
+        self._usb_reset_on_wedge = bool(cfg_recovery.get('usb_reset_on_wedge', False))
+        self._usb_reset_settle_s = float(cfg_recovery.get('usb_reset_settle_s', 8.0))
+        self._usb_reset_max_attempts = int(cfg_recovery.get('usb_reset_max_attempts', 3))
+        self._usb_reset_attempts = 0
         self._decode_expiration_time: Optional[float] = None  # For duration-limited decoding
         self._is_manual_decoder: bool = False  # Manual decoders ignore the short auto-detect idle timeout
+        # How this device's current (or most recent) decode was started —
+        # 'auto' (spectrum scan), 'manual' (web UI entry or Import API
+        # assignment), 'priority' (detection.priority_frequency), or
+        # 'fixed_channel' (detection.fixed_channels table). Used only to
+        # color-code the web UI's SDR Devices table; has no behavioral effect.
+        self._decode_source: Optional[str] = None
 
         # DFT detector for sonde type identification
         det_cfg = app_config.get('detection', {})
         if det_cfg.get('use_dft_detect', True):
+            # detect_confirm_time is the short, per-candidate correlation
+            # check duration — dft_sample_duration is kept as a fallback so
+            # existing configs don't need editing.
             self._dft = DftDetector(
                 dft_detect_path=det_cfg.get('dft_detect_path', 'dft_detect'),
-                sample_duration=det_cfg.get('dft_sample_duration', 5.0)
+                sample_duration=det_cfg.get('detect_confirm_time', det_cfg.get('dft_sample_duration', 5.0))
             )
         else:
             self._dft = None
@@ -269,7 +385,178 @@ class DeviceWorker:
             name=f'Worker-{self.device_serial}'
         )
         self._thread.start()
+        # Wedged-capture watchdog: runs on its own thread (the worker thread is
+        # the one that can get stuck inside a hung read, so it can't watch
+        # itself). See CAPTURE_HANG_TIMEOUT_S / _capture_started_at.
+        self._watchdog_thread = threading.Thread(
+            target=self._capture_watchdog, daemon=True,
+            name=f'Watchdog-{self.device_serial}'
+        )
+        self._watchdog_thread.start()
         self.logger.info(f"Started (device {self.device_serial})")
+
+    def _capture_watchdog(self):
+        """Quarantine a device whose capture_spectrum() has wedged.
+
+        A single libusb read inside capture_spectrum() can block forever on
+        flaky USB. That read is a C call the worker thread is stuck in, so
+        nothing in-process can interrupt it, and the SIGBUS guard rightly refuses
+        to close the device mid-read. Rather than kill the whole service (which
+        would take the other, healthy dongles down with it and thrash-restart on
+        a chronically bad device — observed: RTL00001 wedged all night while its
+        3 siblings were fine), we QUARANTINE just this device: mark it ERROR and
+        set _wedged so it's excluded from Import-API assignment and never
+        re-scanned. The stuck worker thread is abandoned (its USB interface is
+        leaked until the next full restart), but the other devices keep decoding
+        and the Import API assigns nearby sondes to a healthy receiver.
+
+        Safety net: if EVERY device has wedged there's nothing left to decode
+        with, so fall back to os._exit(1) and let systemd bring it all back."""
+        while self._running:
+            time.sleep(5.0)
+            if not self._capturing or self._wedged:
+                continue
+            age = time.time() - self._capture_started_at
+            if age <= self.CAPTURE_HANG_TIMEOUT_S:
+                continue
+
+            self._wedged = True
+            self._state = self.STATE_ERROR
+            self.logger.critical(
+                f"Device {self.device_serial} WEDGED: capture_spectrum() in-flight "
+                f"{age:.0f}s (>{self.CAPTURE_HANG_TIMEOUT_S:.0f}s) — a libusb read is "
+                "stuck and cannot be interrupted. Quarantining this device (marked "
+                "ERROR, excluded from assignment); other devices keep running."
+            )
+
+            # Optional USB-reset auto-recovery: reset the dongle's USB port to
+            # free the stuck read, then un-quarantine it. Keep the watchdog alive
+            # (continue, don't return) so a re-wedge after recovery is caught
+            # again, up to the attempt limit.
+            if self._usb_reset_on_wedge and \
+                    self._usb_reset_attempts < self._usb_reset_max_attempts:
+                self._usb_reset_attempts += 1
+                self.logger.warning(
+                    f"USB-reset recovery attempt {self._usb_reset_attempts}/"
+                    f"{self._usb_reset_max_attempts} for wedged {self.device_serial}…"
+                )
+                threading.Thread(
+                    target=self._attempt_usb_recovery, daemon=True,
+                    name=f"USBRecover.{self.device_serial}"
+                ).start()
+                continue
+
+            # If all sibling workers are also wedged/errored, nothing can decode —
+            # restart the whole service to release every stuck interface.
+            try:
+                workers = getattr(self._manager, '_workers', None) or []
+                if workers and all(
+                    getattr(w, '_wedged', False) or w._state == self.STATE_ERROR
+                    for w in workers
+                ):
+                    self.logger.critical(
+                        "All devices wedged/errored — restarting service "
+                        "(systemd Restart=on-failure will bring it back up)."
+                    )
+                    os._exit(1)
+            except Exception:
+                pass
+            return  # device abandoned; nothing more to watch
+
+    def _attempt_usb_recovery(self):
+        """Recover a WEDGED device by resetting its USB port, then un-quarantine
+        it. Spawned by the watchdog in its own thread. The USB reset aborts the
+        stuck libusb read (freeing the abandoned worker); after a settle we drop
+        the analyzer (forcing a clean reopen) and clear _wedged so the run loop
+        resumes scanning. If reset fails, the device stays quarantined (existing
+        behaviour)."""
+        serial = self.device_serial
+        # Set BEFORE the reset so the read that errors out (NO_DEVICE) is logged
+        # calmly by the scan-cycle handler rather than as a failure+traceback.
+        self._recovering = True
+        try:
+            try:
+                ok = self._usb_reset_by_serial(serial)
+            except Exception as e:
+                self.logger.error(f"USB reset raised for {serial}: {e}")
+                ok = False
+            if not ok:
+                self.logger.error(
+                    f"USB reset failed for {serial}; device stays quarantined "
+                    "(retries on next wedge, or clears on full restart)."
+                )
+                return
+            # Let the aborted read propagate through the stuck worker and the OS
+            # re-enumerate the dongle before the worker reopens it.
+            time.sleep(self._usb_reset_settle_s)
+            try:
+                with self._device_lock:
+                    self._teardown_scan()
+            except Exception as e:
+                self.logger.debug(f"teardown during USB recovery of {serial}: {e}")
+            # Un-quarantine: the run loop reopens the device and resumes scanning.
+            self._capturing = False
+            self._capture_started_at = 0.0
+            self._wedged = False
+            self._state = self.STATE_SCANNING
+            self.logger.warning(
+                f"USB-reset recovery complete for {serial} — un-quarantined, resuming "
+                f"scan (attempt {self._usb_reset_attempts}/{self._usb_reset_max_attempts})."
+            )
+        finally:
+            self._recovering = False
+
+    @staticmethod
+    def _usb_reset_by_serial(serial: str) -> bool:
+        """Issue USBDEVFS_RESET to the RTL-SDR whose EEPROM serial == `serial`.
+        Locates the device via sysfs (NO libusb handle needed — the wedged
+        worker still holds the pyrtlsdr handle), so it works while the device is
+        'open': the port reset forces the stuck bulk transfer to error out.
+        Returns True on a successful reset. Needs write access to
+        /dev/bus/usb/<bus>/<dev> (root, or the rtl-sdr udev rules)."""
+        import glob
+        import fcntl
+        USBDEVFS_RESET = 0x5514  # _IO('U', 20)
+        _log = logging.getLogger('USBReset')
+
+        node = None
+        for dev_dir in glob.glob('/sys/bus/usb/devices/*'):
+            try:
+                with open(os.path.join(dev_dir, 'serial')) as fh:
+                    if fh.read().strip() != serial:
+                        continue
+                with open(os.path.join(dev_dir, 'busnum')) as fh:
+                    busnum = int(fh.read().strip())
+                with open(os.path.join(dev_dir, 'devnum')) as fh:
+                    devnum = int(fh.read().strip())
+                node = f"/dev/bus/usb/{busnum:03d}/{devnum:03d}"
+                break
+            except (FileNotFoundError, ValueError, OSError):
+                continue  # not a USB device with a serial file, or transient
+
+        if node is None:
+            _log.error(f"No USB device with serial '{serial}' in sysfs — cannot reset")
+            return False
+
+        fd = None
+        try:
+            fd = os.open(node, os.O_WRONLY)
+            fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+            _log.warning(f"USBDEVFS_RESET issued to {serial} at {node}")
+            return True
+        except PermissionError:
+            _log.error(f"Permission denied resetting {node} for {serial} — run the "
+                       "service as root or add udev permissions.")
+            return False
+        except OSError as e:
+            _log.error(f"USB reset ioctl failed for {serial}: {e}")
+            return False
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
 
     def stop(self):
         self._running = False
@@ -304,6 +591,13 @@ class DeviceWorker:
     @property
     def current_sonde_serial(self) -> Optional[str]:
         return self._cur_serial
+
+    @property
+    def decode_source(self) -> Optional[str]:
+        """'auto', 'manual', 'import_api', 'priority', or 'fixed_channel' —
+        how the current decode was started, or None while idle/scanning.
+        Web UI color-coding only."""
+        return self._decode_source
 
     @property
     def decoder_mode(self) -> str:
@@ -394,7 +688,17 @@ class DeviceWorker:
             if has_data:
                 self.logger.debug(f"get_spectrum() returning data: {len(self._last_spectrum.get('freqs_mhz', []))} points")
             else:
-                self.logger.warning(f"get_spectrum() returning EMPTY dict for {self.device_serial}")
+                # No snapshot yet is NORMAL while decoding (scanner torn down
+                # before the first dwell completed) — and the web UI polls this
+                # every second, so log quietly and rate-limited instead of the
+                # per-poll WARNING spam observed in the field.
+                now = time.time()
+                if now - getattr(self, '_last_empty_spectrum_log', 0.0) > 60.0:
+                    self._last_empty_spectrum_log = now
+                    self.logger.info(
+                        f"No spectrum snapshot yet for {self.device_serial} "
+                        f"(state={self._state}) — first scan dwell not completed before decode"
+                    )
             return dict(self._last_spectrum)
 
     def _update_spectrum_snapshot(self, freqs, power_db, signals: List[DetectedSignal]):
@@ -484,18 +788,23 @@ class DeviceWorker:
         )
         self._is_manual_decoder = False  # RX Scan decoders are NOT manual
         self._decode_expiration_time = time.time() + self._fixed_channel_scantime
-        
-        return self._start_decode(sig, override_type=stype)
+
+        return self._start_decode(sig, override_type=stype, decode_source='fixed_channel')
 
     def start_manual_decode(self, frequency: float, sonde_type: str,
-                           duration_seconds: Optional[float] = None) -> bool:
-        """Force-start decoding a specific frequency (from web UI).
-        
+                           duration_seconds: Optional[float] = None,
+                           source: str = 'manual') -> bool:
+        """Force-start decoding a specific frequency (from web UI, Import API,
+        fixed_channels, or a priority-frequency check).
+
         Args:
             frequency: Target frequency in Hz
             sonde_type: Sonde type (RS41, RS92, etc.)
             duration_seconds: If set, auto-return to scanning after this many seconds.
                             None or 0 = infinite decoding.
+            source: 'manual' (web UI entry, the default), 'import_api',
+                    'priority', or 'fixed_channel' — used only for the web
+                    UI's SDR Devices table color-coding, no behavioral effect.
         """
         # Channelizer mode: Add manual decode request to queue
         if self._decoder_mode == 'channelizer':
@@ -549,6 +858,31 @@ class DeviceWorker:
             finally:
                 self._device_lock.release()
 
+            # CRITICAL (SIGBUS fix): the worker's capture_spectrum() runs UNLOCKED
+            # and holds an in-flight libusb read. Closing the analyzer while that
+            # read is active frees the device context under the transfer and
+            # crashes the whole process with SIGBUS (status=7/BUS, seen in the
+            # field). We therefore NEVER close/open while _capturing is True.
+            # capture_spectrum() now has a hard wall-clock cap (scan_max_wall_s),
+            # so this clears within a few seconds; wait for it, and if it somehow
+            # doesn't clear, ABORT the manual decode (leave the device scanning)
+            # rather than closing mid-read — a failed manual decode the user can
+            # retry is vastly better than a crash + full restart.
+            wait_start = time.time()
+            while self._capturing and (time.time() - wait_start) < 20.0:
+                time.sleep(0.1)
+            if self._capturing:
+                self.logger.error(
+                    f"Manual decode ABORTED: worker on {self.device_serial} is still "
+                    f"inside capture_spectrum() after 20s — refusing to close the device "
+                    f"mid-read (would SIGBUS). Retry shortly."
+                )
+                # Let the worker resume scanning; do NOT touch the device.
+                with self._device_lock:
+                    if self._state == self.STATE_IDLE:
+                        self._state = self.STATE_SCANNING
+                return False
+
             # Wait for USB device to be fully released before starting rtl_fm
             # Conservative 5-second delay for USB hub stability (increased from 3s for long-running sessions)
             self.logger.info(f"Manual decode: waiting 5s for USB device {self.device_serial} to settle")
@@ -568,7 +902,8 @@ class DeviceWorker:
 
                 # _start_decode() will handle teardown_scan() and USB initialization
                 # Manual decodes use force_override=True to take over from auto-detect
-                success = self._start_decode(sig, override_type=sonde_type, force_override=True)
+                success = self._start_decode(sig, override_type=sonde_type, force_override=True,
+                                              decode_source=source)
                 if success:
                     self.logger.info(
                         f"Manual decode started: {sonde_type} at {frequency/1e6:.3f} MHz "
@@ -591,6 +926,23 @@ class DeviceWorker:
         self.logger.info(f"Device {self.device_serial}: returning to scan")
         return True
 
+    def force_clean_scan_restart(self):
+        """Force a completely clean scan restart, regardless of current
+        state (idle/scanning/decoding/error) — used by the web UI's 'Start
+        Scan' button. Stops any active decode, closes and discards any
+        existing SpectrumAnalyzer (so the next scan cycle constructs a
+        brand-new one, picking up detection-tuning changes applied via
+        RTLSDRDeviceManager.reload_detection_config() — scan_check_time,
+        max_peaks, channel_spacing_hz, etc. — without a full service
+        restart), and clears any stuck error backoff state."""
+        with self._device_lock:
+            if self._state == self.STATE_DECODING:
+                self._teardown_decode()
+            self._teardown_scan()
+            self._consecutive_open_failures = 0
+            self._state = self.STATE_SCANNING
+        self.logger.info(f"Device {self.device_serial}: forced clean scan restart")
+
     # ------------------------------------------------------------------
     # Worker loop
     # ------------------------------------------------------------------
@@ -611,10 +963,19 @@ class DeviceWorker:
         
         while self._running:
             try:
+                # Quarantined: the watchdog found this device's read wedged and
+                # abandoned it. If that stuck read ever returns, the worker must
+                # NOT resume scanning (it would un-quarantine a known-bad device
+                # and hand it back to the Import API). Park permanently, no spin.
+                if self._wedged:
+                    self._state = self.STATE_ERROR
+                    time.sleep(5.0)
+                    continue
+
                 # Track state transitions
                 prev_state = self._last_state
                 self._last_state = self._state
-                
+
                 if self._state == self.STATE_SCANNING:
                     idle_start = None  # Reset idle timer
                     self._scan_cycle()
@@ -633,7 +994,43 @@ class DeviceWorker:
                     else:
                         # Just wait a bit
                         time.sleep(0.5)
-                        
+                elif self._state == self.STATE_ERROR:
+                    # CRITICAL FIX: this loop previously had NO branch for
+                    # STATE_ERROR — a single failed device open set the state
+                    # (for UI visibility) and the loop then matched nothing,
+                    # busy-spinning this thread at 100% CPU with no retry, no
+                    # sleep, forever. Field impact: 3 of 4 devices stuck in
+                    # "Error" for 24 h (V1.0.50 retried forever because it
+                    # never entered an error state), with the spinning threads
+                    # starving the surviving device's decoder pipe.
+                    # Recovery: back off, then return to SCANNING and retry the
+                    # open. Now that devices are closed (not leaked) on failure,
+                    # reopens usually succeed, so a long backoff just wastes
+                    # airtime — cap it low (10s base, 30s max) so a device that
+                    # can recover isn't parked for minutes. The
+                    # MAX_CONSECUTIVE_OPEN_FAILURES → service-restart safety net
+                    # still applies if retries keep genuinely failing.
+                    backoff = min(10.0 * max(1, self._consecutive_open_failures), 30.0)
+                    self.logger.warning(
+                        f"Device {self.device_serial} in error state "
+                        f"({self._consecutive_open_failures} consecutive open failures) "
+                        f"— retrying in {backoff:.0f}s"
+                    )
+                    t0 = time.time()
+                    while self._running and time.time() - t0 < backoff:
+                        if self._manual_decode_pending.is_set():
+                            break  # Let a manual decode try to claim the device
+                        time.sleep(1.0)
+                    if self._running:
+                        self.logger.info(
+                            f"Device {self.device_serial}: retrying scan after error backoff"
+                        )
+                        self._state = self.STATE_SCANNING
+                        idle_start = None
+                else:
+                    # Unknown state — never busy-spin
+                    time.sleep(1.0)
+
             except Exception as exc:
                 self.logger.error(f"Worker loop error: {exc}", exc_info=True)
                 time.sleep(5)
@@ -758,7 +1155,13 @@ class DeviceWorker:
         if self._manual_decode_pending.is_set():
             time.sleep(0.5)
             return
-        
+
+        # Phase-1 pluggable scan backend: the rtl_power full-band sweep replaces
+        # the pyrtlsdr Welch segment scan (time-shared with decoding on this
+        # device). Detect/dispatch downstream is identical.
+        if self._scan_backend == 'rtl_power':
+            return self._scan_cycle_rtl_power()
+
         # Initialize analyzer if needed (with lock protection)
         if self._analyzer is None:
             # If we just transitioned from DECODING, wait for USB device to be fully released
@@ -803,71 +1206,26 @@ class DeviceWorker:
                     self._device_lock.release()
                     time.sleep(15)
                     return
-                
-                # CRITICAL: Test device immediately after init to catch PLL lock failures
-                # Use thread-based timeout since signal.alarm() cannot interrupt C extensions
-                self.logger.debug(f"Testing device {self.device_serial} with quick read...")
-                test_result = {'samples': None, 'error': None}
-                
-                def test_read_worker():
-                    """Worker thread for test read - can be abandoned if it hangs."""
-                    try:
-                        test_result['samples'] = self._analyzer.sdr.read_samples(2048)
-                    except Exception as e:
-                        test_result['error'] = e
-                
-                # Run test read in separate thread with 5-second timeout
-                test_thread = threading.Thread(target=test_read_worker, daemon=True)
-                test_thread.start()
-                test_thread.join(timeout=5.0)
-                
-                # Check if test read completed or timed out
-                if test_thread.is_alive():
-                    # Thread is still running - read_samples() is hung
-                    self.logger.error(
-                        f"Device {self.device_serial} test read TIMEOUT after 5s. "
-                        "USB read is blocked - likely PLL lock failure. Abandoning device and will retry."
-                    )
-                    # Cannot safely close analyzer while thread is blocked - just abandon it.
-                    # NOTE: a background close() was tried here and reverted — calling
-                    # close() from another thread while test_read_worker is still blocked
-                    # inside librtlsdr's C extension on the same handle is not thread-safe
-                    # and caused a SIGSEGV in production. Leaking the handle (USB interface
-                    # stays busy until process restart) is safer than crashing the service.
-                    self._analyzer = None
-                    self._note_open_failure()
-                    self._device_lock.release()
-                    time.sleep(15)  # Longer wait before retry
-                    return
-                elif test_result['error'] is not None:
-                    # Test read threw an exception
-                    self.logger.error(
-                        f"Device {self.device_serial} test read FAILED: {test_result['error']}. "
-                        "Closing and will retry."
-                    )
-                    self._analyzer.close()
-                    self._analyzer = None
-                    self._note_open_failure()
-                    self._device_lock.release()
-                    time.sleep(10)
-                    return
-                elif test_result['samples'] is None or len(test_result['samples']) == 0:
-                    # Test read completed but returned no data
-                    self.logger.error(
-                        f"Device {self.device_serial} returned zero samples. "
-                        "Closing and will retry."
-                    )
-                    self._analyzer.close()
-                    self._analyzer = None
-                    self._note_open_failure()
-                    self._device_lock.release()
-                    time.sleep(10)
-                    return
 
-                # Test read succeeded
-                self.logger.info(f"Device {self.device_serial} test read OK ({len(test_result['samples'])} samples)")
+                # V1.0.60 REGRESSION FIX: the old code ran a probing read_samples()
+                # in a DETACHED daemon thread with a 5s timeout, then on timeout set
+                # self._analyzer = None WITHOUT close() — leaking the RtlSdr handle,
+                # which kept the USB interface claimed. Every subsequent open then
+                # failed with LIBUSB_ERROR_BUSY, and the only escape was the 10-
+                # failure os._exit() service restart. Field logs showed 144 restarts
+                # and BUSY devices that NEVER recovered without a full restart —
+                # "4 SDR always lost, self-healing not working". V1.0.50 had no such
+                # probe: it just opened and let the first spectrum capture be the
+                # real read, recovering via a normal close/reopen on any hiccup.
+                #
+                # We now do the same: a successful open() is enough to proceed;
+                # capture_spectrum() below is the first real read, and its exception
+                # handler tears the scanner down through _teardown_scan() which
+                # properly close()s the device (no leak). Because the read now runs
+                # in THIS worker thread (not a detached one), there is no concurrent
+                # access to the handle, so the SIGSEGV that motivated the old
+                # leak-instead-of-close cannot occur.
                 self._note_open_success()
-
                 self._state = self.STATE_SCANNING
                 self.logger.info(
                     f"Scanning {self.device_config['center_freq']/1e6:.1f} MHz "
@@ -878,35 +1236,212 @@ class DeviceWorker:
                 if self._device_lock.locked():
                     self._device_lock.release()
 
-        # Capture spectrum WITHOUT holding the lock - this can take several seconds
-        # Manual decode can interrupt by setting _manual_decode_pending flag
+        # Capture spectrum WITHOUT holding the lock - this can now take up to
+        # scan_check_time seconds (default 20s) for the averaged multi-chunk
+        # capture. Manual decode can interrupt by setting _manual_decode_pending;
+        # pass it through as abort_check so a pending manual/priority decode
+        # doesn't have to wait out the full dwell time before being noticed.
+        # CRITICAL: hold a local reference to the analyzer for the rest of this
+        # capture/analyze pass. capture_spectrum() runs unlocked and can take
+        # up to scan_check_time seconds — if a manual/imported decode request
+        # arrives during that window, its _teardown_scan() call sets
+        # self._analyzer = None concurrently. Re-reading self._analyzer after
+        # capture_spectrum() returns raced that None-out in the field:
+        # "AttributeError: 'NoneType' object has no attribute 'detect_signals'".
+        # detect_signals()/filter_signals_in_ranges() only operate on the
+        # already-captured freqs/power_db arrays (never touch self.sdr), so
+        # using this local reference is safe even if the real analyzer gets
+        # torn down/closed concurrently.
+        analyzer = self._analyzer
+        # Mark the in-flight libusb read window. _capturing stays True only for
+        # the capture_spectrum() call itself (the sole place that reads the
+        # device); detect_signals()/snapshot below operate on arrays and touch
+        # no USB. A concurrent close() (manual decode teardown) waits for this
+        # to clear — see start_manual_decode() — so the device is never closed
+        # while a read transfer is in flight (would SIGBUS).
+        self._capture_started_at = time.time()
+        self._capturing = True
         try:
             self.logger.debug(f"Starting capture_spectrum() for {self.device_serial}...")
-            freqs, power_db = self._analyzer.capture_spectrum()
+            freqs, power_db = analyzer.capture_spectrum(
+                abort_check=self._manual_decode_pending.is_set
+            )
             self.logger.debug(f"capture_spectrum() completed for {self.device_serial}: {len(freqs) if freqs is not None else 0} points")
-            signals = self._analyzer.detect_signals(freqs, power_db)
-            signals = self._analyzer.filter_signals_in_ranges(signals)
-            self._update_spectrum_snapshot(freqs, power_db, signals)
         except Exception as exc:
+            self._capturing = False
+            # During a deliberate USB-reset recovery the in-flight read errors
+            # with LIBUSB_ERROR_NO_DEVICE — that's expected, not a hardware open
+            # failure. Log it calmly and do NOT count it toward the restart
+            # safety net (the recovery thread handles teardown + reopen).
+            if self._recovering:
+                self.logger.info(
+                    f"{self.device_serial}: in-flight read aborted by USB-reset "
+                    f"recovery (expected: {type(exc).__name__}) — worker will reopen"
+                )
+                with self._device_lock:
+                    self._teardown_scan()
+                time.sleep(1)
+                return
             self.logger.error(f"Spectrum capture failed for {self.device_serial}: {exc}", exc_info=True)
-            # Acquire lock to tear down scanner
+            # Tear down (this close()s the device properly — no leak) and count
+            # the failure so a genuinely dead device still eventually hits the
+            # os._exit safety net. Because the device is now CLOSED (not leaked),
+            # the next open normally succeeds, so this does NOT create the old
+            # BUSY→restart loop — escalation only fires for truly stuck hardware.
             with self._device_lock:
                 self._teardown_scan()
+            self._note_open_failure()
             time.sleep(5)
             return
+
+        # Capture returned — the device read is done, so it's now safe for a
+        # concurrent close() to proceed. Clear the guard BEFORE the rest of the
+        # pass (detect_signals/snapshot touch no USB).
+        self._capturing = False
+
+        # A manual/imported decode may have claimed this device while
+        # capture_spectrum() was running (or aborted it early) — don't bother
+        # analyzing/publishing signals that are about to be discarded anyway.
+        if self._manual_decode_pending.is_set():
+            return
+
+        self._process_scan_signals(freqs, power_db, analyzer)
+
+    # ------------------------------------------------------------------
+    #  Scan backend: rtl_power full-band sweep (Phase 1)
+    # ------------------------------------------------------------------
+    def _scan_cycle_rtl_power(self):
+        """One time-shared rtl_power full-band scan pass, then the shared
+        detect/dispatch. No pyrtlsdr device is opened (rtl_power owns the dongle
+        for the pass and releases it on exit), so there is no _capturing/libusb
+        wedge window here — the scanner uses its own subprocess wall timeout."""
+        # Lazily build the scanner and the device-less detect analyzer.
+        if self._rtl_power_scanner is None:
+            cfg = self._rtl_power_cfg
+            self._rtl_power_scanner = RtlPowerScanner(
+                device_serial=self.device_serial,
+                gain=self.device_config.get('gain', 0),
+                ppm=self.device_config.get('ppm_error', 0),
+                band_start_hz=int(cfg.get('band_start_hz', 402_000_000)),
+                band_stop_hz=int(cfg.get('band_stop_hz', 406_000_000)),
+                step_hz=int(cfg.get('step_hz', 800)),
+                integration_s=float(cfg.get('integration_s', 8)),
+                crop_percent=int(cfg.get('crop_percent', 25)),
+                rtl_power_path=str(cfg.get('rtl_power_path', 'rtl_power')),
+                wall_timeout_s=float(cfg.get('wall_timeout_s', 30)),
+            )
+            # Missing binary → permanent fallback to Welch for this worker.
+            if not self._rtl_power_scanner.available():
+                self.logger.error(
+                    "rtl_power not installed — falling back to the Welch scan "
+                    "backend for this device (install the rtl-sdr package to use "
+                    "detection.scanner.backend: rtl_power)."
+                )
+                self._scan_backend = 'welch'
+                return
+        if self._detect_analyzer is None:
+            # Config-only SpectrumAnalyzer: provides detect_signals/
+            # filter_signals_in_ranges (identical to the Welch path) without ever
+            # opening a pyrtlsdr handle.
+            self._detect_analyzer = SpectrumAnalyzer(
+                self.app_config, self.device_config, self._blacklist)
+
+        self._state = self.STATE_SCANNING
+        # rtl_fm held the device during the previous decode; give the kernel a
+        # moment to release it before rtl_power opens it (mirrors the Welch path).
+        if getattr(self, '_usb_reopen_after_decode', False):
+            time.sleep(2.0)
+            self._usb_reopen_after_decode = False
+
+        if self._first_usb_init:
+            time.sleep(5.0 + self.device_index * 2.5)
+            self._first_usb_init = False
+
+        result = self._rtl_power_scanner.scan(
+            abort_check=self._manual_decode_pending.is_set)
+        if self._manual_decode_pending.is_set():
+            return
+        if result is None:
+            # Transient scan failure (timeout/empty). Don't feed the pyrtlsdr
+            # open-failure→restart safety net. If rtl_power keeps failing, fall
+            # back to Welch so the device never dead-scans (a scan pass that
+            # always exceeds wall_timeout_s, a hung binary, etc.).
+            self._rtl_power_fail_streak += 1
+            if self._rtl_power_fail_streak >= 3:
+                self.logger.error(
+                    "rtl_power scan failed 3x in a row (timeout/empty) — falling "
+                    "back to the Welch scan backend for this device. Check "
+                    "detection.scanner timing (raise wall_timeout_s / lower "
+                    "step_hz / lower integration_s) or rtl_power health."
+                )
+                self._scan_backend = 'welch'
+                self._rtl_power_fail_streak = 0
+            time.sleep(self._scan_interval + 2)
+            return
+
+        self._rtl_power_fail_streak = 0
+        freqs, power_db = result
+        self._note_open_success()
+        self._process_scan_signals(freqs, power_db, self._detect_analyzer)
+
+    def _process_scan_signals(self, freqs, power_db, analyzer):
+        """Shared post-acquisition path for BOTH scan backends: detect signals,
+        update the spectrum snapshot, log repository candidates, then dispatch a
+        decode for the strongest decodable signal. `analyzer` supplies
+        detect_signals/filter_signals_in_ranges + config (never touches USB)."""
+        signals = analyzer.detect_signals(freqs, power_db)
+        signals = analyzer.filter_signals_in_ranges(signals)
+        self._update_spectrum_snapshot(freqs, power_db, signals)
+
+        # Frequency repository: log sonde-like candidates as 'detected' rows. Use
+        # a SEPARATE, lower threshold than the decode path so weak sondes get
+        # listed (for manual selection) even though they won't be auto-decoded,
+        # and require the frequency to sit near the 100 kHz channel grid so the
+        # RTL's odd-frequency spurs (x.x40/x.x60 …) aren't listed. A real decode
+        # still logs 'confirmed' (in the telemetry handler) regardless of grid.
+        _repo = getattr(self._manager, 'frequency_repository', None)
+        if _repo is not None:
+            repo_signals = analyzer.detect_signals(freqs, power_db, threshold_db=self._repo_threshold_db)
+            repo_signals = analyzer.filter_signals_in_ranges(repo_signals)
+            for _s in repo_signals:
+                if self._is_blacklisted(_s.frequency):
+                    continue
+                if not self._repo_grid_ok(_s.frequency):
+                    continue
+                _repo.record_detected(_s.frequency, snr=_s.strength, device=self.device_serial)
 
         # Abort if manual decode was requested during spectrum capture
         if self._manual_decode_pending.is_set():
             return
 
         # Process signals WITHOUT holding the lock
-        # Sort by strength descending; skip blacklisted / already-decoded freqs
+        # Sort by strength descending; skip blacklisted / already-decoded freqs.
+        # (C) Track whether this segment holds a REAL (non-blacklisted, not
+        # already-decoded-elsewhere) sonde signal, even one we skip this pass —
+        # so the band-sweep never abandons a segment that has a sonde in it.
+        signal_present = False
         for sig in sorted(signals, key=lambda s: s.strength, reverse=True):
             if self._is_blacklisted(sig.frequency):
                 continue
             if self.registry.is_active(sig.frequency):
                 continue
-            
+
+            # A real, non-blacklisted, not-currently-decoded signal is here.
+            signal_present = True
+
+            # Skip frequencies whose last auto decode produced zero frames
+            # (negative-result cache — birdies, DC spurs, misclassifications).
+            # (B) is_auto_decode_blocked gets the current SNR: a signal that
+            # reappears clearly STRONGER than when it failed (an ascending sonde)
+            # clears its own block and is retried now instead of staying locked
+            # out for the full cooldown.
+            if self._manager is not None and \
+                    self._manager.is_auto_decode_blocked(sig.frequency, sig.strength):
+                self.logger.debug(
+                    f"Skipping {sig.frequency/1e6:.4f} MHz - in failed-decode cooldown"
+                )
+                continue
+
             # CRITICAL: Skip signals that are assigned to fixed_channels
             # Let fixed_channels start them with the correct type, not auto-detection
             if self._is_fixed_channel_frequency(sig.frequency):
@@ -914,18 +1449,28 @@ class DeviceWorker:
                     f"Skipping {sig.frequency/1e6:.4f} MHz - reserved for fixed_channel with specified type"
                 )
                 continue
-            
+
             # Check one more time before starting decode
             if self._manual_decode_pending.is_set():
                 return
-            
+
             self.logger.info(
                 f"New signal at {sig.frequency/1e6:.4f} MHz "
                 f"(SNR {sig.strength:.1f} dB, BW {sig.bandwidth/1e3:.1f} kHz)"
             )
+            self._empty_scan_count = 0   # found something → stay on this segment
             self._start_decode(sig)
             return   # worker will re-enter loop in DECODING state
 
+        # Nothing decoded this pass.
+        if signal_present:
+            # (C) A sonde IS present (in cooldown, reserved for a fixed channel,
+            # etc.) — do NOT let the band-sweep count this as an empty scan.
+            self._empty_scan_count = 0
+        else:
+            # Genuinely empty segment: count it and hop once the dwell is reached.
+            # (No-op under the rtl_power backend, which already covers the band.)
+            self._maybe_sweep_hop()
         time.sleep(self._scan_interval)
 
     # ------------------------------------------------------------------
@@ -956,7 +1501,7 @@ class DeviceWorker:
                 )
                 self._teardown_decode()
                 return
-        elif self._decoder.is_idle():
+        elif self._decoder.is_idle(self._idle_timeout):
             self.logger.info(
                 f"Decoder idle for >{self._idle_timeout}s — back to scan"
             )
@@ -981,13 +1526,40 @@ class DeviceWorker:
 
     def _start_decode(self, sig: DetectedSignal,
                       override_type: Optional[str] = None,
-                      force_override: bool = False) -> bool:
+                      force_override: bool = False,
+                      decode_source: str = 'auto') -> bool:
         # Atomically claim the frequency in the shared registry
         # For manual decodes with force_override, unregister first to allow takeover
         if force_override:
             self.logger.info(f"Manual decode force override: unclaiming {sig.frequency/1e6:.4f} MHz")
             self.registry.unregister(sig.frequency)
-        
+
+            # CRITICAL: unregister() only removes the shared registry
+            # bookkeeping — it does NOT stop whatever OTHER physical device
+            # might actually be decoding that (or a nearby) frequency right
+            # now. Without this, a manual/priority override for a frequency
+            # already claimed by a DIFFERENT RTL-SDR silently steals the
+            # registry slot while that other dongle keeps running its own
+            # rtl_fm+decoder pipeline on virtually the same real signal —
+            # two adjacent dongles fighting over one carrier. Observed in
+            # the field: a manual DFM request stole a nearby frequency from
+            # a device auto-decoding the SAME physical sonde (bandwidth-
+            # fallback had misclassified it), and neither device could
+            # decode afterward.
+            if self._manager is not None:
+                for other in getattr(self._manager, '_workers', []):
+                    if other is self:
+                        continue
+                    other_freq = other.current_freq
+                    if (other.state == self.STATE_DECODING and other_freq is not None
+                            and abs(other_freq - sig.frequency) < self.registry.TOLERANCE_HZ):
+                        self.logger.info(
+                            f"Manual decode force override: stopping conflicting decode "
+                            f"on {other.device_serial} ({other_freq/1e6:.4f} MHz)"
+                        )
+                        with other._device_lock:
+                            other.stop_decode_and_scan()
+
         # Store original frequency for registry updates
         original_freq = sig.frequency
         
@@ -1031,7 +1603,28 @@ class DeviceWorker:
                 self.logger.error(f"Failed to identify sonde type at {sig.frequency/1e6:.4f} MHz")
                 self.registry.unregister(sig.frequency)
                 return False
-        
+
+        # CRITICAL: only trust DFT's frequency-offset sub-measurement for
+        # types that actually need tight tuning to lock (M10/M20 — narrow
+        # sync window, needed a real -5434.5 Hz correction in the field to
+        # decode at all). For RS41 it has been observed to make things
+        # WORSE: a confirmed-strong, confirmed-genuine RS41 at raw-detected
+        # 405.6992 MHz (already within 1.2 kHz of the independently-verified
+        # true 405.698 MHz) got "corrected" by a reported +1801.2 Hz offset
+        # to 405.701 MHz — 3 kHz off, and never decoded a single frame.
+        # RS41/DFM/RS92/iMet aren't frequency-critical the way M10/M20 are
+        # (matches operational experience: RS41 decoded reliably before
+        # dft_detect ever returned a usable offset at all), so for those
+        # types keep the type ID but ignore the offset and fall back to
+        # plain 1 kHz quantization of the raw scan-detected frequency.
+        FREQUENCY_OFFSET_SENSITIVE_TYPES = ('M10', 'M20')
+        if sonde_offset != 0.0 and sonde_type not in FREQUENCY_OFFSET_SENSITIVE_TYPES:
+            self.logger.debug(
+                f"Ignoring DFT offset {sonde_offset:+.1f} Hz for {sonde_type} "
+                "(not frequency-offset-sensitive) — using raw scan frequency"
+            )
+            sonde_offset = 0.0
+
         # Apply frequency correction from DFT detection (critical for M10/M20)
         # Quantize to 1 kHz to avoid rtl_fm frequency jitter
         if sonde_offset != 0.0:
@@ -1080,24 +1673,56 @@ class DeviceWorker:
             self.logger.debug(f"Waiting 1s after DFT detection before starting AudioPipeline...")
             time.sleep(1.0)
 
-        # Start rtl_fm audio pipeline
-        self.logger.info(f"Starting AudioPipeline for {sonde_type} at {sig.frequency/1e6:.4f} MHz on {self.device_serial}")
+        # Construct decoder FIRST (no subprocess spawned yet): it decides the
+        # decode chain (fsk_demod soft-bit vs. legacy --IQ) and therefore the
+        # required capture sample rate (e.g. DFM soft chain needs 50 kHz).
+        # The AudioPipeline is then created at exactly that rate.
+        # Default OFF: the rtl_fm→fsk_demod→rs41mod --softin chain produced 0
+        # frames in the field on RTL clients (healthy decoder, no telemetry)
+        # while the direct --IQ chain decodes the same signal reliably. --IQ is
+        # now the default; set decoders.soft_decode: true to opt back into the
+        # ~2 dB soft-decision chain once it's verified on your hardware. (The
+        # KA9Q receiver has its own, separate, working soft chain — unaffected.)
+        soft_decode = bool(self.app_config.get('decoders', {}).get('soft_decode', False))
+        # Optional auto_rx-style inline DC removal via iq_dec on the --IQ chain.
+        # Default OFF: harmless where the iq_dec binary is absent (graceful
+        # no-op), but keep it opt-in so a new stage never silently changes
+        # decode behaviour across gateways until validated per client.
+        iq_dc_block = bool(self.app_config.get('decoders', {}).get('iq_dc_block', False))
+        decoder = RS1729Decoder(
+            frequency=sig.frequency,
+            sonde_type=sonde_type,
+            soft_decode=soft_decode,
+            iq_dc_block=iq_dc_block,
+            allow_rate_change=True
+        )
+        decoder.set_frame_callback(self._on_frame)
+
+        # Start rtl_fm audio pipeline at the decoder's required input rate
+        self.logger.info(
+            f"Starting AudioPipeline for {sonde_type} at {sig.frequency/1e6:.4f} MHz "
+            f"on {self.device_serial} ({decoder.sample_rate} Hz, chain={decoder.decode_chain})"
+        )
         pipeline = AudioPipeline(
             frequency=sig.frequency,
-            sample_rate=48000,
+            sample_rate=decoder.sample_rate,
             device_serial=self.device_serial,
             gain=self.device_config.get('gain', 40),
-            ppm_correction=self.device_config.get('ppm_error', 0)
+            ppm_correction=self.device_config.get('ppm_error', 0),
+            enable_metrics=bool(self.app_config.get('decoders', {}).get('live_signal_metrics', False))
         )
         if not pipeline.start():
             self.logger.error(f"AudioPipeline failed to start for {sonde_type} at {sig.frequency/1e6:.4f} MHz")
             self.registry.unregister(sig.frequency)
             return False
 
+        # Reset per-decode telemetry tracking (landed-sonde guard) BEFORE the
+        # decoder starts — frames can arrive during its startup checks
+        self._last_alt_m = None
+        self._last_vv_ms = None
+
         # Start rs1729 decoder
         self.logger.info(f"Starting RS1729 decoder for {sonde_type} at {sig.frequency/1e6:.4f} MHz")
-        decoder = RS1729Decoder(frequency=sig.frequency, sonde_type=sonde_type)
-        decoder.set_frame_callback(self._on_frame)
         audio_stream = pipeline.get_audio_stream()
         if not audio_stream:
             self.logger.error(f"AudioPipeline audio stream is None for {sonde_type} at {sig.frequency/1e6:.4f} MHz")
@@ -1114,9 +1739,19 @@ class DeviceWorker:
         self._decoder      = decoder
         self._cur_freq     = sig.frequency
         self._cur_type     = sonde_type
-        self._cur_signal_strength_db = float(sig.strength)
+        # Manual/imported decodes build a SYNTHETIC DetectedSignal with a
+        # placeholder strength (e.g. 25.0) and no measured power_dbfs — there is
+        # no real scan measurement for them. Detect that (power_dbfs unset) and
+        # report NO scan SNR/RSSI rather than fabricating 25 dB / 25 dBm; the log
+        # and UI then show N/A until the decoder / live metrics supply real
+        # values. Genuine scan signals always carry a real (negative) power_dbfs.
+        _pwr = getattr(sig, 'power_dbfs', None)
+        _synthetic = _pwr in (None, 0.0)
+        self._cur_signal_strength_db = None if _synthetic else float(sig.strength)
+        self._cur_signal_power_dbfs = None if _synthetic else float(_pwr)
         self._decode_start = time.time()
         self._last_frame_t = 0.0
+        self._decode_source = decode_source
         self._state        = self.STATE_DECODING
         self.logger.info(
             f"Decoding {sonde_type} at {sig.frequency/1e6:.4f} MHz "
@@ -1136,7 +1771,79 @@ class DeviceWorker:
                 pass
             self._analyzer = None
 
+    # ------------------------------------------------------------------
+    # Band-sweep (opt-in coverage rotation) — see __init__.
+    # ------------------------------------------------------------------
+
+    def _build_sweep_centers(self) -> list:
+        """Segment centers that tile the configured band. Each device rotates
+        through these when idle so one SDR can cover the whole band over time.
+        Outer centers are inset by ~usable half-bandwidth so the band edges are
+        reachable; segments overlap by design (step < usable width)."""
+        c = self._sweep_cfg
+        band_min = float(c.get('band_min_hz', 402_100_000))
+        band_max = float(c.get('band_max_hz', 405_900_000))
+        sr = float(self.device_config.get('sample_rate', 2_400_000))
+        # ~85% of Nyquist half is reliably usable (tuner/filter roll off near
+        # the ±sample_rate/2 edges).
+        usable_half = (sr / 2.0) * 0.85
+        step = float(c.get('step_hz', sr * 0.8))
+        lo = band_min + usable_half
+        hi = band_max - usable_half
+        if hi <= lo:
+            return [round((band_min + band_max) / 2.0)]
+        n = max(2, int(round((hi - lo) / step)) + 1)
+        return [round(lo + i * (hi - lo) / (n - 1)) for i in range(n)]
+
+    def _maybe_sweep_hop(self):
+        """Called after a scan cycle that started no decode. Counts empty
+        cycles and, past the dwell threshold, retunes this device to the next
+        band segment (reopened by the next scan cycle at the new center)."""
+        if self._scan_backend == 'rtl_power':
+            return  # rtl_power already sweeps the whole band each scan — no hop
+        if not self._sweep_enabled:
+            return
+        if not self._sweep_centers:
+            self._sweep_centers = self._build_sweep_centers()
+            # Start from the segment nearest this device's configured center so
+            # the first hop moves to a segment it hasn't just scanned.
+            cur = self.device_config.get('center_freq', 0) or 0
+            self._sweep_index = min(
+                range(len(self._sweep_centers)),
+                key=lambda i: abs(self._sweep_centers[i] - cur)
+            )
+            self.logger.info(
+                f"Band sweep enabled for {self.device_serial}: segments "
+                f"{[round(x/1e6, 3) for x in self._sweep_centers]} MHz, "
+                f"hop after {self._sweep_dwell} empty scans"
+            )
+        if len(self._sweep_centers) < 2:
+            return  # whole band fits one segment — nothing to sweep
+
+        self._empty_scan_count += 1
+        if self._empty_scan_count < self._sweep_dwell:
+            return
+        self._empty_scan_count = 0
+        self._sweep_index = (self._sweep_index + 1) % len(self._sweep_centers)
+        new_center = self._sweep_centers[self._sweep_index]
+        self.logger.info(
+            f"Band sweep: no sonde after {self._sweep_dwell} scans — retuning "
+            f"{self.device_serial} to {new_center/1e6:.3f} MHz "
+            f"(segment {self._sweep_index + 1}/{len(self._sweep_centers)})"
+        )
+        self.device_config['center_freq'] = new_center
+        # Close the analyzer so the next scan cycle reopens at the new center.
+        with self._device_lock:
+            self._teardown_scan()
+
     def _teardown_decode(self):
+        # Capture decode outcome BEFORE stopping — needed for the manager's
+        # landed-sonde re-assignment guard below
+        ended_source = self._decode_source
+        ended_serial = self._cur_serial
+        ended_freq   = self._cur_freq
+        frames_decoded = self._decoder.frame_count if self._decoder else 0
+
         if self._decoder:
             try:
                 self._decoder.stop()
@@ -1155,10 +1862,41 @@ class DeviceWorker:
         self._cur_type  = None
         self._cur_serial = None
         self._cur_signal_strength_db = None
+        self._cur_signal_power_dbfs = None
+        self._decode_source = None
         was_manual = self._is_manual_decoder
         self._is_manual_decoder = False
         self._state     = self.STATE_IDLE
-        
+
+        # Notify the manager so Import API doesn't immediately re-assign a
+        # landed/lost sonde back onto this (or another) device
+        if ended_source == 'import_api' and self._manager is not None:
+            try:
+                self._manager.note_imported_decode_ended(
+                    serial=ended_serial,
+                    frequency=ended_freq,
+                    last_alt_m=getattr(self, '_last_alt_m', None),
+                    last_vv_ms=getattr(self, '_last_vv_ms', None),
+                    frames_decoded=frames_decoded
+                )
+            except Exception as exc:
+                self.logger.debug(f"Landed-sonde guard notification failed: {exc}")
+
+        # Zero-frame auto decode → negative-result cache: stop the scanner
+        # from re-picking the same birdie/phantom every cycle
+        if (ended_source == 'auto' and frames_decoded == 0 and ended_freq
+                and self._manager is not None):
+            try:
+                self._manager.note_auto_decode_failed(
+                    ended_freq, snr=self._cur_signal_strength_db)
+                # If this 0-frame decode came from the RS41 BW fast-path, the type
+                # ID was probably wrong (a narrow-measuring DFM etc.) — force
+                # dft_detect on the next detection so it's classified correctly.
+                if self._cur_used_fastpath:
+                    self._manager.note_fastpath_failed(ended_freq)
+            except Exception as exc:
+                self.logger.debug(f"Auto-decode failure notification failed: {exc}")
+
         # Mark that we need to wait before next USB reopen (prevents PLL lock failures)
         self._usb_reopen_after_decode = True
         
@@ -1192,13 +1930,53 @@ class DeviceWorker:
             or (sonde_type, 0.0) if using bandwidth fallback
         """
         sonde_offset = 0.0
-        
+        bw = sig.bandwidth
+        self._cur_used_fastpath = False
+
+        # If a previous fast-path RS41 decode at this frequency produced 0 frames,
+        # the BW-based ID was likely wrong (e.g. a narrow-measuring DFM) — skip
+        # the fast-path this time and let dft_detect decide.
+        force_dft = (self._manager is not None
+                     and self._manager.should_skip_fastpath(sig.frequency))
+
+        # ---- RS41 fast-path (restores V1.0.50 behaviour) --------------------
+        # A signal whose 3 dB width sits squarely in the RS41 band (3.5-7.0 kHz)
+        # is RS41 with very high confidence: RS92 is narrower (2-3 kHz), DFM is
+        # wider (>=7.5 kHz), M10/M20/iMet are much wider (9-24 kHz). For these we
+        # SKIP dft_detect entirely and start decoding immediately.
+        #
+        # Why: the dft_detect step costs ~15 s of zero decoding per signal (close
+        # device, 3 s settle, 5 s rtl_fm capture, correlate, 1 s, reopen) AND on
+        # weak RS41 sometimes fails to reach the 0.53 correlation threshold, so
+        # RS41 was both slow to start and occasionally missed entirely in V1.0.60
+        # ("deaf", fewer frames). V1.0.50 identified RS41 by bandwidth instantly
+        # and decoded rock-solid. dft_detect stays in the loop for wider/ambiguous
+        # signals (DFM subtype, M10 vs M20, iMet) where it genuinely earns its
+        # cost and where the Vigor patch improved things.
+        if self.RS41_FASTPATH_ENABLED and not force_dft \
+                and 400e6 <= sig.frequency <= 406e6 \
+                and self.RS41_FASTPATH_BW_MIN <= bw <= self.RS41_FASTPATH_BW_MAX:
+            self.logger.info(
+                f"RS41 fast-path: BW {bw/1e3:.1f} kHz is unambiguously RS41 — "
+                f"skipping dft_detect, decoding immediately (offset ignored for RS41)"
+            )
+            self._cur_used_fastpath = True
+            return 'RS41', 0.0
+        if force_dft and 400e6 <= sig.frequency <= 406e6 \
+                and self.RS41_FASTPATH_BW_MIN <= bw <= self.RS41_FASTPATH_BW_MAX:
+            self.logger.info(
+                f"BW {bw/1e3:.1f} kHz is in RS41 fast-path range but a prior fast-path "
+                f"decode here made 0 frames — using dft_detect to re-check the type"
+            )
+        # ---------------------------------------------------------------------
+
         if self._dft and self._dft.available:
             try:
                 result = self._dft.detect_sonde_type(
                     frequency=sig.frequency,
                     device_serial=self.device_serial,
-                    sample_rate=48000,
+                    # sample_rate intentionally omitted: DftDetector auto-selects
+                    # a narrower or wider IF capture rate from sig.bandwidth.
                     bandwidth=sig.bandwidth
                 )
                 if result:
@@ -1277,10 +2055,40 @@ class DeviceWorker:
     def _is_blacklisted(self, freq_hz: float) -> bool:
         """Check if frequency is blacklisted (±2.5 kHz tolerance)"""
         return any(abs(freq_hz - b) < 2_500 for b in self._blacklist)
+
+    @staticmethod
+    def _near_grid(freq_hz: float, grid_hz: float, tol_hz: float) -> bool:
+        """True if freq_hz is within tol_hz of a grid_hz multiple."""
+        r = freq_hz % grid_hz
+        return r <= tol_hz or (grid_hz - r) <= tol_hz
+
+    def _repo_grid_ok(self, freq_hz: float) -> bool:
+        """Whether an UNCONFIRMED candidate belongs in the frequency repository.
+
+        Accept the coarse 100 kHz sonde-channel grid in every segment; inside a
+        dense segment (403.0-404.0 DFM band) also accept the fine 10 kHz grid
+        (403.13/403.55/…). Elsewhere the 10 kHz grid is rejected so the RTL's
+        10 kHz-grid spurs (404.040/405.660/…) don't clutter the list. A decoded
+        sonde is logged 'confirmed' separately, regardless of this filter."""
+        if self._repo_grid_hz <= 0:
+            return True  # filter disabled
+        if self._near_grid(freq_hz, self._repo_grid_hz, self._repo_grid_tol_hz):
+            return True
+        if self._repo_dense_grid_hz > 0:
+            for lo, hi in self._repo_dense_ranges:
+                if lo <= freq_hz <= hi:
+                    return self._near_grid(freq_hz, self._repo_dense_grid_hz,
+                                           self._repo_dense_grid_tol_hz)
+        return False
     
     def _get_decoder_path(self, sonde_type: str) -> Optional[str]:
         """Get decoder path for a sonde type."""
-        decoder_binary = RS1729Decoder.DECODER_MAP.get(sonde_type, 'rs41mod')
+        # Normalize subtype labels like "DFM17"/"DFM09" back to the base
+        # family ("DFM") first — otherwise this cooldown-path lookup picks
+        # the wrong binary (rs41mod default) for imported/manual decodes
+        # that report a specific DFM variant instead of the base type.
+        normalized = RS1729Decoder.normalize_sonde_type(sonde_type)
+        decoder_binary = RS1729Decoder.DECODER_MAP.get(normalized, 'rs41mod')
         # Delegate to RS1729Decoder's own path resolution (single source of
         # truth — this used to be a separately maintained, slightly-divergent
         # copy of the same lookup list).
@@ -1348,6 +2156,16 @@ class DeviceWorker:
             if sonde_id and sonde_id != 'UNKNOWN':
                 self._cur_serial = sonde_id
 
+            # Track last altitude / vertical speed for the landed-sonde
+            # re-assignment guard (manager.note_imported_decode_ended)
+            try:
+                if frame_data.get('alt') is not None:
+                    self._last_alt_m = float(frame_data.get('alt'))
+                if frame_data.get('velocity_vertical') is not None:
+                    self._last_vv_ms = float(frame_data.get('velocity_vertical'))
+            except (TypeError, ValueError):
+                pass
+
             def _parse_db(val) -> Optional[float]:
                 if val is None:
                     return None
@@ -1385,10 +2203,18 @@ class DeviceWorker:
                 except Exception:
                     live_rssi, live_snr = None, None
 
+            # RSSI and SNR must come from DIFFERENT sources. Previously both fell
+            # back to _cur_signal_strength_db (the scan SNR) when live metrics and
+            # frame values were absent (the default direct-pipe chain has no live
+            # metrics), so RSSI and SNR displayed the identical value. RSSI now
+            # falls back to the scan's absolute peak power (dBFS); SNR to the scan
+            # SNR. They only coincide if the analyzer couldn't supply a power.
             if live_rssi is not None:
                 rssi_db = live_rssi
             elif rssi_db is None:
-                rssi_db = self._cur_signal_strength_db
+                rssi_db = self._cur_signal_power_dbfs
+                if rssi_db is None:  # no absolute power available — last resort
+                    rssi_db = self._cur_signal_strength_db
 
             if live_snr is not None:
                 snr_db = live_snr
@@ -1503,10 +2329,13 @@ class RTLSDRDeviceManager:
 
     def __init__(self, config: dict,
                  telemetry_callback: Callable[[SondeTelemetry], None],
-                 channelizer_status_output=None):
+                 channelizer_status_output=None,
+                 frequency_repository=None):
         self.config             = config
         self.telemetry_callback = telemetry_callback
         self.channelizer_status_output = channelizer_status_output
+        # Optional per-session detected/confirmed frequency log (set by the app).
+        self.frequency_repository = frequency_repository
         self.logger             = logging.getLogger('RTLSDRDeviceManager')
         self.running            = False
         self.lock               = threading.Lock()   # web_server compatibility
@@ -1519,6 +2348,30 @@ class RTLSDRDeviceManager:
         rtlsdr_cfg = config.get('sdr', {}).get('rtlsdr', {})
         if 'devices' in rtlsdr_cfg:
             self.device_configs = rtlsdr_cfg['devices']
+            # Validate/repair per-device configs. A device entry missing
+            # 'center_freq' or 'sample_rate' previously crashed SpectrumAnalyzer
+            # on EVERY scan cycle (KeyError: 'center_freq'), spinning that
+            # worker's log with a traceback every ~5 s and leaving the device
+            # permanently dead. Fill sane defaults and warn once so one typo in
+            # config.yaml degrades one device gracefully instead of wedging it.
+            _default_center = rtlsdr_cfg.get('center_freq', 404_000_000)
+            _default_rate = rtlsdr_cfg.get('sample_rate', 2_400_000)
+            for _dev in self.device_configs:
+                _serial = _dev.get('serial', '?')
+                if _dev.get('center_freq') is None:
+                    _dev['center_freq'] = _default_center
+                    self.logger.warning(
+                        f"Device {_serial} config missing 'center_freq' — "
+                        f"defaulting to {_default_center/1e6:.3f} MHz. Set a "
+                        f"'center_freq' for this device in config.yaml to control "
+                        f"which part of the band it scans."
+                    )
+                if _dev.get('sample_rate') is None:
+                    _dev['sample_rate'] = _default_rate
+                    self.logger.warning(
+                        f"Device {_serial} config missing 'sample_rate' — "
+                        f"defaulting to {_default_rate/1e6:.1f} MSPS."
+                    )
         else:
             # Legacy single-device format
             self.device_configs = [{
@@ -1575,6 +2428,50 @@ class RTLSDRDeviceManager:
             self._api_client = None
             self.logger.debug("Import API disabled in configuration")
 
+        # Landed-sonde reassignment guard: after an imported-sonde decode ends
+        # idle, block that sonde from immediate re-assignment. Field-observed
+        # churn: a sonde landed at ~13:41, the API kept listing it, and the
+        # manager re-assigned it every poll — each time occupying a device for
+        # the full manual_idle_time (600 s) decoding nothing.
+        self._import_reassign_cooldown_s = float(import_api_cfg.get('reassign_cooldown_s', 600))
+        self._import_landed_alt_m = float(import_api_cfg.get('landed_alt_m', 3000))
+        self._import_landed_cooldown_s = float(import_api_cfg.get('landed_cooldown_s', 21600))
+        self._import_blocked: Dict[str, tuple] = {}        # serial → (blocked_until, reason)
+        self._import_blocked_freqs: Dict[float, tuple] = {}  # freq_hz → (blocked_until, reason)
+        self._import_block_lock = threading.Lock()
+
+        # Auto-decode failure cooldown (negative-result cache, auto_rx-style
+        # temporary block list): a scan-detected frequency whose decoder
+        # produced ZERO frames is very likely a birdie/DC spur/misclassified
+        # signal — don't let the scanner re-pick it every cycle (field: a
+        # phantom "DFM" at 404.5813 MHz occupied a device 300 s per cycle in
+        # an endless detect→decode-nothing→rescan loop). Manual and Import
+        # API decodes are NOT affected by this block.
+        det_guard_cfg = config.get('detection', {})
+        self._failed_decode_cooldown_s = float(det_guard_cfg.get('failed_decode_cooldown_s', 900))
+        # (B) The block now uses an ESCALATING backoff instead of a flat cooldown,
+        # and clears early when the signal reappears meaningfully stronger. This
+        # stops a real (weak, ascending) sonde from being locked out for the full
+        # cooldown while it strengthens: the FIRST 0-frame gets only a short
+        # block (re-attempt soon if still detected); repeated 0-frames on the same
+        # frequency escalate toward the cap (throttling a true birdie).
+        self._failed_decode_base_cooldown_s = float(
+            det_guard_cfg.get('failed_decode_base_cooldown_s', 60))
+        # A signal reappearing this many dB above the SNR it failed at is treated
+        # as an ascending/strengthening sonde → its block is cleared and retried.
+        self._failed_decode_snr_rise_db = float(
+            det_guard_cfg.get('failed_decode_snr_rise_db', 3.0))
+        # freq_hz → {'until': ts, 'snr': dB|None, 'fails': n}
+        self._auto_decode_failures: Dict[float, dict] = {}
+        self._auto_fail_lock = threading.Lock()
+
+        # RS41 fast-path self-correction: if a fast-path RS41 decode produces 0
+        # frames, the BW-based ID was likely wrong (e.g. a just-starting DFM that
+        # measured abnormally narrow and landed in the RS41 BW window). Record the
+        # frequency so the NEXT detection skips the fast-path and uses dft_detect
+        # for a proper type ID. TTL-bounded (reuses failed_decode_cooldown_s).
+        self._fastpath_failed: Dict[float, float] = {}  # freq_hz → skip_until
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -1624,10 +2521,15 @@ class RTLSDRDeviceManager:
                 time.sleep(delay)
         self.logger.info("All device workers started")
         
-        # Start Import API polling if enabled
+        # Start Import API polling if enabled. Runs its own warm-up wait
+        # (_start_import_api_polling → _wait_for_workers_ready) in a
+        # background thread before the first poll/assignment, so an
+        # immediate Import API match can't land a device on decode duty
+        # while sibling devices are still mid-USB-open/PLL-negotiation.
         if self._import_api_enabled and self._api_client:
-            self.logger.info("Starting Import API polling...")
-            self._api_client.start(self._on_imported_sondes)
+            threading.Thread(
+                target=self._start_import_api_polling, daemon=True, name='ImportAPI-Warmup'
+            ).start()
         
         # Start fixed channels if enabled (wait for workers to stabilize)
         self.logger.debug(f"Checking fixed_channels startup: enabled={self._fixed_channels_enabled}, channels={len(self._fixed_channels)}")
@@ -1747,7 +2649,8 @@ class RTLSDRDeviceManager:
         success = worker.start_manual_decode(
             frequency=priority_freq_hz,
             sonde_type=sonde_type,
-            duration_seconds=timeout
+            duration_seconds=timeout,
+            source='priority'
         )
         
         if not success:
@@ -1806,6 +2709,143 @@ class RTLSDRDeviceManager:
             # Force return to scanning
             worker.stop_decode_and_scan()
     
+    def note_imported_decode_ended(self, serial: Optional[str], frequency: Optional[float],
+                                   last_alt_m: Optional[float], last_vv_ms: Optional[float],
+                                   frames_decoded: int):
+        """Called by a DeviceWorker when an Import-API-sourced decode ends
+        (idle timeout / stop). Registers a re-assignment block so the next
+        API poll doesn't immediately re-occupy a device with the same sonde.
+
+        Heuristics:
+        - Last decoded altitude below landed_alt_m while descending → the
+          sonde is on the ground (or about to be): long cooldown.
+        - Otherwise (lost high, or never decoded a single frame): short
+          cooldown — enough to break the assign→idle→assign loop while still
+          allowing re-acquisition of a sonde that comes back over the horizon.
+        - Zero frames ever decoded → no serial known: block by frequency.
+        """
+        now = time.time()
+        if (last_alt_m is not None and last_alt_m < self._import_landed_alt_m
+                and (last_vv_ms is None or last_vv_ms < 0)):
+            cooldown = self._import_landed_cooldown_s
+            reason = (f"landed (last alt {last_alt_m:.0f} m, "
+                      f"vV {last_vv_ms if last_vv_ms is not None else '?'} m/s)")
+        else:
+            cooldown = self._import_reassign_cooldown_s
+            if frames_decoded > 0:
+                reason = (f"signal lost (last alt "
+                          f"{f'{last_alt_m:.0f} m' if last_alt_m is not None else 'unknown'})")
+            else:
+                reason = "no frames decoded"
+
+        with self._import_block_lock:
+            if serial:
+                self._import_blocked[serial] = (now + cooldown, reason)
+            elif frequency:
+                self._import_blocked_freqs[frequency] = (now + cooldown, reason)
+
+        target = serial or (f"{frequency/1e6:.3f} MHz" if frequency else "unknown")
+        self.logger.info(
+            f"Import API: blocking re-assignment of {target} for "
+            f"{cooldown/60:.0f} min — {reason} ({frames_decoded} frames decoded)"
+        )
+
+    def note_fastpath_failed(self, frequency: float):
+        """A fast-path RS41 decode produced 0 frames — the BW-based ID was likely
+        wrong (a DFM/other that measured narrow). Force dft_detect on the next
+        detection of this frequency (±10 kHz) for the failed_decode_cooldown_s TTL."""
+        with self._auto_fail_lock:
+            self._fastpath_failed[frequency] = time.time() + self._failed_decode_cooldown_s
+        self.logger.info(
+            f"Fast-path RS41 at {frequency/1e6:.4f} MHz produced 0 frames — will use "
+            f"dft_detect (not the BW fast-path) next time to re-check the sonde type"
+        )
+
+    def should_skip_fastpath(self, frequency: float) -> bool:
+        """True if a recent fast-path RS41 decode at this frequency (±10 kHz)
+        produced 0 frames, so the RS41 BW fast-path should be skipped in favour
+        of dft_detect."""
+        now = time.time()
+        with self._auto_fail_lock:
+            for f in [f for f, until in self._fastpath_failed.items() if until <= now]:
+                del self._fastpath_failed[f]
+            return any(abs(f - frequency) < 10_000 for f in self._fastpath_failed)
+
+    def note_auto_decode_failed(self, frequency: float, snr: Optional[float] = None):
+        """A scan-triggered (auto) decode ended with zero frames — block this
+        frequency from auto re-detection. (B) Uses an escalating backoff: the
+        Nth consecutive 0-frame near this frequency blocks for
+        base * 2^(N-1), capped at failed_decode_cooldown_s. So the first miss on
+        a weak-but-real sonde only pauses briefly (it's retried soon and decodes
+        once it strengthens), while a true birdie that keeps producing 0 frames
+        is throttled toward the long cap. Records the SNR so is_auto_decode_blocked
+        can clear the block early if the signal reappears stronger."""
+        now = time.time()
+        with self._auto_fail_lock:
+            # Carry the consecutive-fail count from a recent entry near this freq.
+            fails = 1
+            for f, e in list(self._auto_decode_failures.items()):
+                if abs(f - frequency) < 10_000:
+                    fails = int(e.get('fails', 1)) + 1
+                    del self._auto_decode_failures[f]
+            dur = min(self._failed_decode_base_cooldown_s * (2 ** (fails - 1)),
+                      self._failed_decode_cooldown_s)
+            self._auto_decode_failures[frequency] = {
+                'until': now + dur, 'snr': snr, 'fails': fails}
+        snr_s = f" (SNR {snr:.1f} dB)" if snr is not None else ""
+        self.logger.info(
+            f"Auto-decode produced 0 frames at {frequency/1e6:.4f} MHz{snr_s} — "
+            f"blocking auto re-detection for {dur/60:.1f} min (fail #{fails}; clears "
+            f"early if it reappears ≥{self._failed_decode_snr_rise_db:.0f} dB stronger)"
+        )
+
+    def is_auto_decode_blocked(self, frequency: float,
+                               current_snr: Optional[float] = None) -> bool:
+        """True if this frequency is in its failed-decode cooldown (±10 kHz).
+        (B) If current_snr is given and the signal has reappeared at least
+        failed_decode_snr_rise_db above the SNR it failed at, the block is
+        CLEARED and False is returned — an ascending/strengthening sonde is
+        retried immediately instead of waiting out the cooldown."""
+        now = time.time()
+        with self._auto_fail_lock:
+            for f in [f for f, e in self._auto_decode_failures.items()
+                      if e.get('until', 0) <= now]:
+                del self._auto_decode_failures[f]
+            for f, e in list(self._auto_decode_failures.items()):
+                if abs(f - frequency) >= 10_000:
+                    continue
+                blk_snr = e.get('snr')
+                if current_snr is not None and blk_snr is not None and \
+                        current_snr >= blk_snr + self._failed_decode_snr_rise_db:
+                    del self._auto_decode_failures[f]
+                    self.logger.info(
+                        f"{frequency/1e6:.4f} MHz reappeared at {current_snr:.1f} dB "
+                        f"(failed at {blk_snr:.1f} dB) — clearing block, retrying"
+                    )
+                    return False
+                return True
+            return False
+
+    def _get_import_block_reason(self, serial: Optional[str],
+                                 frequency: Optional[float]) -> Optional[str]:
+        """Return the block reason if this sonde is under re-assignment
+        cooldown, else None. Expired entries are purged."""
+        now = time.time()
+        with self._import_block_lock:
+            for table in (self._import_blocked, self._import_blocked_freqs):
+                expired = [k for k, (until, _) in table.items() if until <= now]
+                for k in expired:
+                    del table[k]
+
+            if serial and serial in self._import_blocked:
+                until, reason = self._import_blocked[serial]
+                return f"{reason} (retry in {(until - now)/60:.0f} min)"
+            if frequency:
+                for freq, (until, reason) in self._import_blocked_freqs.items():
+                    if abs(freq - frequency) < 20_000:
+                        return f"{reason} (retry in {(until - now)/60:.0f} min)"
+        return None
+
     def _on_imported_sondes(self, sondes: List[Dict]):
         """Callback for Import API: assign detected sondes to available SDR receivers.
         
@@ -1853,7 +2893,17 @@ class RTLSDRDeviceManager:
                     f"already being decoded"
                 )
                 continue
-            
+
+            # Landed-sonde / churn guard: skip sondes whose previous decode
+            # attempt ended idle (landed or signal lost) and are in cooldown
+            block_reason = self._get_import_block_reason(serial, frequency)
+            if block_reason:
+                self.logger.info(
+                    f"Skipping imported sonde {serial} @ {frequency/1e6:.3f} MHz: "
+                    f"{block_reason}"
+                )
+                continue
+
             # Get next available worker
             worker = available_workers[assigned_count]
             
@@ -1867,7 +2917,8 @@ class RTLSDRDeviceManager:
             success = worker.start_manual_decode(
                 frequency=frequency,
                 sonde_type=sonde_type,
-                duration_seconds=None  # Decode until sonde lost
+                duration_seconds=None,  # Decode until sonde lost
+                source='import_api'
             )
             
             if success:
@@ -1893,29 +2944,28 @@ class RTLSDRDeviceManager:
     # Fixed-channel startup
     # ------------------------------------------------------------------
 
-    def _start_fixed_channels(self):
-        """Decode fixed_channels list at startup with RX Scan cycling (Phase 2).
-        
-        Phase 2 Implementation:
-        - Groups channels by device
-        - Enables RX Scan cycling on each device
-        - Each device cycles through its assigned channels every fixed_channel_scantime seconds
-        - Conservative 3-second USB delays between device stops and starts
-        """
-        # Wait for ALL workers to reach SCANNING state AND complete first scan cycle
-        self.logger.info("Fixed Channels: waiting for all workers to complete first scan cycle...")
-        min_wait = 20  # Minimum 20 seconds (allows for staggered init + first scan)
-        max_wait = 40  # Maximum 40 seconds
+    def _wait_for_workers_ready(self, label: str, min_wait: float = 20, max_wait: float = 40,
+                                 final_buffer: float = 2.0):
+        """Block until all workers have opened their RTL-SDR device and reached
+        SCANNING/DECODING at least once (or max_wait elapses). Any startup path
+        that immediately assigns a device to a decode (fixed_channels, Import
+        API) needs this — without it, the assignment can land in the middle of
+        the multi-device USB-open/PLL-negotiation storm that the workers'
+        internal staggered-init delays (5s/7.5s/10s/12.5s...) spread out over,
+        producing a "healthy" decoder that silently never receives clean IQ
+        data (observed in the field as RS41/DFM decoders staying alive with
+        zero frames when an Import API assignment landed within the first
+        ~15s of process start, while sibling devices were still mid-PLL-retry)."""
+        self.logger.info(f"{label}: waiting for all workers to complete first scan cycle...")
         start_wait = time.time()
-        
+
         # First, wait for minimum time
-        first_phase = min(min_wait, max_wait)
-        while time.time() - start_wait < first_phase:
+        while time.time() - start_wait < min_wait:
             time.sleep(1.0)
-        
+
         elapsed = time.time() - start_wait
-        self.logger.info(f"Fixed Channels: minimum wait complete ({elapsed:.1f}s)")
-        
+        self.logger.info(f"{label}: minimum wait complete ({elapsed:.1f}s)")
+
         # Then verify all workers are in SCANNING or DECODING state
         while time.time() - start_wait < max_wait:
             all_scanning = True
@@ -1923,23 +2973,45 @@ class RTLSDRDeviceManager:
                 if w.state not in (DeviceWorker.STATE_SCANNING, DeviceWorker.STATE_DECODING):
                     all_scanning = False
                     break
-            
+
             if all_scanning:
                 elapsed = time.time() - start_wait
-                self.logger.info(f"Fixed Channels: all workers ready after {elapsed:.1f}s total")
+                self.logger.info(f"{label}: all workers ready after {elapsed:.1f}s total")
                 break
-            
+
             time.sleep(1.0)
         else:
             # Timeout reached
             self.logger.warning(
-                f"Fixed Channels: timeout waiting for workers (some may still be initializing)"
+                f"{label}: timeout waiting for workers (some may still be initializing)"
             )
-        
-        # Add final 2-second buffer to ensure USB devices are fully settled
-        self.logger.info("Fixed Channels: adding 2s final buffer for USB stability...")
-        time.sleep(2.0)
-        
+
+        # Final buffer to ensure USB devices are fully settled
+        self.logger.info(f"{label}: adding {final_buffer:.0f}s final buffer for USB stability...")
+        time.sleep(final_buffer)
+
+    def _start_import_api_polling(self):
+        """Warm-up wrapper around SondeApiClient.start(): waits for all workers
+        to be past their initial USB-open/PLL-negotiation storm before the
+        first Import API poll can assign (and immediately start decoding on)
+        a device — see _wait_for_workers_ready() docstring for the failure
+        mode this avoids. Runs in its own thread so RTLSDRDeviceManager.start()
+        itself stays non-blocking."""
+        self._wait_for_workers_ready("Import API")
+        self.logger.info("Starting Import API polling...")
+        self._api_client.start(self._on_imported_sondes)
+
+    def _start_fixed_channels(self):
+        """Decode fixed_channels list at startup with RX Scan cycling (Phase 2).
+
+        Phase 2 Implementation:
+        - Groups channels by device
+        - Enables RX Scan cycling on each device
+        - Each device cycles through its assigned channels every fixed_channel_scantime seconds
+        - Conservative 3-second USB delays between device stops and starts
+        """
+        self._wait_for_workers_ready("Fixed Channels")
+
         try:
             self.logger.debug("Fixed Channels: starting channel assignment phase")
             
@@ -2033,7 +3105,8 @@ class RTLSDRDeviceManager:
                             f"Calling start_manual_decode() for {worker.device_serial}: "
                             f"freq={freq_hz/1e6:.3f} MHz, type={stype}"
                         )
-                        result = worker.start_manual_decode(freq_hz, stype, duration_seconds=None)
+                        result = worker.start_manual_decode(freq_hz, stype, duration_seconds=None,
+                                                             source='fixed_channel')
                         self.logger.debug(
                             f"start_manual_decode() returned: {result} for {worker.device_serial}"
                         )
@@ -2072,7 +3145,8 @@ class RTLSDRDeviceManager:
                             f"Calling start_manual_decode() for {worker.device_serial}: "
                             f"freq={freq_hz/1e6:.3f} MHz, type={stype}"
                         )
-                        result = worker.start_manual_decode(freq_hz, stype, duration_seconds=None)
+                        result = worker.start_manual_decode(freq_hz, stype, duration_seconds=None,
+                                                             source='fixed_channel')
                         self.logger.debug(
                             f"start_manual_decode() returned: {result} for {worker.device_serial}"
                         )
@@ -2206,11 +3280,13 @@ class RTLSDRDeviceManager:
                 'freq_label':            freq_label,
                 'sonde_type':            w.current_sonde_type,
                 'sonde_serial':          w.current_sonde_serial,
+                'decode_source':         w.decode_source,  # 'auto'/'manual'/'priority'/'fixed_channel'/None
                 'gain':                  w.device_config.get('gain', 40),  # Current gain setting
                 'decoder_mode':          w.decoder_mode,  # 'legacy' or 'channelizer'
                 'channelizer_active':    w.get_channelizer_channel_details(),  # Active channel details
                 'channelizer_max':       w.channelizer_max_channels,     # Max channels (0 for legacy)
                 'scan_return_eta_s':     w.get_scan_return_eta_s(),  # Seconds until back to scanning, or None
+                'sweep_enabled':         bool(getattr(w, '_sweep_enabled', False)),  # band-sweep active for this device
             })
         return result
 
@@ -2239,7 +3315,7 @@ class RTLSDRDeviceManager:
                 if spec:
                     self.logger.debug(f"Returning spectrum with {len(spec.get('freqs_mhz', []))} points")
                     return spec
-                self.logger.warning(f"Worker {serial} returned empty spectrum, returning fallback")
+                self.logger.debug(f"Worker {serial} returned empty spectrum, returning fallback")
                 return {
                     'receiver_id': target,
                     'receiver_name': f"RTL-SDR {serial}",
@@ -2275,7 +3351,29 @@ class RTLSDRDeviceManager:
         """Update Fixed Channel scan time (Phase 2: RX Scan cycling duration)."""
         self._fixed_channel_scantime = seconds
         self.logger.info(f"Fixed Channel scantime set to {seconds}s (will be used in Phase 2 RX Scan)")
-    
+
+    def reload_detection_config(self) -> bool:
+        """Re-read the `detection:` section from config.yaml on disk and
+        apply it in place to the shared app config dict, so the web UI's
+        'Start Scan' (force clean restart) button can pick up freshly-
+        edited scan tuning — scan_check_time, max_peaks, channel_spacing_hz,
+        detect_confirm_time, etc. — without a full service restart.
+        Mutates self.config in place: every DeviceWorker.app_config is the
+        SAME dict object, so this takes effect for all workers immediately.
+        """
+        try:
+            import yaml
+            with open('config.yaml', 'r', encoding='utf-8') as f:
+                fresh = yaml.safe_load(f) or {}
+            fresh_detection = fresh.get('detection', {})
+            self.config.setdefault('detection', {}).update(fresh_detection)
+            self.logger.info("Reloaded detection config from config.yaml for forced scan restart")
+            return True
+        except Exception as e:
+            self.logger.warning(f"Failed to reload detection config from config.yaml: {e}")
+            return False
+
+
     def get_runtime_config(self) -> dict:
         """Return current runtime configuration."""
         det_cfg = self.config.get('detection', {})

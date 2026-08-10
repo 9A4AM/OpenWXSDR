@@ -220,6 +220,9 @@
         .status-scanning { background: #4299e1; color: white; }
         .status-decoding { background: #48bb78; color: white; }
         .status-idle { background: #cbd5e0; color: #4a5568; }
+
+        /* Band-sweep active: green outer ring around the status badge. */
+        .receiver-status.sweep-ring { box-shadow: 0 0 0 3px rgba(72, 187, 120, 0.55); }
         
         .receiver-info {
             margin-top: 10px;
@@ -504,7 +507,7 @@
         <div class="section-card">
             <h2 class="section-title">
                 <i class="bi bi-broadcast section-icon"></i>
-                SDR Receivers
+                SDR <span id="sdrReceiversHeaderLabel">Receivers</span>
             </h2>
             <div class="receivers-grid" id="receiversGrid">
                 <div class="text-center text-muted py-4">
@@ -576,7 +579,7 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     
     <!-- RX Statistics Common Functions -->
-    <script src="/static/js/rx-statistics-common.js"></script>
+    <script src="/static/js/rx-statistics-common.js?v={{ static_js_v }}"></script>
     
     <script>
         // Auto-refresh interval (30 seconds)
@@ -659,16 +662,23 @@
                 const receivers = await response.json();
                 
                 const grid = document.getElementById('receiversGrid');
-                
+
+                // Header reads "SDR Receiver" (singular) when exactly one is configured.
+                const hdrLabel = document.getElementById('sdrReceiversHeaderLabel');
+                if (hdrLabel) hdrLabel.textContent = (receivers && receivers.length === 1) ? 'Receiver' : 'Receivers';
+
                 if (!receivers || receivers.length === 0) {
                     grid.innerHTML = '<div class="text-center text-muted py-4">No receivers configured</div>';
                     return;
                 }
-                
+
                 grid.innerHTML = receivers.map(rx => {
                     const state = rx.state || 'IDLE';
                     const stateLower = state.toLowerCase();
                     const stateClass = `status-${stateLower}`;
+                    // Band-sweep active → green ring around the status badge.
+                    const sweepRing = (rx.sweep_enabled && (state === 'SCANNING' || state === 'DECODING'))
+                                    ? ' sweep-ring' : '';
                     
                     let freqInfo = 'Idle';
                     // Use freq_label for scanning (shows range), or format frequency for decoding
@@ -679,21 +689,23 @@
                         freqInfo = `${(rx.frequency / 1e6).toFixed(3)} MHz`;
                     }
                     
-                    let sondeInfo = '';
-                    if (state === 'DECODING' && rx.sonde_serial) {
-                        sondeInfo = `
-                            <div class="info-row">
-                                <span class="info-label">Sonde:</span>
-                                <span class="info-value">${rx.sonde_serial}</span>
-                            </div>
-                        `;
+                    const sondeInfo = `
+                        <div class="info-row">
+                            <span class="info-label">Sonde:</span>
+                            <span class="info-value">${(state === 'DECODING' && rx.sonde_serial) ? rx.sonde_serial : '-'}</span>
+                        </div>
+                    `;
+
+                    let gainInfo = '-';
+                    if (rx.gain !== undefined && rx.gain !== null) {
+                        gainInfo = (rx.gain === 0) ? 'Auto' : `${rx.gain} dB`;
                     }
-                    
+
                     return `
                         <div class="receiver-card ${stateLower}">
                             <div class="receiver-header">
                                 <div class="receiver-name">${rx.device_id || 'Unknown'}</div>
-                                <div class="receiver-status ${stateClass}">${state}</div>
+                                <div class="receiver-status ${stateClass}${sweepRing}">${state}</div>
                             </div>
                             <div class="receiver-info">
                                 <div class="info-row">
@@ -707,7 +719,7 @@
                                 </div>
                                 <div class="info-row">
                                     <span class="info-label">Gain:</span>
-                                    <span class="info-value">${rx.gain !== undefined ? rx.gain + ' dB' : 'Auto'}</span>
+                                    <span class="info-value">${gainInfo}</span>
                                 </div>
                                 ${rx.decoder_mode === 'channelizer' ? `
                                 <div class="info-row">
@@ -1735,6 +1747,18 @@
             const currentLang = localStorage.getItem('aboutLanguage') || 'en';
             setAboutLanguage(currentLang);
             modal.show();
+            // Fill Hostname / IP (same source as the Service Status modal)
+            fetch('/api/service_status', { cache: 'no-store' })
+                .then(r => r.json())
+                .then(data => {
+                    if (!data || !data.success) return;
+                    const text = `${data.hostname || '-'} / ${data.ip_address || '-'}`;
+                    const en = document.getElementById('aboutHostnameIpEN');
+                    const de = document.getElementById('aboutHostnameIpDE');
+                    if (en) en.textContent = text;
+                    if (de) de.textContent = text;
+                })
+                .catch(() => { /* leave placeholder on error */ });
         }
 
         function setAboutLanguage(lang) {
@@ -2499,6 +2523,7 @@
                                 <tr><th>Version</th><td>V{{ version }} (Release)</td></tr>
                                 <tr><th>Station</th><td>{{ callsign }}</td></tr>
                                 <tr><th>Build Date</th><td>{{ build_date }}</td></tr>
+                                <tr><th>Hostname / IP</th><td><span id="aboutHostnameIpEN">-</span></td></tr>
                             </tbody>
                         </table>
 
@@ -2538,6 +2563,7 @@
                                 <tr><th>Version</th><td>V{{ version }} (Release)</td></tr>
                                 <tr><th>Station</th><td>{{ callsign }}</td></tr>
                                 <tr><th>Build-Datum</th><td>{{ build_date }}</td></tr>
+                                <tr><th>Hostname / IP</th><td><span id="aboutHostnameIpDE">-</span></td></tr>
                             </tbody>
                         </table>
 
@@ -2648,7 +2674,20 @@
         <div class="modal-dialog modal-xl" style="max-width: 1400px;">
             <div class="modal-content">
                 <div class="modal-header">
-                    <h5 class="modal-title"><i class="bi bi-graph-up-arrow"></i> Receiver Statistics</h5>
+                    <div class="d-flex align-items-center gap-3 flex-wrap">
+                        <h5 class="modal-title mb-0"><i class="bi bi-graph-up-arrow"></i> Receiver Statistics</h5>
+                        <div class="d-flex align-items-center gap-2">
+                            <label for="rxStatsDaysSelect" class="mb-0 small text-muted">Range:</label>
+                            <select id="rxStatsDaysSelect" class="form-select form-select-sm" style="width: auto;" onchange="showReceiverStatistics()">
+                                <option value="3">3 days</option>
+                                <option value="7" selected>7 days</option>
+                                <option value="14">14 days</option>
+                                <option value="30">1 month</option>
+                                <option value="60">2 months</option>
+                                <option value="90">3 months</option>
+                            </select>
+                        </div>
+                    </div>
                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
                 <div class="modal-body" style="max-height: 80vh; overflow-y: auto;">

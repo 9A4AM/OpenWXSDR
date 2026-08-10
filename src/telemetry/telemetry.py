@@ -38,6 +38,8 @@
 #    - hardware    : generic host hardware description (e.g. "Raspberry Pi 4
 #                    Model B Rev 1.4" or "x86_64 (Linux 6.1.0)"), the same
 #                    detection used by the web UI's Service Status modal.
+#    - rx_devices  : number of configured receiver devices (e.g. RTL-SDR
+#                    dongles) — a count only, no serials/identifiers.
 #
 #  Explicitly NEVER sent: callsign, station lat/lon, MQTT/SondeHub
 #  credentials, RTL-SDR serials, hostname, IP address, or any other
@@ -65,7 +67,7 @@ class InstallPing:
     """Anonymous, opt-out installation counter. See module docstring for
     exactly what data is (and is not) sent."""
 
-    ENDPOINT_URL = 'http://api.opnwx.de/telemetry/openwxsdr.php'
+    ENDPOINT_URL = 'http://api.opnwx.de/telemetry/openwxsdr_json.php'
     DEFAULT_INTERVAL_HOURS = 24
     REQUEST_TIMEOUT_S = 5
 
@@ -80,6 +82,7 @@ class InstallPing:
         # never hostname/IP, which _get_host_info() also exposes to the web
         # UI's Service Status modal but which are excluded here on purpose.
         self.hardware = detect_host_hardware()
+        self.rx_device_count = self._count_rx_devices(config, self.sdr_type)
         self.logger = logging.getLogger('Telemetry')
         self.data_dir = data_dir
 
@@ -89,6 +92,18 @@ class InstallPing:
 
         if self.enabled:
             self._install_id = self._load_or_create_install_id()
+
+    @staticmethod
+    def _count_rx_devices(config: dict, sdr_type: str) -> int:
+        """Number of configured receiver devices — a count only, no serials.
+        Only RTL-SDR supports multiple devices (config.sdr.rtlsdr.devices);
+        the other backends (ka9q/flux242/airspy) are single-receiver."""
+        if sdr_type == 'rtlsdr':
+            devices = config.get('sdr', {}).get('rtlsdr', {}).get('devices')
+            if devices:
+                return len(devices)
+            return 1  # legacy single-device config format
+        return 1
 
     def _load_or_create_install_id(self) -> str:
         """Load the persisted random install ID, or generate and store a new
@@ -139,6 +154,7 @@ class InstallPing:
             'version': __version__,
             'sdr_type': self.sdr_type,
             'hardware': self.hardware,
+            'rx_devices': self.rx_device_count,
         }
         try:
             requests.post(self.ENDPOINT_URL, json=payload, timeout=self.REQUEST_TIMEOUT_S)

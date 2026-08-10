@@ -72,10 +72,74 @@ class RS1729Decoder:
         'LMS6': 'lms6mod',
         'MRZ': 'mrzmod'
     }
-    
+
+    # External sources (Import API, manual web UI entry) may report a
+    # specific sonde variant/subtype (e.g. "DFM17", "DFM09", "DFM06")
+    # instead of the base family name used as the DECODER_MAP key.
+    # DECODER_MAP.get('DFM17', 'rs41mod') falls through to its default —
+    # observed in the field silently launching rs41mod (wrong decoder,
+    # wrong flags) for a real DFM17 signal. Normalize known variants back
+    # to their base family before decoder-binary selection.
+    SONDE_TYPE_ALIASES = {
+        'DFM06': 'DFM', 'DFM09': 'DFM', 'DFM17': 'DFM',
+    }
+
+    # m10mod/m20mod share one binary family and report which variant was
+    # actually decoded via a raw hex type code in the JSON "subtype" field
+    # (e.g. "0x20") instead of a friendly name the way DFM does
+    # ("0xC:DFM17") — translate known codes to human-readable labels so the
+    # web UI doesn't show a bare hex code where DFM shows "DFM17".
+    M_SERIES_TYPE_CODES = {
+        '0x20': 'M20',
+        '0x9F': 'M10',
+    }
+
+    # Soft-decision decode chain parameters (auto_rx method):
+    #   rtl_fm -M raw (cs16 IQ) → fsk_demod (soft symbols) → decoder --softin
+    # This is ~2 dB more sensitive than direct --IQ decoding and tolerant of
+    # several kHz mistuning (fsk_demod tracks the tone frequencies itself).
+    # NOTE: fsk_demod requires sample_rate to be an integer multiple of the
+    # baud rate — hence DFM uses 50000 (20 sps), not 48000 (19.2 sps).
+    # M10/M20 intentionally NOT listed yet: their --softin support across
+    # unpinned rs1729/RS builds is unverified, and their --IQ path was only
+    # recently field-fixed — add them here once validated (M10 would need
+    # 48080 Hz, which AudioPipeline's '<n>k' rtl_fm rate formatting can't
+    # express yet).
+    # fsk_extra mirrors radiosonde_auto_rx's CURRENT fsk_demod invocations
+    # (autorx/decode.py, generate_decoder_command_experimental). The earlier
+    # params here ('--mask 4800' for RS41, nothing for DFM) were auto_rx's
+    # PRE-2025-08-26 settings — field/bench testing with this harness showed
+    # that RS41 soft chain was deaf below ~30 dB SNR with them while direct --IQ
+    # decoded the same signals fine. auto_rx's 2025-08-26 update ("bump mask
+    # estimator to 5000 Hz, increase timing estimator duration --nsym=300, and
+    # change oversampling -p 5 … improves weak signal performance") is adopted
+    # below. DFM uses inverted soft bits (-i, needed for dfm09mod subtype
+    # detection) and NO mask estimator (auto_rx: DFMs decode better without it).
+    # Requires an fsk_demod built from current auto_rx (scripts/install_softchain.sh)
+    # that accepts --nsym/-p; on an older binary the soft chain simply falls
+    # back to --IQ.
+    SOFT_CHAIN_PARAMS = {
+        'RS41': {'sample_rate': 48000, 'baud': 4800,
+                 'fsk_extra': ['--mask', '5000', '--nsym=300', '-p', '5'],
+                 'freq_lower': -5000, 'freq_upper': 5000},
+        'DFM':  {'sample_rate': 50000, 'baud': 2500,
+                 'fsk_extra': ['-i'],
+                 'freq_lower': -5000, 'freq_upper': 5000},
+    }
+
     # Class-level cache for decoder capabilities
     _decoder_caps = {}
     _decoder_failures = {}  # Track failures per (path, type) for cooldown
+    _flag_probe_cache = {}  # (path, flags) → bool from empirical flag probing
+
+    @classmethod
+    def normalize_sonde_type(cls, sonde_type: str) -> str:
+        """Uppercase and map known subtype variants (e.g. 'DFM17', 'DFM09')
+        back to their base family key ('DFM') used in DECODER_MAP — single
+        source of truth, used both here and by device_manager.py's own
+        decoder-path/cooldown lookup so the two never drift out of sync."""
+        normalized = sonde_type.upper() if sonde_type else 'RS41'
+        return cls.SONDE_TYPE_ALIASES.get(normalized, normalized)
 
     @classmethod
     def resolve_decoder_path(cls, decoder_binary: str) -> Optional[str]:
@@ -124,6 +188,7 @@ class RS1729Decoder:
             'IQ': False,
             'dc': False,
             'lpIQ': False,
+            'jsnsubfrm1': False,
         }
         
         try:
@@ -148,6 +213,7 @@ class RS1729Decoder:
             caps['IQ'] = '--IQ' in help_text
             caps['dc'] = '--dc' in help_text
             caps['lpIQ'] = '--lpIQ' in help_text
+            caps['jsnsubfrm1'] = '--jsnsubfrm1' in help_text
             
             cls._decoder_caps[decoder_path] = caps
             return caps
@@ -156,6 +222,58 @@ class RS1729Decoder:
             cls._decoder_caps[decoder_path] = caps
             return caps
     
+    @classmethod
+    def _probe_flags_accepted(cls, decoder_path: str, flags: list, timeout: float = 3.0) -> bool:
+        """
+        Empirically test whether a decoder binary ACCEPTS the given flags.
+
+        Why: rs1729 --help output under-reports supported flags on many
+        builds — field-verified on this very project: rs41mod ran fine with
+        --ptu2 while not listing it in --help (and m10mod/m20mod never list
+        --IQ/--json/--dc at all). Trusting --help therefore wrongly disables
+        features on working builds.
+
+        Method: spawn the decoder with the flags and /dev/null on stdin.
+        A build that accepts the flags reads stdin, hits immediate EOF and
+        exits quietly. A build that rejects them errors out mentioning the
+        option / printing usage before reading any input.
+        """
+        key = (decoder_path, tuple(flags))
+        if key in cls._flag_probe_cache:
+            return cls._flag_probe_cache[key]
+
+        accepted = False
+        try:
+            with open(os.devnull, 'rb') as devnull:
+                result = subprocess.run(
+                    [decoder_path] + list(flags),
+                    stdin=devnull,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout
+                )
+            output = (result.stdout + result.stderr).lower()
+            rejected = (
+                'unknown option' in output
+                or 'invalid option' in output
+                or 'unrecognized' in output
+                or 'not supported' in output
+                or 'usage:' in output
+                or ('error' in output and 'option' in output)
+            )
+            accepted = not rejected
+        except FileNotFoundError:
+            accepted = False
+        except subprocess.TimeoutExpired:
+            # Kept reading stdin past EOF or hung — treat as accepted:
+            # a flag-rejecting build errors out instantly, it never hangs.
+            accepted = True
+        except Exception:
+            accepted = False
+
+        cls._flag_probe_cache[key] = accepted
+        return accepted
+
     @classmethod
     def _detect_softin_support(cls, decoder_path: str) -> bool:
         """
@@ -170,17 +288,44 @@ class RS1729Decoder:
         caps = cls._detect_decoder_capabilities(decoder_path)
         return caps.get('softin', False)
     
-    def __init__(self, frequency: float, sonde_type: str = 'RS41', decoder_path: str = None):
+    def __init__(self, frequency: float, sonde_type: str = 'RS41', decoder_path: str = None,
+                 sample_rate: int = 48000, soft_decode: bool = False,
+                 allow_rate_change: bool = False, iq_dc_block: bool = False):
         """
         Initialize decoder
-        
+
         Args:
             frequency: Signal frequency in Hz
             sonde_type: Type of radiosonde (RS41, DFM, M10, etc.)
             decoder_path: Path to decoder executable (default: auto-detect based on sonde_type)
+            sample_rate: IQ input sample rate in Hz — must match the AudioPipeline
+                capturing at the same rate. Default 48000 works for RS41/DFM/RS92/iMet
+                (their baud rates are low enough for 5-6x oversampling at 48 kHz), but
+                M10/M20's ~9600 baud only gets 5.0 samples/symbol at 48 kHz, which
+                m20mod itself flags as marginal ("note: sample rate low (5.0 sps)") —
+                caller should pass a higher rate (e.g. 96000) for those types.
+            soft_decode: Prefer the fsk_demod soft-bit chain (auto_rx method) when
+                the sonde type is in SOFT_CHAIN_PARAMS, the decoder binary supports
+                --softin and --json, and fsk_demod is installed. Falls back to the
+                direct --IQ chain otherwise.
+            allow_rate_change: If True, the constructor may CHANGE self.sample_rate
+                to the soft chain's required rate (e.g. 50000 for DFM) — the caller
+                must then create its capture pipeline using self.sample_rate AFTER
+                construction (device_manager does this). If False (default), the
+                soft chain is only used when its required rate equals sample_rate,
+                so callers with a fixed-rate stream (Airspy, decoder_manager) are
+                never fed a rate mismatch.
+            iq_dc_block: If True, insert rs1729's iq_dec as an inline DC-removal
+                stage ahead of the decoder (auto_rx method). In the --IQ chain:
+                rtl_fm -M raw (cs16 IQ) → iq_dec → decoder --IQ. In the soft
+                chain it precedes fsk_demod: rtl_fm → iq_dec → fsk_demod →
+                decoder --softin. iq_dec strips the residual DC offset (the
+                RTL-SDR centre spike) that sits on the sonde's centre tone.
+                Silently skipped (no DC stage) when the iq_dec binary is absent.
         """
         self.frequency = frequency
-        self.sonde_type = sonde_type.upper() if sonde_type else 'RS41'
+        self.sonde_type = self.normalize_sonde_type(sonde_type)
+        self.sample_rate = sample_rate
         
         # Get decoder binary name for this sonde type
         decoder_binary = self.DECODER_MAP.get(self.sonde_type, 'rs41mod')
@@ -202,10 +347,80 @@ class RS1729Decoder:
             self.logger.info(f"Detected decoder capabilities: {caps_str}")
         
         if not self.has_softin and self.sonde_type in ['RS41', 'DFM']:
-            self.logger.warning(f"{self.DECODER_MAP.get(self.sonde_type)} does not support --softin flag. "
-                              f"Using IQ mode with text PTU fallback. "
-                              f"For full PTU support, install Auto_RX-compatible decoders from rs1729/RS.")
-        
+            # INFO, not WARNING: the --IQ chain is a fully-supported path and,
+            # since --sat was removed from the RS41 command, it emits complete
+            # PTU (temp/pressure, and humidity once the sonde's cal subframes
+            # are collected) DIRECTLY in the JSON — no "text fallback", no need
+            # to install different decoders. The soft chain (fsk_demod +
+            # --softin) is only a ~2 dB sensitivity upgrade, not a PTU
+            # requirement. This message previously scared users into thinking
+            # PTU was degraded on --IQ, which is no longer true.
+            self.logger.info(
+                f"{self.DECODER_MAP.get(self.sonde_type)} --help does not list "
+                f"--softin; using the --IQ decode chain (full JSON PTU supported). "
+                f"Install fsk_demod (scripts/install_softchain.sh) only if you want "
+                f"the extra ~2 dB soft-decision sensitivity."
+            )
+
+        # ------------------------------------------------------------------
+        # Decode-chain selection: 'softin' (rtl_fm → fsk_demod → decoder
+        # --softin, the auto_rx method) or 'iq' (direct --IQ, legacy path).
+        # The soft chain requires: type in SOFT_CHAIN_PARAMS, decoder binary
+        # with --softin AND --json (our frame parser needs JSON output), and
+        # an fsk_demod binary. JSON gating matters because with --softin the
+        # decoder's text output format differs from the --IQ text format the
+        # legacy parser knows.
+        # ------------------------------------------------------------------
+        self.decode_chain = 'iq'
+        self.fsk_process: Optional[subprocess.Popen] = None
+        self.fsk_demod_path = self.resolve_decoder_path('fsk_demod')
+
+        # Inline iq_dec DC-removal stage (auto_rx method) for the --IQ chain.
+        # Resolved eagerly so start() can decide without re-probing; only used
+        # when iq_dc_block is set AND the binary is present (graceful no-op).
+        self.iq_dc_block = bool(iq_dc_block)
+        self.iqdec_path = self.resolve_decoder_path('iq_dec')
+        self.iqdec_process: Optional[subprocess.Popen] = None
+        if soft_decode and self.sonde_type in self.SOFT_CHAIN_PARAMS:
+            params = self.SOFT_CHAIN_PARAMS[self.sonde_type]
+            # --help under-reports flags on many rs1729 builds (field-verified:
+            # rs41mod accepted --ptu2 while not listing it). When --help says
+            # no, verify empirically before giving up on the soft chain.
+            softin_ok = self.has_softin and self.decoder_caps.get('json', False)
+            if not softin_ok:
+                probe_flags = ['--softin', '--json']
+                if self.sonde_type == 'DFM':
+                    probe_flags.append('--auto')
+                softin_ok = self._probe_flags_accepted(self.decoder_path, probe_flags)
+                if softin_ok:
+                    self.logger.info(
+                        f"{os.path.basename(self.decoder_path)} accepts "
+                        f"{' '.join(probe_flags)} despite --help not listing them "
+                        f"(empirical probe) — soft chain enabled"
+                    )
+            if not softin_ok:
+                self.logger.info(
+                    f"Soft decode chain unavailable for {self.sonde_type}: decoder "
+                    f"rejects --softin/--json (verified by probe) — using --IQ chain"
+                )
+            elif not self.fsk_demod_path:
+                self.logger.info(
+                    "Soft decode chain unavailable: fsk_demod binary not found "
+                    "(expected in decoders/rs1729/ or PATH) — using --IQ chain"
+                )
+            elif params['sample_rate'] != self.sample_rate and not allow_rate_change:
+                self.logger.info(
+                    f"Soft decode chain for {self.sonde_type} needs {params['sample_rate']} Hz "
+                    f"input but stream is fixed at {self.sample_rate} Hz — using --IQ chain"
+                )
+            else:
+                self.decode_chain = 'softin'
+                self.sample_rate = params['sample_rate']
+                self.logger.info(
+                    f"Using fsk_demod soft-bit decode chain for {self.sonde_type} "
+                    f"({self.sample_rate} Hz / {params['baud']} baud)"
+                )
+
         self.process: Optional[subprocess.Popen] = None
         self.running = False
         self.frame_callback: Optional[Callable] = None
@@ -217,7 +432,9 @@ class RS1729Decoder:
         self.ptu_cache_timestamps = {}  # Track PTU data timestamps for freshness check
         self.startup_failure_count = 0  # Track immediate startup failures
         self.last_failure_time = None  # Track last failure for cooldown
+        self.last_ebno_db: Optional[float] = None  # From fsk_demod --stats (soft chain only)
         self._logged_ptu_degraded_mode = False  # One-time warning for PTU fallback mode
+        self._logged_ptu_source = False  # One-time INFO/WARN reporting where PTU comes from
     
     def set_frame_callback(self, callback: Callable[[dict], None]):
         """Set callback for decoded frames"""
@@ -225,18 +442,235 @@ class RS1729Decoder:
     
     def start(self, audio_stream) -> bool:
         """
-        Start decoder with IQ stream from stdin
-        
+        Start decoder with IQ stream from stdin.
+
+        Dispatches to the fsk_demod soft-bit chain (auto_rx method) when
+        selected in the constructor, with automatic fallback to the direct
+        --IQ chain if the soft chain fails to spawn.
+
         Args:
-            audio_stream: Audio stream file object (rtl_fm stdout)
-            
+            audio_stream: Audio stream file object (rtl_fm stdout / pipeline pipe)
+
         Returns:
             True if decoder started successfully
         """
         if not audio_stream:
             self.logger.error("No audio stream provided")
             return False
-        
+
+        if self.decode_chain == 'softin':
+            if self._start_softin_chain(audio_stream):
+                return True
+            # Fall back to direct --IQ decoding on the same live stream. The
+            # capture sample rate already matches (pipeline was created from
+            # self.sample_rate), so the --IQ decoder gets a consistent rate.
+            self.logger.warning(
+                "Soft decode chain failed to start — falling back to --IQ chain"
+            )
+            self._stop_fsk_process()
+            # If an iq_dec DC stage was started ahead of fsk_demod, stop it too
+            # so _start_iq_chain can spawn a fresh one on the same live stream.
+            self._stop_iqdec()
+            self.decode_chain = 'iq'
+
+        return self._start_iq_chain(audio_stream)
+
+    def _start_softin_chain(self, audio_stream) -> bool:
+        """
+        Spawn the auto_rx-style soft-decision pipeline:
+            audio_stream (cs16 IQ) → [iq_dec] → fsk_demod → decoder --softin
+
+        Same fsk_demod invocation as the field-tested KA9Q path
+        (ka9q_receiver.py) and radiosonde_auto_rx. When iq_dc_block is set, an
+        iq_dec DC-removal stage is inserted ahead of fsk_demod (harmless no-op
+        if the binary is absent) — this is the mode-4 combination the test
+        harness exercises (softin + iq_dec).
+        """
+        params = self.SOFT_CHAIN_PARAMS[self.sonde_type]
+
+        fsk_cmd = [
+            self.fsk_demod_path,
+            '--cs16',                          # complex signed 16-bit IQ input
+            '-b', str(params['freq_lower']),   # tone search lower bound (Hz)
+            '-u', str(params['freq_upper']),   # tone search upper bound (Hz)
+            '-s',                              # soft-decision output
+        ] + params['fsk_extra'] + [
+            '--stats=5',                       # JSON stats (EbNodB) every 5 s on stderr
+            '2',                               # 2FSK
+            str(self.sample_rate),
+            str(params['baud']),
+            '-', '-'                           # stdin → stdout
+        ]
+
+        cmd = [self.decoder_path]
+        if self.sonde_type == 'RS41':
+            # Matches the KA9Q path / auto_rx: soft bits are inverted → -i.
+            # JSON output carries PTU directly in this mode (no text fallback
+            # merging needed).
+            cmd.extend(['--softin', '-i', '--json', '--ptu2'])
+            # Optional enhancement flags: trust --help when it says yes,
+            # otherwise verify empirically (--help under-reports on many
+            # builds; --ecc in particular matters for weak-signal yield).
+            # CRITICAL: do NOT add --sat here. In rs41mod, JSON PTU is only
+            # emitted from the ec>=0 branch, where get_PTU() is guarded by
+            # `!sat` (rs41mod.c line ~2279). Passing --sat silently disables
+            # temp/humidity/pressure in the JSON. The JSON "sats" field comes
+            # from numSV in the GPS decode and does NOT need --sat.
+            for flag, cap_key in (('--jsnsubfrm1', 'jsnsubfrm1'),
+                                  ('--ecc', 'ecc')):
+                if self.decoder_caps.get(cap_key, False) or \
+                        self._probe_flags_accepted(self.decoder_path, [flag]):
+                    cmd.append(flag)
+        elif self.sonde_type == 'DFM':
+            # --auto handles DFM06/09/17 subtype + inversion detection.
+            cmd.extend(['--auto', '--softin', '--json'])
+            # --ecc: keep probe fallback (harmless, and it's in --help anyway).
+            if self.decoder_caps.get('ecc', False) or \
+                    self._probe_flags_accepted(self.decoder_path, ['--ecc']):
+                cmd.append('--ecc')
+            # --dist/--ptu/-ID: --help ONLY, NO probe — field dfm09mod builds
+            # reject them (exit 255) and the probe false-positives them, which
+            # killed every DFM decode from 2026-07-21 on. See the matching note
+            # in _start_iq_chain's DFM branch.
+            for flag, cap_key in (('--dist', 'dist'), ('--ptu', 'ptu'), ('-ID', 'ID')):
+                if self.decoder_caps.get(cap_key, False):
+                    cmd.append(flag)
+        else:
+            # Type not in SOFT_CHAIN_PARAMS — shouldn't happen (constructor
+            # gates decode_chain), but never crash into it.
+            return False
+
+        stdbuf = shutil.which('stdbuf')
+        if stdbuf:
+            cmd = [stdbuf, '-oL', '-eL'] + cmd
+
+        self.logger.info(f"Starting fsk_demod: {' '.join(fsk_cmd)}")
+        self.logger.info(f"Starting decoder (softin): {' '.join(cmd)}")
+
+        try:
+            # Optional iq_dec DC stage feeds fsk_demod; passthrough if disabled.
+            fsk_stdin = self._maybe_start_iqdec(audio_stream)
+            self.fsk_process = subprocess.Popen(
+                fsk_cmd,
+                stdin=fsk_stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0
+            )
+            self.process = subprocess.Popen(
+                cmd,
+                stdin=self.fsk_process.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                universal_newlines=False
+            )
+            # Close fsk_demod stdout in the parent so the decoder sees EOF
+            # when fsk_demod exits (same pattern as ka9q_receiver.py).
+            self.fsk_process.stdout.close()
+            # Likewise close iq_dec's stdout in the parent so fsk_demod sees EOF
+            # when iq_dec exits.
+            if self.iqdec_process is not None:
+                try:
+                    self.iqdec_process.stdout.close()
+                except Exception:
+                    pass
+        except FileNotFoundError as e:
+            self.logger.error(f"Soft chain binary not found: {e}")
+            self._stop_iqdec()
+            return False
+        except Exception as e:
+            self.logger.error(f"Failed to spawn soft decode chain: {e}")
+            self._stop_iqdec()
+            return False
+
+        ok = self._confirm_startup(cmd)
+        if not ok:
+            self._stop_iqdec()
+        return ok
+
+    def _stop_fsk_process(self):
+        """Terminate the fsk_demod process, if any."""
+        if self.fsk_process:
+            try:
+                self.fsk_process.terminate()
+                self.fsk_process.wait(timeout=2)
+            except Exception:
+                try:
+                    self.fsk_process.kill()
+                    self.fsk_process.wait(timeout=2)
+                except Exception:
+                    pass
+            self.fsk_process = None
+
+    def _maybe_start_iqdec(self, audio_stream):
+        """Optionally insert rs1729's iq_dec as an inline DC-removal stage ahead
+        of the --IQ decoder (auto_rx method):
+
+            rtl_fm -M raw (cs16 IQ) → iq_dec → decoder --IQ
+
+        iq_dec removes the residual DC offset in the 16-bit IQ (the RTL-SDR
+        centre spike) that otherwise lands right on the sonde's centre tone.
+        Returns the stream the decoder should read from: iq_dec's stdout when
+        the stage is active, otherwise the original audio_stream unchanged.
+
+        Command mirrors auto_rx's get_sdr_iq_cmd(dc_block=True):
+            iq_dec --bo 16 [--IFbw <rate_kHz>] - <sample_rate> 16
+        --IFbw is only added for wideband streams (>80 kHz), matching auto_rx —
+        our RS41/DFM rates (48/50 kHz) are narrowband so it is omitted.
+        """
+        if not self.iq_dc_block:
+            return audio_stream
+        if not self.iqdec_path:
+            self.logger.info(
+                "iq_dc_block enabled but iq_dec binary not found (expected in "
+                "decoders/rs1729/ or PATH) — using direct --IQ without DC removal"
+            )
+            return audio_stream
+
+        cmd = [self.iqdec_path, '--bo', '16']
+        if self.sample_rate > 80000:
+            cmd += ['--IFbw', str(self.sample_rate // 1000)]
+        cmd += ['-', str(self.sample_rate), '16']
+
+        self.logger.info(f"Starting iq_dec DC-removal stage: {' '.join(cmd)}")
+        try:
+            self.iqdec_process = subprocess.Popen(
+                cmd,
+                stdin=audio_stream,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,   # matches auto_rx '2>/dev/null'
+                bufsize=0,
+            )
+        except FileNotFoundError:
+            self.logger.warning(
+                f"iq_dec not spawnable at {self.iqdec_path} — using direct --IQ"
+            )
+            self.iqdec_process = None
+            return audio_stream
+        except Exception as e:
+            self.logger.warning(f"Failed to start iq_dec ({e}) — using direct --IQ")
+            self.iqdec_process = None
+            return audio_stream
+
+        return self.iqdec_process.stdout
+
+    def _stop_iqdec(self):
+        """Terminate the iq_dec DC-removal process, if any."""
+        if self.iqdec_process:
+            try:
+                self.iqdec_process.terminate()
+                self.iqdec_process.wait(timeout=2)
+            except Exception:
+                try:
+                    self.iqdec_process.kill()
+                    self.iqdec_process.wait(timeout=2)
+                except Exception:
+                    pass
+            self.iqdec_process = None
+
+    def _start_iq_chain(self, audio_stream) -> bool:
+        """Start the legacy direct --IQ decoder chain (decoder reads raw IQ)."""
         try:
             # Build decoder command based on sonde type
             # Different decoders have different command-line options
@@ -247,73 +681,105 @@ class RS1729Decoder:
             if self.sonde_type == 'RS41':
                 # RS41: rs41mod with --json and --ptu2 for full telemetry including PTU
                 # -vv: VERY verbose (needed to get PTU in text when using --json)
-                # --ptu2: PTU sensor data, --sat: satellite count
+                # --ptu2: PTU sensor data (temp/humidity/pressure)
                 # --json: JSON output with position/velocity
-                # PTU data appears in verbose text lines, not in JSON (with --IQ mode)
-                cmd.extend(['-vv', '--ptu2', '--sat', '--json', '--IQ', '0.0', '-', '48000', '16'])
-                # CRITICAL: unlike the DFM branch below, --ptu2 was previously added
-                # unconditionally without checking whether the installed rs41mod
-                # build actually recognizes it (install.sh clones rs1729/RS unpinned,
-                # so this varies per install — same root cause class as the
-                # dft_detect CLI-format mismatch). If unsupported, PTU silently never
-                # appears (JSON or text) with no diagnostic trail. Log it explicitly.
-                if not self.decoder_caps.get('ptu2', False):
+                # CRITICAL: --sat REMOVED. In rs41mod the JSON PTU block calls
+                # get_PTU() only under `!sat` (rs41mod.c ~2279), so --sat
+                # silently disabled temp/humidity/pressure in JSON — the exact
+                # cause of "no PTU" in the field logs. The JSON "sats" field is
+                # numSV from the GPS decode and does NOT depend on --sat.
+                cmd.extend(['-vv', '--ptu2', '--json'])
+                # Error correction (Reed-Solomon): recovers weak-but-repairable
+                # frames AND rejects corrupted ones. Field evidence for the
+                # latter: a desk RS41 without GPS lock produced random Atlantic
+                # coordinates jumping 400 km/frame — CRC-failed GPS data passed
+                # straight through because --ecc was never added (--help
+                # under-reports it). Probe empirically: prefer --ecc2
+                # (stronger), fall back to --ecc.
+                if self._probe_flags_accepted(self.decoder_path, ['--ecc2']):
+                    cmd.append('--ecc2')
+                elif self.decoder_caps.get('ecc', False) or \
+                        self._probe_flags_accepted(self.decoder_path, ['--ecc']):
+                    cmd.append('--ecc')
+                else:
                     self.logger.warning(
-                        "rs41mod does not report --ptu2 support via --help — PTU "
-                        "(temp/humidity/pressure) will likely be unavailable for "
-                        "this decoder. Set OPENWX_JSON_PTU_DEBUG=1 to see raw JSON "
-                        "keys per frame for diagnosis."
+                        "rs41mod accepts neither --ecc2 nor --ecc — corrupted "
+                        "frames will pass through undetected and weak frames "
+                        "won't be recovered. Update decoders/rs1729 binaries."
+                    )
+                cmd.extend(['--IQ', '0.0', '-', str(self.sample_rate), '16'])
+                # Only warn if --ptu2 is GENUINELY unsupported — verified by an
+                # empirical probe, not by --help (which under-reports: rs41mod
+                # runs --ptu2 fine on builds whose --help never lists it, so the
+                # old "not in --help → warn" check cried wolf on every normal
+                # install). We still pass --ptu2 above unconditionally; this is
+                # purely a diagnostic for the rare truly-old binary.
+                if not self.decoder_caps.get('ptu2', False) and \
+                        not self._probe_flags_accepted(self.decoder_path, ['--ptu2']):
+                    self.logger.warning(
+                        "rs41mod rejects --ptu2 (verified by probe) — PTU "
+                        "(temp/humidity/pressure) will be unavailable. Update the "
+                        "decoders/rs1729 binaries (scripts/install_softchain.sh)."
                     )
             elif self.sonde_type == 'DFM':
                 # DFM: dfm09mod with IQ input mode
-                # --auto: Automatic DFM subtype detection (DFM06/DFM09/DFM17) - CRITICAL for correct detection
-                # Without --auto, dfm09mod may not lock on DFM06/DFM17 variants
+                # --auto: Automatic DFM subtype detection (DFM06/DFM09/DFM17) -
+                # CRITICAL for correct detection. --auto and --IQ work on all
+                # field builds even though dfm09mod --help under-reports them.
                 cmd.extend(['--auto', '-vv', '--IQ', '0.0'])
-                
-                # Add optional enhancement flags if supported
-                if self.decoder_caps.get('ecc', False):
-                    cmd.append('--ecc')
-                if self.decoder_caps.get('json', False):
-                    cmd.append('--json')
-                if self.decoder_caps.get('dist', False):
-                    cmd.append('--dist')
-                if self.decoder_caps.get('ptu', False):
-                    cmd.append('--ptu')
-                
-                # Add -ID flag only if explicitly supported
-                if self.decoder_caps.get('ID', False):
-                    cmd.append('-ID')
-                else:
-                    self.logger.info("DFM decoder does not support -ID flag, serial may be masked")
-                
+
+                # --ecc/--json ARE listed by --help on the field builds; keep the
+                # probe fallback for the rare under-reporting binary.
+                for flag, cap_key in (('--ecc', 'ecc'), ('--json', 'json')):
+                    if self.decoder_caps.get(cap_key, False) or \
+                            self._probe_flags_accepted(self.decoder_path, [flag]):
+                        cmd.append(flag)
+
+                # CRITICAL: --dist/--ptu/-ID are gated on --help (decoder_caps)
+                # ONLY — NO empirical probe. Field dfm09mod builds REJECT these
+                # (exit 255 → DFM decode completely dead, observed 2026-07-21
+                # onward), yet _probe_flags_accepted false-positived them: the
+                # binary neither prints "usage"/"unknown option" for them nor
+                # exits cleanly, so the probe wrongly judged them accepted and
+                # every DFM decode died at startup. The known-good command on
+                # 2026-07-17 was exactly '--auto -vv --IQ 0.0 --ecc --json'.
+                # Only add these when the binary explicitly documents them.
+                for flag, cap_key in (('--dist', 'dist'), ('--ptu', 'ptu'), ('-ID', 'ID')):
+                    if self.decoder_caps.get(cap_key, False):
+                        cmd.append(flag)
+                if not self.decoder_caps.get('ID', False):
+                    self.logger.info("dfm09mod --help lacks -ID; serial may be masked "
+                                     "(not probed — probing it breaks this build)")
+
                 # Add verbosity and input parameters
-                cmd.extend(['-', '48000', '16'])
+                cmd.extend(['-', str(self.sample_rate), '16'])
             elif self.sonde_type in ('M10', 'M20'):
-                # M10/M20: m10mod/m20mod with optional enhancement flags.
-                # NOTE: --dc, --ptu, --json, --lpIQ are only added when the probed
-                # binary actually supports them (see EMERGENCY_FIX_v1.0.46a: older
-                # decoder builds crash immediately on an unrecognized flag, producing
-                # zero frames). Baseline '-v --IQ 0.0 - 48000 16' always works.
-                cmd.append('-v')
-                if self.decoder_caps.get('dc', False):
-                    cmd.append('--dc')  # DC offset removal (helps with subcarrier)
-                if self.decoder_caps.get('ptu', False):
-                    cmd.append('--ptu')  # PTU sensor output
-                if self.decoder_caps.get('json', False):
-                    cmd.append('--json')  # JSON structured output
-                cmd.extend(['--IQ', '0.0'])
-                if self.decoder_caps.get('lpIQ', False):
-                    cmd.append('--lpIQ')  # Low-pass filter to reduce high-frequency noise
-                cmd.extend(['-', '48000', '16'])
+                # M10/M20: m10mod/m20mod.
+                # CRITICAL: --dc/--ptu/--json/--IQ/--lpIQ are all undocumented on
+                # this decoder family — `m10mod --help` only ever lists
+                # `-r, --raw` / `-c, --color`, the same way `--IQ` itself never
+                # shows up there either despite being required and working.
+                # The old capability probe (decoder_caps.get('dc'/'ptu'/'json'/
+                # 'lpIQ', False)) therefore NEVER found these flags "supported"
+                # and silently dropped all of them on every install, leaving
+                # only the bare '-v --IQ 0.0 - <rate> 16' — this is very likely
+                # why M20 produced zero frames in the field despite a strong,
+                # confirmed-genuine signal. Field-proven fix (multiple gateway
+                # operators, incl. several French M10/M20 stations): always
+                # pass these flags unconditionally, matching rs41mod/dfm09mod
+                # which DO document their extra flags via --help and keep
+                # capability gating.
+                cmd.extend(['-v', '--dc', '--ptu', '--json', '--IQ', '0.0', '--lpIQ',
+                            '-', str(self.sample_rate), '16'])
             elif self.sonde_type == 'RS92':
                 # RS92: rs92mod -v --IQ 0.0 - 48000 16
-                cmd.extend(['-v', '--IQ', '0.0', '-', '48000', '16'])
+                cmd.extend(['-v', '--IQ', '0.0', '-', str(self.sample_rate), '16'])
             elif self.sonde_type == 'iMet':
                 # iMet: imet54mod -v --IQ 0.0 - 48000 16
-                cmd.extend(['-v', '--IQ', '0.0', '-', '48000', '16'])
+                cmd.extend(['-v', '--IQ', '0.0', '-', str(self.sample_rate), '16'])
             else:
-                # Default: assume RS41-like syntax
-                cmd.extend(['-vv', '--ptu2', '--sat', '--json', '--IQ', '0.0', '-', '48000', '16'])
+                # Default: assume RS41-like syntax (no --sat — it disables JSON PTU)
+                cmd.extend(['-vv', '--ptu2', '--json', '--IQ', '0.0', '-', str(self.sample_rate), '16'])
             
             # Wrap with stdbuf (if available) to force line-buffered stdout AND stderr
             # on the child process.  Without this, libc switches to block-buffering
@@ -326,87 +792,163 @@ class RS1729Decoder:
 
             self.logger.info(f"Starting decoder: {' '.join(cmd)}")
 
-            # Start decoder with stdin piped from rtl_fm / Airspy channelizer
+            # Optionally route rtl_fm's raw cs16 IQ through iq_dec first for
+            # auto_rx-style inline DC removal. Returns audio_stream untouched
+            # when the stage is disabled/unavailable, so the direct-pipe
+            # topology is preserved by default.
+            decoder_stdin = self._maybe_start_iqdec(audio_stream)
+
+            # Start decoder with stdin piped from rtl_fm / iq_dec / Airspy channelizer
             # bufsize=0 (unbuffered binary) is critical: the decoder reads raw int16 IQ
             # bytes; universal_newlines must be False to keep stdin in binary mode.
             self.process = subprocess.Popen(
                 cmd,
-                stdin=audio_stream,
+                stdin=decoder_stdin,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
                 universal_newlines=False
             )
-            
-            # Wait briefly to check startup
-            time.sleep(0.5)
-            if self.process.poll() is not None:
-                exit_code = self.process.poll()
-                self.startup_failure_count += 1
-                self.last_failure_time = time.time()
-                self.logger.error(f"Decoder exited immediately with code {exit_code} (failure #{self.startup_failure_count})")
-                
-                # Log command for debugging startup failures
-                self.logger.error(f"Failed command: {' '.join(cmd)}")
-                
-                # Track failure for cooldown
-                failure_key = (self.decoder_path, self.sonde_type)
-                if failure_key not in self._decoder_failures:
-                    self._decoder_failures[failure_key] = []
-                self._decoder_failures[failure_key].append(time.time())
-                
-                return False
-            
-            self.running = True
-            self._start_time = time.time()
-            
-            # Start threads to monitor stdout and stderr
-            self.stdout_thread = threading.Thread(
-                target=self._monitor_stdout,
-                daemon=True
-            )
-            self.stderr_thread = threading.Thread(
-                target=self._monitor_stderr,
-                daemon=True
-            )
-            
-            self.stdout_thread.start()
-            self.stderr_thread.start()
-            
-            self.logger.info(f"Decoder started - processing {self.frequency/1e6:.4f} MHz")
-            
-            # Monitor for early crashes
-            time.sleep(2.0)
-            if self.process.poll() is not None:
-                exit_code = self.process.poll()
-                self.startup_failure_count += 1
-                self.last_failure_time = time.time()
-                self.logger.error(f"Decoder crashed early with exit code {exit_code} (failure #{self.startup_failure_count})")
-                self.running = False
-                
-                # Track failure for cooldown
-                failure_key = (self.decoder_path, self.sonde_type)
-                if failure_key not in self._decoder_failures:
-                    self._decoder_failures[failure_key] = []
-                self._decoder_failures[failure_key].append(time.time())
-                
-                return False
-            
-            self.logger.info(f"Decoder healthy after 2s startup, PID={self.process.pid}")
-            
-            return True
-            
+
+            # If iq_dec is in the chain, close its stdout in the parent so the
+            # decoder sees EOF when iq_dec exits (same pattern as fsk_demod).
+            if self.iqdec_process is not None:
+                try:
+                    self.iqdec_process.stdout.close()
+                except Exception:
+                    pass
+
+            ok = self._confirm_startup(cmd)
+            if not ok:
+                # Tear down the iq_dec stage on decoder startup failure so it
+                # doesn't linger holding the pipe / CPU.
+                self._stop_iqdec()
+            return ok
+
         except FileNotFoundError:
             self.logger.error(f"Decoder not found: {self.decoder_path}. Install rs1729 decoder tools.")
+            self._stop_iqdec()
             return False
         except Exception as e:
             self.logger.error(f"Failed to start decoder: {e}")
+            self._stop_iqdec()
             return False
+
+    def _record_startup_failure(self, exit_code: int, cmd: list, phase: str):
+        """Common bookkeeping for a decoder that died during startup."""
+        self.startup_failure_count += 1
+        self.last_failure_time = time.time()
+        self.logger.error(
+            f"Decoder {phase} with code {exit_code} (failure #{self.startup_failure_count})"
+        )
+        self.logger.error(f"Failed command: {' '.join(cmd)}")
+
+        # If the soft chain was involved, surface fsk_demod's stderr — the
+        # decoder often dies with a generic code when fsk_demod is the real
+        # culprit (bad args, unsupported build).
+        if self.fsk_process:
+            fsk_exit = self.fsk_process.poll()
+            if fsk_exit is not None:
+                try:
+                    fsk_err = self.fsk_process.stderr.read(500).decode('utf-8', errors='replace')
+                except Exception:
+                    fsk_err = ''
+                self.logger.error(
+                    f"fsk_demod also exited (code {fsk_exit}): {fsk_err.strip()[:300]}"
+                )
+
+        # Track failure for cooldown
+        failure_key = (self.decoder_path, self.sonde_type)
+        if failure_key not in self._decoder_failures:
+            self._decoder_failures[failure_key] = []
+        self._decoder_failures[failure_key].append(time.time())
+
+    def _confirm_startup(self, cmd: list) -> bool:
+        """Shared post-spawn health checks + monitor-thread startup for both
+        decode chains. Returns True when the decoder survives 2.5 s."""
+        # Wait briefly to check startup
+        time.sleep(0.5)
+        if self.process.poll() is not None:
+            self._record_startup_failure(self.process.poll(), cmd, 'exited immediately')
+            return False
+
+        self.running = True
+        self._start_time = time.time()
+
+        # Start threads to monitor stdout and stderr
+        self.stdout_thread = threading.Thread(
+            target=self._monitor_stdout,
+            daemon=True
+        )
+        self.stderr_thread = threading.Thread(
+            target=self._monitor_stderr,
+            daemon=True
+        )
+
+        self.stdout_thread.start()
+        self.stderr_thread.start()
+
+        if self.fsk_process is not None:
+            self.fsk_stderr_thread = threading.Thread(
+                target=self._monitor_fsk_stderr,
+                daemon=True
+            )
+            self.fsk_stderr_thread.start()
+
+        self.logger.info(f"Decoder started - processing {self.frequency/1e6:.4f} MHz")
+
+        # Monitor for early crashes
+        time.sleep(2.0)
+        if self.process.poll() is not None:
+            self.running = False
+            self._record_startup_failure(self.process.poll(), cmd, 'crashed early')
+            return False
+
+        self.logger.info(f"Decoder healthy after 2s startup, PID={self.process.pid}")
+
+        return True
+
+    def _monitor_fsk_stderr(self):
+        """Monitor fsk_demod stderr: log startup lines, extract EbNodB from
+        the periodic --stats JSON for signal-quality tracking."""
+        if not self.fsk_process or not self.fsk_process.stderr:
+            return
+        line_count = 0
+        try:
+            for raw_line in self.fsk_process.stderr:
+                if not self.running:
+                    break
+                line = raw_line.decode('utf-8', errors='replace').strip() if isinstance(raw_line, bytes) else raw_line.strip()
+                if not line:
+                    continue
+                line_count += 1
+                if line.startswith('{'):
+                    # Periodic stats JSON: {"secs":..,"EbNodB": 12.3,"ppm":..}
+                    try:
+                        stats = json.loads(line)
+                        ebno = stats.get('EbNodB')
+                        if ebno is not None:
+                            self.last_ebno_db = float(ebno)
+                            self.logger.debug(f"fsk_demod EbNodB={ebno}, ppm={stats.get('ppm')}")
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        pass
+                elif line_count <= 5:
+                    self.logger.info(f"fsk_demod stderr [{line_count}]: {line}")
+                else:
+                    self.logger.debug(f"fsk_demod stderr: {line}")
+        except Exception as e:
+            if self.running:
+                self.logger.debug(f"fsk_demod stderr monitor stopped: {e}")
     
     def stop(self):
-        """Stop decoder process"""
+        """Stop decoder (and fsk_demod, if the soft chain is active)"""
         self.running = False
-        
+
+        # Stop upstream stages (fsk_demod / iq_dec) first so the decoder sees
+        # EOF on stdin and can flush/exit cleanly before being terminated.
+        self._stop_fsk_process()
+        self._stop_iqdec()
+
         if self.process:
             try:
                 self.process.terminate()
@@ -414,7 +956,7 @@ class RS1729Decoder:
             except:
                 self.process.kill()
             self.process = None
-        
+
         self.logger.info("Decoder stopped")
     
     def is_alive(self) -> bool:
@@ -451,7 +993,9 @@ class RS1729Decoder:
             'last_frame': self.last_frame_time.isoformat() if self.last_frame_time else None,
             'running': self.running and self.is_alive(),
             'startup_failures': self.startup_failure_count,
-            'last_failure': self.last_failure_time
+            'last_failure': self.last_failure_time,
+            'decode_chain': self.decode_chain,
+            'ebno_db': self.last_ebno_db
         }
     
     @classmethod
@@ -595,8 +1139,11 @@ class RS1729Decoder:
         m = re.search(r'T=([+-]?\d+(?:\.\d+)?)', line)
         if m:
             ptu['temp'] = float(m.group(1))
-        # Match RH=5.8% or RH=5.8
-        m = re.search(r'RH=(\d+(?:\.\d+)?)', line)
+        # Match humidity. CRITICAL: in --ptu2 mode rs41mod prints "RH2=5.8%"
+        # (the improved humidity) and SUPPRESSES the plain "_RH=" line, so a
+        # regex for "RH=" alone never matches and humidity is lost. Accept
+        # _RH=, RH=, and RH2= (prefer whichever is present).
+        m = re.search(r'(?:_?RH2?)=(\d+(?:\.\d+)?)', line)
         if m:
             ptu['humidity'] = float(m.group(1))
         # Match P=24.38hPa or P=24.38
@@ -654,6 +1201,21 @@ class RS1729Decoder:
             if sonde_type == 'DFM' and sonde_id.startswith('D') and sonde_id[1:].isdigit():
                 sonde_id = sonde_id[1:]
 
+            # CRITICAL: a newly-detected DFM reports an all-'x' placeholder
+            # serial ("xxxxxxxx") for the first several frames — the real
+            # serial is spread across multiple sub-frames and isn't fully
+            # decoded yet. Forwarding this as telemetry creates a phantom
+            # "xxxxxxxx" entry in the Active Radiosondes panel that only
+            # gets replaced once the real serial resolves. Log it (position/
+            # altitude may already be valid) but don't emit it as telemetry.
+            if sonde_type == 'DFM' and re.fullmatch(r'[xX]+', sonde_id):
+                self.logger.info(
+                    f"DFM frame #{frame_num}: serial not yet decoded (placeholder "
+                    f"'{sonde_id}'), lat={json_data.get('lat')} lon={json_data.get('lon')} "
+                    f"alt={json_data.get('alt')} — not submitting as telemetry until ID resolves"
+                )
+                return None
+
             decoded_datetime = None
             dt_raw = json_data.get('datetime')
             if dt_raw:
@@ -688,7 +1250,7 @@ class RS1729Decoder:
 
             # Optional fields – only include when present in this JSON frame
             # Parse DFM subtype format: "0xC:DFM17" → subtype="DFM17", dfmcode="0xC"
-            dfm_subtype_parsed = False
+            subtype_handled = False
             if self.sonde_type == 'DFM' and json_data.get('subtype'):
                 raw_subtype = str(json_data.get('subtype'))
                 if ':' in raw_subtype:
@@ -696,11 +1258,21 @@ class RS1729Decoder:
                     parts = raw_subtype.split(':', 1)
                     frame['dfmcode'] = parts[0]  # "0xC"
                     frame['subtype'] = parts[1]  # "DFM17"
-                    dfm_subtype_parsed = True
+                    subtype_handled = True
                 else:
                     frame['subtype'] = raw_subtype
-                    dfm_subtype_parsed = True
-            
+                    subtype_handled = True
+            elif self.sonde_type in ('M10', 'M20') and json_data.get('subtype'):
+                # Unlike DFM's "0xC:DFM17", m10mod/m20mod report only the bare
+                # hex code (e.g. "0x20") with no friendly name attached —
+                # translate known codes so the web UI shows "M20" the same
+                # way it shows "DFM17", instead of a bare hex code.
+                raw_subtype = str(json_data.get('subtype'))
+                translated = self.M_SERIES_TYPE_CODES.get(raw_subtype)
+                if translated:
+                    frame['subtype'] = translated
+                subtype_handled = True
+
             for src, dst, cast in [
                 ('vel_h', 'velocity_horizontal', float),
                 ('vel_v', 'velocity_vertical', float),
@@ -715,10 +1287,14 @@ class RS1729Decoder:
                 ('ref_datetime', 'ref_datetime', str),
                 ('ref_position', 'ref_position', str),
             ]:
-                # Skip subtype if already parsed for DFM
-                if dst == 'subtype' and dfm_subtype_parsed:
+                if dst == 'subtype' and subtype_handled:
                     continue
                 value = json_data.get(src)
+                # Defensive catch-all: never surface a raw hex placeholder
+                # code as if it were a human-readable subtype, regardless of
+                # sonde type.
+                if dst == 'subtype' and isinstance(value, str) and value.startswith('0x'):
+                    continue
                 if value is not None:
                     try:
                         frame[dst] = cast(value)
@@ -747,65 +1323,83 @@ class RS1729Decoder:
                     except (TypeError, ValueError):
                         pass
 
-            # Track PTU source for quality analysis
-            ptu_source = 'none'
-            has_json_ptu = all(frame.get(k) for k in ('temp', 'humidity', 'pressure'))
-            
-            if has_json_ptu:
-                ptu_source = 'json'
-            else:
-                # Serial-aware PTU fallback: match by (serial, frame) proximity with freshness check
+            # -------------------------------------------------------------
+            # PTU: JSON is authoritative and accurate. rs41mod (--ptu2 --json,
+            # no --sat) prints each PTU field in JSON ONLY when it's valid
+            # (temp > -273, humidity >= 0, pressure > 0), so a field being
+            # absent means "not available this frame" — NOT an error. Common
+            # cases: non-SGP sondes have no pressure sensor; humidity can lag
+            # until RH cal completes. The old logic required ALL THREE to be
+            # truthy (and 0.0 counted as missing), so it discarded perfectly
+            # good JSON temp/humidity and fell back to the less accurate text
+            # path on essentially every frame. Now: keep every JSON field the
+            # decoder gave us, and fill ONLY genuinely-missing fields from the
+            # recent text-PTU cache. is-not-None everywhere so 0°C / 0% are kept.
+            # -------------------------------------------------------------
+            json_fields = [k for k in ('temp', 'humidity', 'pressure') if frame.get(k) is not None]
+            missing = [k for k in ('temp', 'humidity', 'pressure') if frame.get(k) is None]
+            filled_from_text = []
+
+            if missing:
+                # Serial-aware fallback: nearest fresh same-serial cached text PTU
                 current_frame = frame['frame_number']
                 current_serial = frame['sonde_id']
                 best_match = None
                 best_distance = 999999
                 now = time.time()
-                freshness_window = 5.0  # 5 second expiry for stale data
-                
+                freshness_window = 5.0  # seconds
+
                 for (cached_serial, cached_frame), timestamp in self.ptu_cache_timestamps.items():
-                    # Only match same serial to prevent cross-contamination
                     if cached_serial != current_serial:
                         continue
-                    
-                    # Check freshness (within 5 seconds)
-                    age = now - timestamp
-                    if age > freshness_window:
+                    if now - timestamp > freshness_window:
                         continue
-                    
-                    # Look for recent PTU data within +/- 3 frames
                     frame_distance = abs(cached_frame - current_frame)
                     if frame_distance <= 3 and frame_distance < best_distance:
                         best_match = (cached_serial, cached_frame)
                         best_distance = frame_distance
-                
+
                 if best_match is not None:
                     cached = self.ptu_cache[best_match]
-                    frame.setdefault('temp', cached.get('temp'))
-                    frame.setdefault('humidity', cached.get('humidity'))
-                    frame.setdefault('pressure', cached.get('pressure'))
-                    
-                    # Update source if any PTU data was merged
-                    if any(frame.get(k) for k in ('temp', 'humidity', 'pressure')):
-                        ptu_source = 'text_fallback'
-                        
-                        # Log PTU degraded mode warning once per decoder session
-                        if not self._logged_ptu_degraded_mode:
-                            self.logger.warning(
-                                f"PTU degraded mode: {self.sonde_type} decoder lacks --softin support or "
-                                f"JSON PTU fields. Using text fallback (frame proximity + freshness check). "
-                                f"For better PTU reliability, install Auto_RX-compatible rs1729 decoders."
-                            )
-                            self._logged_ptu_degraded_mode = True
-                    
-                    if self.debug_json_ptu:
-                        self.logger.info(
-                            f"[PTU Merged] {current_serial} frame {current_frame} matched with text frame "
-                            f"{best_match[1]} (distance={best_distance}): T={frame.get('temp')}°C "
-                            f"RH={frame.get('humidity')}% P={frame.get('pressure')}hPa"
-                        )
-            
+                    for k in missing:
+                        v = cached.get(k)
+                        if v is not None:
+                            frame[k] = v
+                            filled_from_text.append(k)
+
+            if json_fields:
+                ptu_source = 'json' if not filled_from_text else 'json+text'
+            elif filled_from_text:
+                ptu_source = 'text_fallback'
+            else:
+                ptu_source = 'none'
+
+            # One-time visibility on where PTU is actually coming from. INFO when
+            # JSON is supplying PTU (the good case); WARN only if the decoder
+            # emitted NO PTU in JSON at all (points to a flag/build problem).
+            if not self._logged_ptu_source and ptu_source != 'none':
+                self._logged_ptu_source = True
+                if json_fields:
+                    extra = f" (+text for {filled_from_text})" if filled_from_text else ""
+                    self.logger.info(
+                        f"PTU source for {self.sonde_type}: JSON {json_fields}{extra} — "
+                        f"accurate JSON telemetry in use."
+                    )
+                else:
+                    self.logger.warning(
+                        f"PTU from TEXT fallback only ({filled_from_text}) — JSON carried no "
+                        f"temp/humidity/pressure. Verify decoder flags: '--ptu2 --json' present "
+                        f"and '--sat' absent (--sat disables JSON PTU)."
+                    )
+
             # Add PTU source tag to frame for quality tracking
             frame['ptu_source'] = ptu_source
+
+            if self.debug_json_ptu:
+                self.logger.info(
+                    f"[PTU] {frame['sonde_id']} frame {frame['frame_number']} source={ptu_source} "
+                    f"T={frame.get('temp')} RH={frame.get('humidity')} P={frame.get('pressure')}"
+                )
 
             if self.debug_json_ptu:
                 ptu_keys = {k: json_data.get(k) for k in ('temp', 'tempc', 'temperature', 'T', 'humidity', 'humidityrh', 'rh', 'RH', 'pressure', 'pressurehpa', 'pres', 'P') if k in json_data}
@@ -819,7 +1413,7 @@ class RS1729Decoder:
             self.logger.error(f"Error parsing JSON frame: {e}")
             return None
 
-    def _parse_frame(self, line: str) -> Optional[dict]:
+    def _parse_frame(self, line: str) -> Optional[dict]:  # noqa: legacy helper
         """Legacy text-frame parser retained as fallback/debug helper."""
         try:
             frame = {}

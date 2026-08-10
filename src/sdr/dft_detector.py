@@ -87,6 +87,19 @@ class DftDetector:
         'M20': 0.75,
         'iMet': 0.65  # Estimated threshold for iMet
     }
+
+    # radiosonde_auto_rx uses a narrower IF/capture bandwidth for narrowband
+    # sonde types during the detect step specifically to raise correlation
+    # SNR (less noise power let through) — and a wider one for types whose
+    # signal itself is wider (M10/M20/iMet, ~9-22 kHz). We only support the
+    # 400-406 MHz band (no 1680 MHz RS92-NGP/LMS6 support), so this picks
+    # between two rates using the coarse 3dB bandwidth already measured by
+    # the spectrum scan, rather than blindly reusing auto_rx's own numbers
+    # (which are tuned for its fsk_demod-based capture chain) — narrowing
+    # blindly risks clipping a genuinely wideband candidate.
+    NARROWBAND_SAMPLE_RATE_HZ = 24_000
+    WIDEBAND_SAMPLE_RATE_HZ = 48_000
+    WIDEBAND_BANDWIDTH_THRESHOLD_HZ = 16_000
     
     def __init__(self, dft_detect_path: str = 'dft_detect', sample_duration: float = 5.0):
         """
@@ -135,26 +148,30 @@ class DftDetector:
             return False
     
     def detect_sonde_type(
-        self, 
-        frequency: float, 
+        self,
+        frequency: float,
         device_serial: str = "0",
-        sample_rate: int = 48000,
+        sample_rate: Optional[int] = None,
         bandwidth: Optional[float] = None
     ) -> Optional[Tuple[str, float]]:
         """
         Detect sonde type using correlation analysis.
-        
+
         Process:
         1. Capture short burst of IQ samples at detected frequency
         2. Run dft_detect to correlate against known sonde signatures
         3. Return sonde type with highest correlation above threshold
-        
+
         Args:
             frequency: Center frequency in Hz
             device_serial: RTL-SDR device serial number or index
-            sample_rate: Sample rate in Hz (default: 48000)
-            bandwidth: Optional bandwidth hint in Hz (for fallback)
-            
+            sample_rate: Sample rate in Hz. If None (default), auto-selected
+                from `bandwidth` — narrower for narrowband candidates to raise
+                correlation SNR, wider for candidates that are already wide.
+            bandwidth: Optional bandwidth hint in Hz — used both for the
+                bandwidth-based fallback AND to auto-select the IF capture
+                rate above.
+
         Returns:
             Tuple of (sonde_type, frequency_offset_hz) or None if no match
             Example: ('RS41', -125.0) means RS41 detected 125 Hz below center
@@ -162,9 +179,22 @@ class DftDetector:
         if not self.available:
             self.logger.debug("dft_detect not available, skipping correlation detection")
             return None
-        
+
+        if sample_rate is None:
+            # ALWAYS capture wide (48 kHz). The narrowband auto-selection was
+            # driven by the scan's 3 dB-bandwidth estimate, which badly
+            # underestimates M10/M20 (two-humped spectrum → the 3 dB walker
+            # stops at the first hump: field log showed "BW 2.3 kHz" for a
+            # genuine M20 that was actually ~12 kHz wide and 4 kHz off-center).
+            # The resulting 24 kHz capture clipped the signal and dft_detect
+            # failed 6 consecutive times (~25 s wasted per attempt) before one
+            # lucky identification. The theoretical SNR benefit of narrowing
+            # never materialized in the field; wide capture identifies on the
+            # first attempt.
+            sample_rate = self.WIDEBAND_SAMPLE_RATE_HZ
+
         self.logger.info(f"Running correlation analysis at {frequency/1e6:.4f} MHz")
-        
+
         # Capture FM-demodulated audio (rtl_fm -M fm output is the correct input for dft_detect)
         iq_file = self._capture_fm_audio(frequency, device_serial, sample_rate)
         if not iq_file:
@@ -347,6 +377,23 @@ class DftDetector:
             '16',
         ]
 
+    def _build_dft_cmd_advanced(self, iq_file: str, sample_rate: int) -> list:
+        """Third observed build convention: --iq is a bare flag (no numeric
+        offset argument) — dft_detect --dc --iq - <rate> 16 <iq_file>.
+        Passing "0.0" right after --iq on this build makes dft_detect treat
+        "0.0" as its input-file positional argument instead, which fails with
+        "error: open 0.0" — exactly what was observed in the field. The file
+        is passed as the last positional argument, not via stdin."""
+        return [
+            self.dft_detect_path,
+            '--dc',
+            '--iq',
+            '-',
+            str(sample_rate),
+            '16',
+            iq_file,
+        ]
+
     def _run_dft_detect_once(self, iq_file: str, sample_rate: int, fmt: str):
         """Run a single dft_detect attempt with the given CLI convention.
         Returns (raw_output, results_dict). A non-empty results_dict is the
@@ -356,6 +403,9 @@ class DftDetector:
         if fmt == 'modern':
             cmd = self._build_dft_cmd_modern(sample_rate)
             stdin_file = open(iq_file, 'rb')
+        elif fmt == 'advanced':
+            cmd = self._build_dft_cmd_advanced(iq_file, sample_rate)
+            stdin_file = None
         else:
             cmd = self._build_dft_cmd_legacy(iq_file, sample_rate)
             stdin_file = None
@@ -403,7 +453,7 @@ class DftDetector:
         """
         formats_to_try = (
             [self._working_format] if self._working_format
-            else ['legacy', 'modern']
+            else ['legacy', 'modern', 'advanced']
         )
 
         try:
@@ -423,6 +473,23 @@ class DftDetector:
             self.logger.info(f"Correlation output: {output}")
             if results:
                 self.logger.info(f"Correlation results: {results}")
+            elif not output.strip():
+                # Completely empty output from every CLI convention is not a
+                # "weak signal" result — the binary itself is not working
+                # (field: every detection then falls through to the unreliable
+                # bandwidth guess, causing phantom/wrong-type decoders).
+                try:
+                    fsize = os.path.getsize(iq_file)
+                except OSError:
+                    fsize = -1
+                self.logger.warning(
+                    f"dft_detect produced NO output at all (formats tried: "
+                    f"{', '.join(formats_to_try)}; capture file: {fsize} bytes). "
+                    f"The dft_detect binary at '{self.dft_detect_path}' appears "
+                    f"broken on this system — test it manually and rebuild from "
+                    f"rs1729/RS (scan/dft_detect.c) if needed. Falling back to "
+                    f"bandwidth-based type detection until then."
+                )
             else:
                 self.logger.warning(
                     "dft_detect returned no parseable results "
@@ -449,8 +516,12 @@ class DftDetector:
             RS41: 0.653, -1250.0 Hz
         """
         results: Dict[str, Tuple[float, float]] = {}
+        # Different dft_detect builds label the same sonde types differently
+        # (e.g. "DFM9"/"IMET4" instead of "DFM"/"iMet") — accept both and
+        # normalize below so real correlation output isn't silently dropped
+        # just because it doesn't match our expected spelling.
         line_pattern = re.compile(
-            r'^\s*(RS41|RS92|DFM|M10|M20|iMet|LMS6)\s*:\s*'
+            r'^\s*(RS41|RS92|DFM9?|M10|M20|IMET4|iMet|LMS6)\s*:\s*'
             r'([+-]?\d+(?:\.\d+)?)'
             r'(?:\s*[,;]\s*([+-]?\d+(?:\.\d+)?)(?:\s*Hz)?)?\s*$',
             re.IGNORECASE,
@@ -467,8 +538,10 @@ class DftDetector:
                 continue
 
             sonde_type = match.group(1)
-            if sonde_type.lower() == 'imet':
+            if sonde_type.lower() in ('imet', 'imet4'):
                 sonde_type = 'iMet'
+            elif sonde_type.lower() in ('dfm', 'dfm9'):
+                sonde_type = 'DFM'
             correlation = float(match.group(2))
             freq_offset = float(match.group(3)) if match.group(3) is not None else 0.0
 

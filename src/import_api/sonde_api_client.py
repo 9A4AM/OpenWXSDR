@@ -7,6 +7,7 @@ for automatic SDR assignment.
 
 import requests
 import logging
+import math
 import time
 import threading
 from typing import List, Dict, Optional, Callable
@@ -35,7 +36,14 @@ class SondeApiClient:
         self.time_range_minutes = config.get('time_range_minutes', 15)
         self.sonde_type_filter = config.get('sonde_type', 'all')
         self.max_sondes = config.get('max_sondes', 4)
-        
+
+        # api.v2.sondehub.org's /sondes endpoint returns the same fields as
+        # api.opnwx.de EXCEPT it has no "distance" — so distance_km parses to 0
+        # for every sonde, breaking the nearest-first sort and distance-based
+        # receiver assignment. When talking to SondeHub we compute distance
+        # ourselves (haversine from the station position to each sonde).
+        self._is_sondehub = 'sondehub.org' in self.url.lower()
+
         self._poll_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._callback: Optional[Callable[[List[Dict]], None]] = None
@@ -61,7 +69,8 @@ class SondeApiClient:
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True, name="ImportApiPoller")
         self._poll_thread.start()
         self.logger.info(f"Import API started: {self.url}, interval={self.check_interval_s}s, "
-                        f"lat={self.lat}, lon={self.lon}, distance={self.distance_km}km")
+                        f"lat={self.lat}, lon={self.lon}, distance={self.distance_km}km"
+                        + (" (distance computed locally — SondeHub)" if self._is_sondehub else ""))
     
     def stop(self):
         """Stop the polling thread."""
@@ -99,7 +108,7 @@ class SondeApiClient:
             # Build API URL
             # Example: https://api.opnwx.de/sondes.php?lat=52.62&lon=10.28&distance=999999&p=14400
             time_seconds = self.time_range_minutes * 60
-            url = f"https://{self.url}/sondes.php"
+            url = f"https://{self.url}/sondes"
             params = {
                 'lat': self.lat,
                 'lon': self.lon,
@@ -148,6 +157,29 @@ class SondeApiClient:
             self.logger.error(f"Unexpected error fetching sondes: {e}")
             return []
     
+    @staticmethod
+    def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Great-circle distance in km between two lat/lon points."""
+        r = 6371.0  # Earth radius (km)
+        p1, p2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlmb = math.radians(lon2 - lon1)
+        a = (math.sin(dphi / 2) ** 2
+             + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2)
+        return r * 2 * math.asin(min(1.0, math.sqrt(a)))
+
+    def _resolve_distance_km(self, api_distance_km: float, sonde_lat: float,
+                             sonde_lon: float) -> float:
+        """Return a usable distance: the API value when present/nonzero,
+        otherwise (SondeHub, or a missing/zero value) computed via haversine
+        from the station position — provided the sonde has a real fix."""
+        if not self._is_sondehub and api_distance_km > 0:
+            return api_distance_km
+        # SondeHub, or opnwx returned 0/missing: compute from coords if valid
+        if sonde_lat != 0.0 or sonde_lon != 0.0:
+            return self._haversine_km(self.lat, self.lon, sonde_lat, sonde_lon)
+        return api_distance_km
+
     def _parse_dict_format(self, data: dict) -> List[Dict]:
         """Parse API response in dict format (serial as key)."""
         sondes = []
@@ -172,17 +204,25 @@ class SondeApiClient:
                     if frequency < 1000:  # Assume MHz
                         frequency = frequency * 1e6
                     
-                    # Parse distance (format: "166.037 km")
-                    distance_str = sonde_data.get('distance', '0 km')
-                    distance_km = float(distance_str.split()[0]) if distance_str else 0
-                    
+                    # Parse distance (format: "166.037 km"); may be a bare
+                    # number or absent (SondeHub omits it entirely)
+                    distance_val = sonde_data.get('distance', 0)
+                    if isinstance(distance_val, str):
+                        distance_km = float(distance_val.split()[0]) if distance_val.strip() else 0.0
+                    else:
+                        distance_km = float(distance_val or 0)
+
+                    sonde_lat = float(sonde_data.get('lat', 0))
+                    sonde_lon = float(sonde_data.get('lon', 0))
+                    distance_km = self._resolve_distance_km(distance_km, sonde_lat, sonde_lon)
+
                     sonde_info = {
                         'serial': serial,
                         'frequency': frequency,
                         'type': sonde_type,
                         'distance_km': distance_km,
-                        'lat': float(sonde_data.get('lat', 0)),
-                        'lon': float(sonde_data.get('lon', 0)),
+                        'lat': sonde_lat,
+                        'lon': sonde_lon,
                         'alt': float(sonde_data.get('alt', 0)),
                         'frame': int(sonde_data.get('frame', 0)),
                         'datetime': sonde_data.get('datetime', ''),
@@ -240,19 +280,25 @@ class SondeApiClient:
                 if frequency < 1000:  # Assume MHz
                     frequency = frequency * 1e6
                 
-                # Parse distance (can be float or string like "166.037 km")
-                distance_km = item.get('distance', 0)
-                if isinstance(distance_km, str):
-                    distance_km = float(distance_km.split()[0]) if distance_km else 0
-                distance_km = float(distance_km)
-                
+                # Parse distance (can be float, string "166.037 km", or absent
+                # — SondeHub omits it entirely)
+                distance_val = item.get('distance', 0)
+                if isinstance(distance_val, str):
+                    distance_km = float(distance_val.split()[0]) if distance_val.strip() else 0.0
+                else:
+                    distance_km = float(distance_val or 0)
+
+                sonde_lat = float(item.get('lat', 0))
+                sonde_lon = float(item.get('lon', 0))
+                distance_km = self._resolve_distance_km(distance_km, sonde_lat, sonde_lon)
+
                 sonde_info = {
                     'serial': serial,
                     'frequency': frequency,
                     'type': sonde_type,
                     'distance_km': distance_km,
-                    'lat': float(item.get('lat', 0)),
-                    'lon': float(item.get('lon', 0)),
+                    'lat': sonde_lat,
+                    'lon': sonde_lon,
                     'alt': float(item.get('alt', 0)),
                     'frame': int(item.get('frame', 0)),
                     'datetime': item.get('datetime', ''),

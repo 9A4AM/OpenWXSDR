@@ -4,6 +4,26 @@
  */
 
 /**
+ * Safety net for a known Bootstrap 5 quirk: if a modal element ever gets shown/hidden via
+ * more than one `new bootstrap.Modal(el)` instance (e.g. a function that shows/hides the
+ * same modal repeatedly across several calls), its internal open-modal/backdrop count can
+ * desync, leaving a `.modal-backdrop` element (and the body's `modal-open` state) stuck
+ * after the last modal on the page closes. Call this once per modal element; it removes
+ * any leftover backdrop only when no Bootstrap modal is actually still shown.
+ */
+function attachModalBackdropCleanup(modalEl) {
+    if (!modalEl || modalEl._backdropCleanupAttached) return;
+    modalEl._backdropCleanupAttached = true;
+    modalEl.addEventListener('hidden.bs.modal', () => {
+        if (document.querySelectorAll('.modal.show').length > 0) return;
+        document.querySelectorAll('.modal-backdrop').forEach(el => el.remove());
+        document.body.classList.remove('modal-open');
+        document.body.style.removeProperty('overflow');
+        document.body.style.removeProperty('padding-right');
+    });
+}
+
+/**
  * Helper function to create integer histogram (for satellite counts)
  * @param {number[]} values - Array of numeric values
  * @returns {{labels: string[], counts: number[]}} - Histogram data
@@ -169,6 +189,7 @@ async function showRxStatisticsCommon(options) {
     // Show loading modal if provided (index.html)
     let loadingModal = null;
     let loadingModalEl = null;
+    let progressEl = null;
     if (loadingModalId) {
         loadingModalEl = document.getElementById(loadingModalId);
         if (loadingModalEl) {
@@ -177,28 +198,77 @@ async function showRxStatisticsCommon(options) {
             if (loadingModalTextEl) {
                 loadingModalTextEl.textContent = 'Loading statistics...';
             }
-            
-            loadingModal = new bootstrap.Modal(loadingModalEl);
-            
+            progressEl = document.getElementById('loadingModalProgress');
+            if (progressEl) {
+                progressEl.innerHTML = '';
+            }
+
+            // Reuse a single Modal instance per element (getOrCreateInstance) instead of
+            // `new bootstrap.Modal(...)` on every call. Changing the time-range dropdown
+            // re-runs this whole function, which shows/hides this same loading modal
+            // repeatedly while rxStatisticsModal stays open underneath it — creating a
+            // fresh instance each time desyncs Bootstrap's internal open-modal/backdrop
+            // count, which is what was leaving a stuck backdrop over the map after the
+            // statistics modal was later closed.
+            loadingModal = bootstrap.Modal.getOrCreateInstance(loadingModalEl);
+            attachModalBackdropCleanup(loadingModalEl);
+
             await new Promise((resolve) => {
                 loadingModalEl.addEventListener('shown.bs.modal', resolve, { once: true });
                 loadingModal.show();
             });
         }
     }
-    
+
+    // Time range selector (3/7/14 days, 1/2/3 months) — present in the RX statistics
+    // modal on both index.html and dashboard.html. Falls back to no filter (full
+    // history) if the modal doesn't have the selector for some reason.
+    const daysSelectEl = document.getElementById('rxStatsDaysSelect');
+    const days = daysSelectEl ? parseInt(daysSelectEl.value, 10) : null;
+    const daysQuery = days ? `?days=${days}` : '';
+
     try {
-        // Fetch statistics data
-        console.log('Fetching RX statistics for', currentActivityLogfile);
-        const response = await fetch(`/api/logfile/${currentActivityLogfile}/rx_statistics`);
-        const data = await response.json();
-        
+        // Statistics scan reads every sonde logfile on disk, which can take a while on a
+        // gateway with a long tracking history. Run it as a background job on the server
+        // and poll for progress instead of one opaque blocking fetch, so the loading modal
+        // can show real "processing file X/Y" feedback instead of just a spinner.
+        console.log('Starting RX statistics job for', currentActivityLogfile, 'days=', days);
+        const startResponse = await fetch(`/api/logfile/${currentActivityLogfile}/rx_statistics/start${daysQuery}`, {
+            method: 'POST'
+        });
+        const startData = await startResponse.json();
+        if (!startData.job_id) {
+            throw new Error(startData.error || 'Failed to start statistics job');
+        }
+        const jobId = startData.job_id;
+
+        let data = null;
+        while (true) {
+            const jobResponse = await fetch(`/api/rx_statistics_job/${jobId}`);
+            const job = await jobResponse.json();
+
+            if (progressEl) {
+                progressEl.innerHTML = job.total > 0
+                    ? `Processing file ${job.current} / ${job.total}<br>Reading: ${job.filename || ''}`
+                    : 'Parsing activity log…';
+            }
+
+            if (job.done) {
+                if (job.error) {
+                    throw new Error(job.error);
+                }
+                data = job.result;
+                break;
+            }
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+
         if (!data.success) {
             throw new Error(data.error || 'Failed to load statistics');
         }
-        
+
         console.log('RX Statistics data:', data);
-        
+
         // Hide loading modal if it was shown
         if (loadingModal && loadingModalEl) {
             await new Promise((resolve) => {
@@ -253,8 +323,15 @@ async function showRxStatisticsCommon(options) {
         });
         
         // Create frames per day chart
-        const framesPerDayLabels = Object.keys(data.frames_timeline).sort();
-        const framesPerDayCounts = framesPerDayLabels.map(k => data.frames_timeline[k]);
+        // Use the union of days seen in either timeline (not just frames_timeline) so a day
+        // with detected sondes but zero counted frames still shows as an empty bar in its
+        // correct position, instead of being dropped from the x-axis entirely and making the
+        // chart look misaligned with "Received Sondes per Day".
+        const framesPerDayLabels = Array.from(new Set([
+            ...Object.keys(data.sonde_timeline),
+            ...Object.keys(data.frames_timeline)
+        ])).sort();
+        const framesPerDayCounts = framesPerDayLabels.map(k => data.frames_timeline[k] || 0);
         
         rxStatisticsCharts.framesPerDay = new Chart(document.getElementById('framesPerDayChart'), {
             type: 'bar',
@@ -413,8 +490,13 @@ async function showRxStatisticsCommon(options) {
             onBeforeShow(data);
         }
         
-        // Show the RX statistics modal
-        const rxStatsModal = new bootstrap.Modal(document.getElementById('rxStatisticsModal'));
+        // Show the RX statistics modal. getOrCreateInstance (not `new Modal(...)`) — this
+        // function re-runs every time the range dropdown changes while the modal is
+        // already open, and creating a fresh instance each time is what desynced
+        // Bootstrap's backdrop bookkeeping (see comment above the loading-modal instance).
+        const rxStatsModalEl = document.getElementById('rxStatisticsModal');
+        attachModalBackdropCleanup(rxStatsModalEl);
+        const rxStatsModal = bootstrap.Modal.getOrCreateInstance(rxStatsModalEl);
         rxStatsModal.show();
         
         // Call after show callback

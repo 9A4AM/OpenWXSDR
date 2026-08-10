@@ -44,6 +44,7 @@ import logging
 from typing import Optional
 from datetime import datetime
 
+from .. import __version__
 from ..decoders.models import SondeTelemetry
 
 
@@ -109,7 +110,7 @@ class UDPOutput:
         """
         payload = {
             'software_name': 'OpenWXSDR',
-            'software_version': '1.0.0',
+            'software_version': __version__,
             'uploader_callsign': self.uploader_callsign,
             'time_received': datetime.utcnow().isoformat() + 'Z',
             

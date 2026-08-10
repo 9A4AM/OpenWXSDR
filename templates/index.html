@@ -484,7 +484,12 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
         .status-healthy {
             background: #28a745;
         }
-        
+
+        /* Band-sweep active: green outer ring around the (green) device dot. */
+        .status-indicator.sweep-ring {
+            box-shadow: 0 0 0 3px rgba(40, 167, 69, 0.45);
+        }
+
         .status-warning {
             background: #ffc107;
         }
@@ -708,8 +713,12 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
             </div>
             
             <!-- SDR Devices Table -->
-            <div class="section-header" style="margin-top: 15px;">
-                <i class="bi bi-router"></i> SDR Devices
+            <div class="section-header" style="margin-top: 15px; display: flex; align-items: center; justify-content: space-between;">
+                <span><i class="bi bi-router"></i> SDR <span id="sdrDevicesHeaderLabel">Devices</span></span>
+                <button class="btn btn-sm btn-outline-info" style="font-size: 11px; padding: 2px 8px;"
+                        onclick="showFrequencyRepository()" title="Radiosonde frequencies detected/decoded this session">
+                    <i class="bi bi-list-stars"></i> Frequencies
+                </button>
             </div>
             <div id="devicesTable" style="overflow-x: auto;">
                 <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
@@ -737,7 +746,7 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     
     <!-- RX Statistics Common Functions -->
-    <script src="/static/js/rx-statistics-common.js"></script>
+    <script src="/static/js/rx-statistics-common.js?v={{ static_js_v }}"></script>
     
     <!-- Leaflet JS -->
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -993,9 +1002,13 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                 const response = await fetch('/api/devices');
                 const data = await response.json();
                 const devices = data.devices || [];
-                
+
+                // Header reads "SDR Device" (singular) when exactly one is configured.
+                const hdrLabel = document.getElementById('sdrDevicesHeaderLabel');
+                if (hdrLabel) hdrLabel.textContent = (devices.length === 1) ? 'Device' : 'Devices';
+
                 const tbody = document.getElementById('devicesTableBody');
-                
+
                 if (devices.length === 0) {
                     tbody.innerHTML = '<tr><td colspan=\"6\" style=\"padding: 15px; text-align: center; color: rgba(255,255,255,0.5);\">No devices configured</td></tr>';
                     return;
@@ -1023,6 +1036,10 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                         statusText = 'Error';
                     }
                     
+                    // Band-sweep active → green outer ring around the green dot.
+                    const sweepRing = (device.sweep_enabled && statusClass === 'status-healthy')
+                                    ? ' sweep-ring' : '';
+
                     // Frequency display - use freq_label when available (shows scan range)
                     const freqText = device.freq_label ? device.freq_label
                                    : device.frequency  ? `${device.frequency.toFixed(3)} MHz`
@@ -1031,14 +1048,21 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                     // Sonde type display
                     const sondeText = formatSondeTypeShort(device.sonde_type);
 
-                    // Timer: hh:mm countdown until this device returns to scanning
-                    // if no more valid frames arrive (only meaningful while decoding).
+                    // Timer: mm:ss (or "Nh" once over 99 minutes) until this device
+                    // returns to scanning if no more valid frames arrive (only
+                    // meaningful while decoding).
                     const timerText = formatScanReturnEta(device.scan_return_eta_s);
 
+                    // Row background: white/default while idle/initializing/scanning;
+                    // colored once decoding, by how the decode was started, so the
+                    // table gives an at-a-glance overview of what's driving each
+                    // device. Error state always wins.
+                    const rowBg = deviceRowBackground(device.status, device.decode_source);
+
                     return `
-                        <tr style=\"border-bottom: 1px solid rgba(255,255,255,0.05);\">
+                        <tr style=\"border-bottom: 1px solid rgba(255,255,255,0.05);${rowBg}\">
                             <td style=\"padding: 8px; text-align: center;\">
-                                <span class=\"status-indicator ${statusClass}\"></span>
+                                <span class=\"status-indicator ${statusClass}${sweepRing}\"></span>
                             </td>
                             <td style=\"padding: 8px;\"><b>${device.serial}</b></td>
                             <td style=\"padding: 8px; font-family: monospace;\">${freqText}</td>
@@ -1070,16 +1094,45 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
             return base.substring(0, 5);
         }
 
-        // Format seconds-remaining as "HH:MM"; '—' when not applicable
-        // (device not decoding, or no timeout applies).
+        // Format seconds-remaining as "MM:SS"; once over 99 minutes, switch to
+        // whole hours only (e.g. "4h") since minute/second precision isn't
+        // meaningful at that range. '—' when not applicable (device not
+        // decoding, or no timeout applies).
         function formatScanReturnEta(remainingSeconds) {
             if (remainingSeconds === null || remainingSeconds === undefined) {
                 return '—';
             }
-            const totalMinutes = Math.max(0, Math.ceil(remainingSeconds / 60));
-            const hh = Math.floor(totalMinutes / 60);
-            const mm = totalMinutes % 60;
-            return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+            const totalSeconds = Math.max(0, Math.ceil(remainingSeconds));
+            const totalMinutes = Math.floor(totalSeconds / 60);
+            if (totalMinutes > 99) {
+                return `${Math.round(totalMinutes / 60)}h`;
+            }
+            const ss = totalSeconds % 60;
+            return `${String(totalMinutes).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+        }
+
+        // SDR Devices table row background, by device status / how a decode
+        // was started (device.decode_source: 'auto'/'manual'/'import_api'/
+        // 'priority'/'fixed_channel'/null). White/transparent while idle/
+        // initializing/scanning; colored once decoding (or on error), for
+        // an at-a-glance overview of what's driving each device.
+        const DEVICE_ROW_BG = {
+            error:         'rgba(244, 67, 54, 0.18)',   // light red
+            auto:          'rgba(76, 175, 80, 0.18)',   // light green — detected from spectrum
+            import_api:    'rgba(33, 150, 243, 0.18)',  // light blue — imported from api.opnwx.de
+            manual:        'rgba(255, 152, 0, 0.18)',   // light orange — manually entered (web UI)
+            priority:      'rgba(255, 193, 7, 0.18)',   // light yellow — priority_frequency / fixed_channels
+            fixed_channel: 'rgba(255, 193, 7, 0.18)',
+        };
+        function deviceRowBackground(status, decodeSource) {
+            if (status === 'error') {
+                return ` background-color: ${DEVICE_ROW_BG.error};`;
+            }
+            if (status === 'decoding') {
+                const color = DEVICE_ROW_BG[decodeSource] || DEVICE_ROW_BG.auto;
+                return ` background-color: ${color};`;
+            }
+            return '';
         }
         
         // Update sondes list
@@ -1506,14 +1559,24 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                                 ? '<span class="badge bg-primary">Scanning ' + (d.freq_label || '') + '</span>'
                                 : d.status === 'decoding'
                                 ? '<span class="badge bg-success">Decoding ' + (d.frequency ? d.frequency.toFixed(3) + ' MHz' : '') + '</span>'
+                                : d.status === 'error'
+                                ? '<span class="badge bg-danger">Error</span>'
                                 : '<span class="badge bg-secondary">Idle</span>';
-                            const canScan = (d.status === 'idle' || d.status === 'decoding');
-                            const btnLabel = d.status === 'decoding'
+                            // Sonde type currently being decoded, shown as its own
+                            // badge right after the "Decoding ..." status badge.
+                            const sondeTypeBadge = (d.status === 'decoding' && d.sonde_type)
+                                ? '<span class="badge bg-info text-dark ms-1">' + formatSondeTypeShort(d.sonde_type) + '</span>'
+                                : '';
+                            // Always enabled: forces a clean restart regardless of
+                            // current state (idle/scanning/decoding/error) — stops
+                            // any active decode and rebuilds the spectrum analyzer
+                            // from the latest config.yaml detection settings.
+                            const btnLabel = (d.status === 'decoding' || d.status === 'scanning')
                                 ? '<i class="bi bi-arrow-repeat"></i> Restart Scan'
                                 : '<i class="bi bi-play-fill"></i> Start Scan';
                             return `<div class="d-flex align-items-center justify-content-between mb-2 p-2 border rounded">
-                                <div><strong>${d.serial}</strong>&nbsp;${statusBadge}</div>
-                                <button class="btn btn-sm btn-outline-primary" ${canScan ? '' : 'disabled'}
+                                <div><strong>${d.serial}</strong>&nbsp;${statusBadge}${sondeTypeBadge}</div>
+                                <button class="btn btn-sm btn-outline-primary"
                                     onclick="startScanning('${d.serial}'); return false;">
                                     ${btnLabel}
                                 </button>
@@ -1524,6 +1587,74 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
                     modal.show();
                 })
                 .catch(err => { console.error(err); alert('Failed to load device list'); });
+        }
+
+        function showFrequencyRepository() {
+            const modalEl = document.getElementById('frequencyRepositoryModal');
+            let modal = bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl);
+            modal.show();
+            fetch('/api/frequency_repository')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('freqRepoFile').textContent = data.file || '';
+                    const freqs = data.frequencies || [];
+                    const el = document.getElementById('freqRepoList');
+                    if (freqs.length === 0) {
+                        el.innerHTML = '<div class="text-center text-muted py-3">No frequencies logged yet this session.</div>';
+                        return;
+                    }
+                    const rows = freqs.map(f => {
+                        const statusBadge = f.status === 'confirmed'
+                            ? '<span class="badge bg-success">confirmed</span>'
+                            : '<span class="badge bg-secondary">detected</span>';
+                        const type = f.type ? formatSondeTypeShort(f.type) : '—';
+                        const serial = f.serial || '—';
+                        const snr = f.snr_db ? f.snr_db + ' dB' : '—';
+                        const rssi = f.rssi_dbm ? f.rssi_dbm + ' dBm' : '—';
+                        const start = (f.decode_source || '');
+                        return `<tr>
+                            <td style="font-family:monospace;"><b>${f.frequency_mhz.toFixed(3)}</b></td>
+                            <td>${statusBadge}</td>
+                            <td>${type}</td>
+                            <td>${serial}</td>
+                            <td>${snr}</td>
+                            <td>${rssi}</td>
+                            <td style="font-family:monospace;font-size:11px;">${(f.last_seen||'').replace('T',' ').replace('Z','')}</td>
+                            <td class="text-center">
+                                <button class="btn btn-sm btn-outline-primary" style="font-size:11px;padding:1px 6px;"
+                                    onclick="startDecoderFromRepo(${f.frequency_mhz.toFixed(3)}, '${f.type || 'RS41'}'); return false;">
+                                    <i class="bi bi-play-fill"></i></button>
+                            </td>
+                        </tr>`;
+                    }).join('');
+                    el.innerHTML = `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;" class="table table-sm">
+                        <thead><tr>
+                            <th>MHz</th><th>Status</th><th>Type</th><th>Serial</th><th>SNR</th><th>RSSI</th><th>Last seen (UTC)</th><th></th>
+                        </tr></thead><tbody>${rows}</tbody></table></div>`;
+                })
+                .catch(err => {
+                    console.error(err);
+                    document.getElementById('freqRepoList').innerHTML =
+                        '<div class="text-center text-danger py-3">Failed to load frequency repository.</div>';
+                });
+        }
+
+        // Manually launch a decoder for a frequency picked from the repository.
+        function startDecoderFromRepo(freqMhz, sondeType) {
+            fetch('/api/start_decoder', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ frequency: parseFloat(freqMhz), sonde_type: sondeType, device_serial: null, duration_minutes: 0 })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    alert('Decoder started for ' + freqMhz + ' MHz (' + sondeType + ')');
+                } else {
+                    alert('Failed to start decoder: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(err => { console.error(err); alert('Failed to start decoder'); });
         }
 
         function startScanning(serial) {
@@ -1551,6 +1682,18 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
             const currentLang = localStorage.getItem('aboutLanguage') || 'en';
             setAboutLanguage(currentLang);
             modal.show();
+            // Fill Hostname / IP (same source as the Service Status modal)
+            fetch('/api/service_status', { cache: 'no-store' })
+                .then(r => r.json())
+                .then(data => {
+                    if (!data || !data.success) return;
+                    const text = `${data.hostname || '-'} / ${data.ip_address || '-'}`;
+                    const en = document.getElementById('aboutHostnameIpEN');
+                    const de = document.getElementById('aboutHostnameIpDE');
+                    if (en) en.textContent = text;
+                    if (de) de.textContent = text;
+                })
+                .catch(() => { /* leave placeholder on error */ });
         }
 
         function setAboutLanguage(lang) {
@@ -1838,7 +1981,11 @@ See http://www.gnu.org/licenses/gpl-2.0.html.
             const loadingModalEl = document.getElementById('loadingModal');
             const loadingModal = new bootstrap.Modal(loadingModalEl, { backdrop: 'static', keyboard: false });
             document.getElementById('loadingModalText').textContent = 'Decoder start in progress...';
-            
+            // Clear any leftover RX-statistics progress ("Processing file X/Y …")
+            // so it doesn't show under the decoder-start message.
+            const decLoadProgress = document.getElementById('loadingModalProgress');
+            if (decLoadProgress) decLoadProgress.innerHTML = '';
+
             // Wait for modal to be shown
             await new Promise((resolve) => {
                 loadingModalEl.addEventListener('shown.bs.modal', resolve, { once: true });
@@ -2442,6 +2589,33 @@ ${trkSegs}
         </div>
     </div>
 
+    <!-- Frequency Repository Modal -->
+    <div class="modal fade" id="frequencyRepositoryModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-list-stars"></i> Frequency Repository</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="text-muted small mb-2">
+                        Radiosonde channels seen this session.
+                        <span class="badge bg-success">confirmed</span> = a decode produced telemetry;
+                        <span class="badge bg-secondary">detected</span> = a scan peak not (yet) decoded.
+                        <span id="freqRepoFile" class="float-end fst-italic"></span>
+                    </p>
+                    <div id="freqRepoList">
+                        <div class="text-center text-muted py-3"><i class="bi bi-hourglass-split"></i> Loading…</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-outline-secondary btn-sm" onclick="showFrequencyRepository()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Decoder Settings Modal -->
     <div class="modal fade" id="decoderSettingsModal" tabindex="-1">
         <div class="modal-dialog">
@@ -2497,6 +2671,7 @@ ${trkSegs}
                                 <tr><th>Version</th><td>V{{ version }} (Release)</td></tr>
                                 <tr><th>Station</th><td>{{ callsign }}</td></tr>
                                 <tr><th>Build Date</th><td>{{ build_date }}</td></tr>
+                                <tr><th>Hostname / IP</th><td><span id="aboutHostnameIpEN">-</span></td></tr>
                             </tbody>
                         </table>
 
@@ -2536,6 +2711,7 @@ ${trkSegs}
                                 <tr><th>Version</th><td>V{{ version }} (Release)</td></tr>
                                 <tr><th>Station</th><td>{{ callsign }}</td></tr>
                                 <tr><th>Build-Datum</th><td>{{ build_date }}</td></tr>
+                                <tr><th>Hostname / IP</th><td><span id="aboutHostnameIpDE">-</span></td></tr>
                             </tbody>
                         </table>
 
@@ -2643,7 +2819,20 @@ ${trkSegs}
         <div class="modal-dialog modal-xl" style="max-width: 1400px;">
             <div class="modal-content">
                 <div class="modal-header">
-                    <h5 class="modal-title"><i class="bi bi-graph-up-arrow"></i> Receiver Statistics</h5>
+                    <div class="d-flex align-items-center gap-3 flex-wrap">
+                        <h5 class="modal-title mb-0"><i class="bi bi-graph-up-arrow"></i> Receiver Statistics</h5>
+                        <div class="d-flex align-items-center gap-2">
+                            <label for="rxStatsDaysSelect" class="mb-0 small text-muted">Range:</label>
+                            <select id="rxStatsDaysSelect" class="form-select form-select-sm" style="width: auto;" onchange="showRxStatistics()">
+                                <option value="3">3 days</option>
+                                <option value="7" selected>7 days</option>
+                                <option value="14">14 days</option>
+                                <option value="30">1 month</option>
+                                <option value="60">2 months</option>
+                                <option value="90">3 months</option>
+                            </select>
+                        </div>
+                    </div>
                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
                 <div class="modal-body" style="max-height: 80vh; overflow-y: auto;">
@@ -3288,12 +3477,20 @@ ${trkSegs}
                                 </td>
                             </tr>
                             <tr>
+                                <th class="text-muted">Memory / Disk</th>
+                                <td><span id="serviceMemDisk">-</span></td>
+                            </tr>
+                            <tr>
                                 <th class="text-muted">Hostname / IP</th>
                                 <td><span id="serviceHostnameIp">-</span></td>
                             </tr>
                             <tr>
                                 <th class="text-muted" style="width: 32%;">Service</th>
                                 <td><strong id="serviceUnit">openwxsdr.service</strong></td>
+                            </tr>
+                            <tr>
+                                <th class="text-muted">Version</th>
+                                <td><span id="serviceVersion">-</span></td>
                             </tr>
                             <tr>
                                 <th class="text-muted">Loaded</th>
@@ -3382,10 +3579,29 @@ ${trkSegs}
                         <span class="visually-hidden">Loading...</span>
                     </div>
                     <h5 id="loadingModalText" class="mb-0">Loading logfile data...</h5>
+                    <div id="loadingModalProgress" class="text-muted small mt-2"></div>
                 </div>
             </div>
         </div>
     </div>
+    <script>
+        // #loadingModal is shared by several actions (decoder start, load
+        // radiosonde, load logfile, RX statistics). Only the RX-statistics job
+        // writes #loadingModalProgress ("Processing file X/Y — Reading: …"), and
+        // it never cleared it on exit — so the next action to reuse this modal
+        // (e.g. "Decoder start in progress…") showed that stale progress line
+        // underneath. Clear it every time the modal hides so no caller inherits
+        // leftover text.
+        (function () {
+            const el = document.getElementById('loadingModal');
+            if (el) {
+                el.addEventListener('hidden.bs.modal', function () {
+                    const p = document.getElementById('loadingModalProgress');
+                    if (p) p.innerHTML = '';
+                });
+            }
+        })();
+    </script>
 
     <!-- Spectrum Modal -->
     <div class="modal fade" id="spectrumModal" tabindex="-1">
@@ -5516,10 +5732,19 @@ ${trkSegs}
                     return;
                 }
                 document.getElementById('serviceHardware').textContent = data.hardware || '-';
+                const ramTotal = data.ram_total || 'n/a';
+                const diskTotal = data.disk_total || 'n/a';
+                const diskFree = data.disk_free || 'n/a';
+                document.getElementById('serviceMemDisk').textContent =
+                    `RAM ${ramTotal} · Disk ${diskFree} free / ${diskTotal} total`;
                 const hostname = data.hostname || '-';
                 const ipAddress = data.ip_address || '-';
                 document.getElementById('serviceHostnameIp').textContent = `${hostname} / ${ipAddress}`;
                 document.getElementById('serviceUnit').textContent = data.unit || 'openwxsdr.service';
+                const svcVersion = data.version ? ('V' + data.version) : '-';
+                const svcBuild = data.build_date ? ` (${data.build_date})` : '';
+                const svcStation = data.station ? ` · ${data.station}` : '';
+                document.getElementById('serviceVersion').textContent = `${svcVersion}${svcBuild}${svcStation}`;
                 document.getElementById('serviceLoaded').textContent = data.loaded_line || '-';
                 document.getElementById('serviceActive').textContent = data.active_line || data.active || '-';
                 document.getElementById('serviceMainPid').textContent = data.main_pid_line || '-';

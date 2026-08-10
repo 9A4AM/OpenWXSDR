@@ -58,6 +58,9 @@ import threading
 import time
 import subprocess
 import os
+import sys
+import shutil
+import array
 import json
 from typing import Optional, Dict, List, Callable, Set
 from dataclasses import dataclass
@@ -98,10 +101,41 @@ class KA9QReceiver:
         # Audio pipeline: RTP → fsk_demod (demodulate FSK) → decoder --softin
         self.active_decoders: Dict[int, subprocess.Popen] = {}  # SSRC → decoder process
         self.fsk_processes: Dict[int, subprocess.Popen] = {}    # SSRC → fsk_demod process
+
+        # The KA9Q path decodes ONLY via the fsk_demod soft-bit chain (unlike
+        # the RTL path, KA9Q delivers demod-ready IQ so there is no --IQ
+        # fallback). fsk_demod is therefore mandatory here. Resolve + verify it
+        # once at construction so a missing binary produces ONE clear,
+        # actionable error instead of an identical Popen traceback on every
+        # stream, every scan cycle, forever (field: OPENWX6 spammed the same
+        # FileNotFoundError for 8 streams × every 10s scan with no hint that
+        # the fix is to build fsk_demod).
+        self._fsk_demod_path = self._resolve_binary('fsk_demod')
+        self._rs41_decoder_path = self._resolve_binary('rs41mod')
+        self._soft_chain_available = bool(self._fsk_demod_path)
+        self._logged_missing_fsk = False
+        if not self._soft_chain_available:
+            rs1729_path = self.config.get('decoders', {}).get('rs1729_path', './decoders/rs1729')
+            self.logger.error(
+                "=" * 68 + "\n"
+                "fsk_demod binary NOT FOUND — the KA9Q receiver decodes only via\n"
+                "the fsk_demod soft-bit chain and CANNOT decode without it. No\n"
+                f"telemetry will be produced. Expected in: {rs1729_path}/fsk_demod\n"
+                "FIX: run  ./scripts/install_softchain.sh  on this host to build\n"
+                "fsk_demod (and a working dft_detect) from radiosonde_auto_rx,\n"
+                "then restart the service.\n"
+                + "=" * 68
+            )
         
         # Decoder signal quality monitoring (EbNodB tracking)
         self.decoder_spawn_times: Dict[int, float] = {}  # SSRC → spawn timestamp
         self.decoder_ebnodb_values: Dict[int, List[float]] = {}  # SSRC → list of recent EbNodB values
+        # Throttle the compact per-channel EbNodB log line (the full fsk_demod
+        # stats JSON is never logged at INFO — see _read_fsk_stderr).
+        self._last_ebnodb_log: Dict[int, float] = {}
+        self.fsk_ebnodb_log_interval = float(
+            self.config.get('sdr', {}).get('ka9q', {}).get('ebnodb_log_interval_s', 30)
+        )
         self.decoder_validation_timeout = 20.0  # Monitor decoders for 20s before auto-cleanup
         self.decoder_min_ebnodb = 6.0  # Minimum EbNodB required for reliable decode
         
@@ -113,6 +147,26 @@ class KA9QReceiver:
         
         # Spectrum scanning configuration
         ka9q_config = self.config.get('sdr', {}).get('ka9q', {})
+
+        # CRITICAL: ka9q-radio transmits RTP PCM/IQ samples in NETWORK byte
+        # order (big-endian), but fsk_demod --cs16 reads samples in the host's
+        # NATIVE byte order (little-endian on all ARM/x86 gateways). Writing
+        # the raw RTP payload straight to fsk_demod therefore feeds it
+        # byte-swapped garbage: fsk_demod runs and estimates tones but locks
+        # onto noise, so EbNodB stays pinned at the ~1-3 dB noise floor and
+        # ZERO frames decode — even on a strong sonde that other gateways
+        # decode fine (field: OPENWX6 saw 5 live sondes, KA9Q got none).
+        # radiosonde_auto_rx byte-swaps here; we must too. Default on; the
+        # toggle exists only for the (essentially nonexistent) big-endian host.
+        self.rtp_byte_swap = bool(ka9q_config.get('rtp_byte_swap', True))
+        if self.rtp_byte_swap and sys.byteorder != 'little':
+            # On a big-endian host, native already matches network order —
+            # swapping would BREAK it. Disable automatically.
+            self.logger.warning(
+                "Host is big-endian; disabling ka9q.rtp_byte_swap "
+                "(native order already matches network order)"
+            )
+            self.rtp_byte_swap = False
         self.scanning_mode = ka9q_config.get('scanning_mode', False)
         self.scan_interval = ka9q_config.get('scan_interval', 10)
         self.scan_frequency_min = ka9q_config.get('scan_frequency_min', 400e6)
@@ -504,13 +558,26 @@ class KA9QReceiver:
                     self.logger.warning(f"fsk_demod process for SSRC {ssrc:08x} has exited with code {fsk_proc.poll()}")
                 else:
                     try:
-                        fsk_proc.stdin.write(payload)
+                        # Convert ka9q big-endian RTP samples → native little-
+                        # endian int16 for fsk_demod (see rtp_byte_swap note in
+                        # __init__). Fast C-level swap via array; guard against a
+                        # stray odd-length payload that would raise here.
+                        out = payload
+                        if self.rtp_byte_swap and (len(payload) & 1) == 0:
+                            swapped = array.array('h')
+                            swapped.frombytes(payload)
+                            swapped.byteswap()
+                            out = swapped.tobytes()
+
+                        fsk_proc.stdin.write(out)
                         fsk_proc.stdin.flush()
-                        
-                        # Log first write for debugging
+
+                        # Log only the very first write per channel (at DEBUG)
+                        # — the per-packet INFO spam isn't needed once decoding
+                        # is confirmed working.
                         stream = self.active_streams.get(ssrc)
-                        if stream and stream.packet_count <= 3:  # Log first 3 writes
-                            self.logger.info(f"I/Q write #{stream.packet_count} to fsk_demod SSRC={ssrc:08x}: {len(payload)} bytes")
+                        if stream and stream.packet_count == 1:
+                            self.logger.debug(f"First I/Q write to fsk_demod SSRC={ssrc:08x}: {len(payload)} bytes (byteswap={self.rtp_byte_swap})")
                             
                     except BrokenPipeError:
                         self.logger.warning(f"fsk_demod pipe broken for SSRC={ssrc:08x}")
@@ -532,34 +599,65 @@ class KA9QReceiver:
         except Exception as e:
             self.logger.debug(f"Error parsing RTP packet: {e}")
     
+    def _resolve_binary(self, name: str) -> Optional[str]:
+        """Locate a decoder/demod binary: configured rs1729_path first (relative
+        to CWD, matching the systemd WorkingDirectory), then absolute, then PATH.
+        Returns the usable path or None."""
+        rs1729_path = self.config.get('decoders', {}).get('rs1729_path', './decoders/rs1729')
+        candidate = os.path.join(rs1729_path, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+        abs_candidate = os.path.join(os.getcwd(), candidate)
+        if os.path.isfile(abs_candidate) and os.access(abs_candidate, os.X_OK):
+            return abs_candidate
+        which = shutil.which(name)
+        if which:
+            return which
+        return None
+
     def _spawn_decoder_for_stream(self, ssrc: int, stream: KA9QStream):
         """Spawn fsk_demod + rs1729 decoder pipeline for a KA9Q I/Q stream (softin method)"""
+        # Guard: don't attempt (and log a full traceback) once per stream per
+        # scan cycle when fsk_demod is simply not installed — the actionable
+        # error was already logged once at startup.
+        if not self._soft_chain_available:
+            if not self._logged_missing_fsk:
+                self.logger.error(
+                    "Cannot spawn decoders: fsk_demod not installed "
+                    "(run ./scripts/install_softchain.sh). Suppressing further "
+                    "per-stream spawn errors."
+                )
+                self._logged_missing_fsk = True
+            return
         try:
-            # Determine decoder path
-            rs1729_path = self.config.get('decoders', {}).get('rs1729_path', './decoders/rs1729')
-            decoder_path = os.path.join(rs1729_path, 'rs41mod')
-            fsk_demod_path = os.path.join(rs1729_path, 'fsk_demod')
+            # Determine decoder path (resolved + verified at construction)
+            decoder_path = self._rs41_decoder_path
+            fsk_demod_path = self._fsk_demod_path
             
             # Pipeline: KA9Q I/Q (cs16) → fsk_demod → rs41mod --softin
 
-            # Build fsk_demod command (from auto_rx)
+            # Build fsk_demod command — matches radiosonde_auto_rx's CURRENT RS41
+            # soft-chain invocation (autorx/decode.py, 2025-08-26 weak-signal
+            # tuning) and rs1729_decoder.SOFT_CHAIN_PARAMS['RS41'], so both soft
+            # paths stay consistent. The old '--mask 4800' (no --nsym/-p) was
+            # deaf on weaker signals; auto_rx bumped the mask estimator to 5000,
+            # lengthened the timing estimator (--nsym=300) and set oversampling
+            # -p 5. Requires an fsk_demod built from current auto_rx.
             # --cs16: complex signed 16-bit input (interleaved I/Q)
-            # -b -5000, -u 5000: frequency bounds (±5kHz from center)
-            # -s: Schmitt trigger
-            # --mask 4800: mask frequency (related to baud rate)
-            # --stats=5: statistics every 5 seconds
-            # 2: number of channels (I/Q = 2)
-            # 48000: sample rate
-            # 4800: baud rate (RS41 uses 4800 baud)
+            # -b -5000, -u 5000: FSK estimator window ±5 kHz
+            # -s: soft-decision output
+            # 2: 2FSK   48000: sample rate   4800: RS41 baud
             fsk_demod_cmd = [
                 fsk_demod_path,
                 '--cs16',
                 '-b', '-5000',
                 '-u', '5000',
                 '-s',
-                '--mask', '4800',
+                '--mask', '5000',
+                '--nsym=300',
+                '-p', '5',
                 '--stats=5',
-                '2',  # I/Q = 2 channels
+                '2',  # 2FSK
                 str(stream.sample_rate),  # 48000
                 '4800',  # Baud rate for RS41
                 '-',  # stdin
@@ -578,9 +676,11 @@ class KA9QReceiver:
                 '-i'
             ]
             
-            self.logger.info(f"Spawning fsk_demod decoder pipeline for SSRC={ssrc:08x}")
-            self.logger.info(f"  fsk_demod: {' '.join(fsk_demod_cmd)}")
-            self.logger.info(f"  Decoder: {' '.join(decoder_cmd)}")
+            freq = self.channel_frequencies.get(ssrc, 0.0)
+            freq_s = f"{freq/1e6:.3f} MHz" if freq else f"SSRC={ssrc:08x}"
+            self.logger.info(f"Spawning decoder pipeline for {freq_s}")
+            self.logger.debug(f"  fsk_demod: {' '.join(fsk_demod_cmd)}")
+            self.logger.debug(f"  Decoder: {' '.join(decoder_cmd)}")
             
             # Start fsk_demod process
             fsk_proc = subprocess.Popen(
@@ -615,7 +715,7 @@ class KA9QReceiver:
                 self.decoder_spawn_times[ssrc] = time.time()
                 self.decoder_ebnodb_values[ssrc] = []
             
-            self.logger.info(f"Decoder pipeline spawned for SSRC={ssrc:08x}, fsk_demod PID={fsk_proc.pid}, decoder PID={decoder_proc.pid}")
+            self.logger.debug(f"Decoder pipeline spawned for SSRC={ssrc:08x}, fsk_demod PID={fsk_proc.pid}, decoder PID={decoder_proc.pid}")
             
             # Give pipeline a moment to start
             time.sleep(0.1)
@@ -699,13 +799,33 @@ class KA9QReceiver:
                 try:
                     line_str = line.decode('utf-8', errors='replace').strip()
                     if line_str.startswith('{'):
-                        # JSON telemetry frame
-                        self.logger.info(f"KA9Q decoder output: {line_str}")
-                        
-                        # TODO: Parse JSON and call decoder_callback
-                        # if self.decoder_callback:
-                        #     self.decoder_callback(json.loads(line_str))
-                        
+                        # JSON telemetry frame from the rs1729 decoder. Parse it,
+                        # inject the channel frequency (the decoder JSON has none —
+                        # it comes from this stream's RTP/SSRC mapping), and hand
+                        # it to the telemetry callback. Previously this was a TODO
+                        # and every decoded frame was logged but silently dropped
+                        # before reaching the web UI / UDP / MQTT / SondeHub.
+                        try:
+                            frame = json.loads(line_str)
+                        except json.JSONDecodeError:
+                            self.logger.debug(f"Non-JSON decoder line: {line_str[:120]}")
+                            continue
+
+                        if self.decoder_callback:
+                            stream = self.active_streams.get(ssrc)
+                            if stream and stream.frequency and 'frequency' not in frame:
+                                frame['frequency'] = stream.frequency  # Hz
+                            try:
+                                self.decoder_callback(frame)
+                            except Exception as cb_exc:
+                                self.logger.error(
+                                    f"KA9Q telemetry callback failed for SSRC={ssrc:08x}: {cb_exc}",
+                                    exc_info=True
+                                )
+                        else:
+                            # No callback wired — log so the frame isn't silently lost
+                            self.logger.info(f"KA9Q decoder output (no callback): {line_str}")
+
                 except Exception as e:
                     self.logger.debug(f"Error processing decoder output: {e}")
         
@@ -717,15 +837,19 @@ class KA9QReceiver:
     
     def _read_decoder_stderr(self, ssrc: int, decoder: subprocess.Popen):
         """Read and log decoder stderr for diagnostics"""
-        self.logger.info(f"Decoder stderr reader started for SSRC={ssrc:08x}")
-        
+        self.logger.debug(f"Decoder stderr reader started for SSRC={ssrc:08x}")
+
         try:
             for line in decoder.stderr:
                 try:
                     line_str = line.decode('utf-8', errors='replace').strip()
                     if line_str:
-                        # Log at INFO level so we can see it in production
-                        self.logger.info(f"Decoder stderr [{ssrc:08x}]: {line_str}")
+                        # Decoder stderr is routine startup chatter ("IF: 48000",
+                        # "dec: 1") — DEBUG unless it looks like an error.
+                        if any(w in line_str.lower() for w in ('error', 'fail', 'invalid', 'not supported')):
+                            self.logger.warning(f"Decoder stderr [{ssrc:08x}]: {line_str}")
+                        else:
+                            self.logger.debug(f"Decoder stderr [{ssrc:08x}]: {line_str}")
                 except Exception as e:
                     self.logger.debug(f"Error processing decoder stderr: {e}")
         
@@ -737,36 +861,54 @@ class KA9QReceiver:
     
     def _read_fsk_stderr(self, ssrc: int, fsk_proc: subprocess.Popen):
         """Read and log fsk_demod stderr for diagnostics and extract EbNodB values"""
-        self.logger.info(f"fsk_demod stderr reader started for SSRC={ssrc:08x}")
+        self.logger.debug(f"fsk_demod stderr reader started for SSRC={ssrc:08x}")
         
         try:
             for line in fsk_proc.stderr:
                 try:
                     line_str = line.decode('utf-8', errors='replace').strip()
-                    if line_str:
-                        # Log fsk_demod output (stats, warnings, errors)
-                        self.logger.info(f"fsk_demod [{ssrc:08x}]: {line_str}")
-                        
-                        # Parse EbNodB values for signal quality monitoring
-                        # fsk_demod outputs JSON format: {"secs": ..., "EbNodB": 3.4, ...}
-                        if "EbNodB" in line_str and line_str.startswith("{"):
-                            try:
-                                # Parse JSON to extract EbNodB value
-                                stats = json.loads(line_str)
-                                if "EbNodB" in stats:
-                                    ebnodb = float(stats["EbNodB"])
-                                    with self.lock:
-                                        if ssrc in self.decoder_ebnodb_values:
-                                            self.decoder_ebnodb_values[ssrc].append(ebnodb)
-                                            # Keep only the last 10 values (rolling window)
-                                            if len(self.decoder_ebnodb_values[ssrc]) > 10:
-                                                self.decoder_ebnodb_values[ssrc].pop(0)
-                                            # Log signal quality for debugging
-                                            avg_ebnodb = sum(self.decoder_ebnodb_values[ssrc]) / len(self.decoder_ebnodb_values[ssrc])
-                                            self.logger.debug(f"SSRC {ssrc:08x}: EbNodB={ebnodb:.1f} dB (avg last {len(self.decoder_ebnodb_values[ssrc])} samples: {avg_ebnodb:.1f} dB)")
-                            except Exception as e:
-                                self.logger.debug(f"Failed to parse EbNodB JSON from: {line_str[:100]}: {e}")
-                                
+                    if not line_str:
+                        continue
+
+                    # fsk_demod emits a large JSON stats blob (EbNodB +
+                    # eye_diagram + samp_fft) every --stats interval per channel.
+                    # Logging the whole thing at INFO for ~15 channels floods
+                    # the journal (thousands of lines/min). Extract just EbNodB,
+                    # track it for the quality gate, and log a compact one-liner
+                    # AT MOST once per fsk_ebnodb_log_interval per channel.
+                    if line_str.startswith("{") and "EbNodB" in line_str:
+                        try:
+                            stats = json.loads(line_str)
+                            ebnodb = float(stats.get("EbNodB"))
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            continue
+
+                        with self.lock:
+                            if ssrc in self.decoder_ebnodb_values:
+                                self.decoder_ebnodb_values[ssrc].append(ebnodb)
+                                if len(self.decoder_ebnodb_values[ssrc]) > 10:
+                                    self.decoder_ebnodb_values[ssrc].pop(0)
+
+                        now = time.time()
+                        last = self._last_ebnodb_log.get(ssrc, 0.0)
+                        if now - last >= self.fsk_ebnodb_log_interval:
+                            self._last_ebnodb_log[ssrc] = now
+                            freq = self.channel_frequencies.get(ssrc, 0.0)
+                            freq_s = f"{freq/1e6:.3f} MHz" if freq else f"{ssrc:08x}"
+                            ppm = stats.get("ppm")
+                            self.logger.info(
+                                f"fsk_demod {freq_s}: EbNodB={ebnodb:.1f} dB"
+                                + (f", ppm={ppm}" if ppm is not None else "")
+                            )
+                    else:
+                        # Non-stats stderr (startup notes, warnings, errors) —
+                        # keep these but drop the routine "Setting estimator
+                        # limits" banner that appears on every spawn.
+                        if "Setting estimator limits" in line_str:
+                            self.logger.debug(f"fsk_demod [{ssrc:08x}]: {line_str}")
+                        else:
+                            self.logger.info(f"fsk_demod [{ssrc:08x}]: {line_str}")
+
                 except Exception as e:
                     self.logger.debug(f"Error processing fsk_demod stderr: {e}")
         

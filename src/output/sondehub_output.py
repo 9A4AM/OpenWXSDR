@@ -499,20 +499,25 @@ class SondeHubOutput:
         if telemetry.rs41_mainboard is not None:
             payload['rs41_mainboard'] = str(telemetry.rs41_mainboard)
         if telemetry.rs41_mainboard_fw is not None:
-            payload['rs41_mainboard_fw'] = int(telemetry.rs41_mainboard_fw)
+            # SondeHub expects rs41_mainboard_fw as a STRING, not an int.
+            payload['rs41_mainboard_fw'] = str(telemetry.rs41_mainboard_fw)
         if telemetry.ref_datetime is not None:
             payload['ref_datetime'] = str(telemetry.ref_datetime)
         if telemetry.ref_position is not None:
             payload['ref_position'] = str(telemetry.ref_position)
         if telemetry.tx_frequency is not None:
-            # tx_frequency from rs41mod JSON is already in MHz format
-            payload['tx_frequency'] = round(float(telemetry.tx_frequency), 3)
+            # tx_frequency is stored in kHz (field-observed: 405700.0 = the
+            # nominal 405.7 MHz channel). Convert kHz→MHz so it's submitted as
+            # 405.7. (Dividing by 1e6 as if it were Hz gave a wrong 0.406.)
+            payload['tx_frequency'] = round(float(telemetry.tx_frequency) / 1e3, 3)
 
         # SNR and RSSI removed per user request - not needed for SondeHub
 
         uploader_position = self._uploader_position()
         if uploader_position is not None:
             payload['uploader_position'] = uploader_position
+        if self.station_alt is not None:
+            payload['uploader_alt'] = float(self.station_alt)
         if self.uploader_antenna:
             payload['uploader_antenna'] = self.uploader_antenna
 

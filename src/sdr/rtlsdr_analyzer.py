@@ -46,7 +46,7 @@ import numpy as np
 import logging
 import time
 import threading
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Callable
 from dataclasses import dataclass
 from scipy import signal as scipy_signal
 
@@ -62,14 +62,27 @@ except ImportError:
 class DetectedSignal:
     """Represents a detected radiosonde signal"""
     frequency: float
-    strength: float  # SNR in dB
+    strength: float  # SNR in dB (peak power above noise floor)
     bandwidth: float
     timestamp: float
+    # Absolute peak power at the signal bin (dBFS) and the scan's noise floor
+    # (dBFS). strength == power_dbfs - noise_floor_dbfs. Kept separately so the
+    # UI can show a real RSSI (power) distinct from SNR — without these, both
+    # RSSI and SNR fell back to the same SNR value and displayed identically.
+    power_dbfs: float = 0.0
+    noise_floor_dbfs: float = 0.0
     
 
 class SpectrumAnalyzer:
     """Analyzes spectrum and detects radiosonde signals"""
-    
+
+    # librtlsdr's own rtl_sdr.c reference tool reads in chunks of 16*16384
+    # samples by default — a USB bulk-transfer size known to be reliable.
+    # capture_spectrum() reads in chunks of this size (never "however many
+    # samples make up N seconds", which can be megabytes at typical 2.4 MSPS
+    # configs and risks LIBUSB_ERROR_NO_MEM).
+    READ_CHUNK_SAMPLES = 16 * 16384  # 262144
+
     def __init__(self, config: dict, device_config: dict = None, frequency_blacklist: list = None):
         """
         Initialize spectrum analyzer
@@ -103,12 +116,60 @@ class SpectrumAnalyzer:
         self.device_config = device_config
         self.device_serial = device_config.get('serial', '0')
         
-        # Configuration
-        self.center_freq = device_config['center_freq']
-        self.sample_rate = device_config['sample_rate']
+        # Configuration. Use .get with defaults — a device config missing
+        # center_freq/sample_rate must not crash the scan loop (it used to raise
+        # KeyError on every cycle and wedge the worker). The manager also fills
+        # these defaults up front; this is defense-in-depth.
+        self.center_freq = device_config.get('center_freq') or 404_000_000
+        self.sample_rate = device_config.get('sample_rate') or 2_400_000
         self.fft_size = config['detection']['fft_size']
         self.detection_threshold = config['detection']['detection_threshold']
         self.scan_interval = config['receivers']['scan_interval']
+
+        # Scan tuning: a much longer integration window before peak-picking
+        # than a single FFT snapshot, real-world channel spacing for peak
+        # min-distance/quantization, and a cap on how many candidates a
+        # single scan pass can report.
+        det_cfg = config['detection']
+        # Default lowered 20 → 5 s: on a 4-device Pi the concurrent Welch
+        # averaging inflated a "20 s" dwell to minutes of wall time (field:
+        # first snapshots took 2-8 min after startup) and starved decoder
+        # pipes. 5 s (~5 averaged batches) still cleans up the peak list well.
+        self.scan_check_time = float(det_cfg.get('scan_check_time', 5.0))
+        # Hard wall-clock cap on a single capture_spectrum() call. On a 4-dongle
+        # Pi, CPU/USB contention inflates a nominal N-second dwell to minutes,
+        # which (a) never completes the first scan and (b) leaves the worker
+        # stuck in an unlocked libusb read so a concurrent close() SIGBUSes.
+        # This cap guarantees capture returns promptly with whatever it has
+        # averaged so far. Fixed low default, DECOUPLED from scan_check_time so
+        # a high dwell (config or contention) can never stretch capture without
+        # bound — if scan_check_time < cap the loop finishes normally first; if
+        # it's higher, we just return a shorter (still valid) average.
+        self.scan_max_wall_s = float(det_cfg.get('scan_max_wall_s', 8.0))
+        self.channel_spacing_hz = float(det_cfg.get('channel_spacing_hz', 10_000))
+        self.max_peaks = int(det_cfg.get('max_peaks', 10))
+
+        # Reject candidate peaks that don't line up with the sonde band's
+        # channel raster (e.g. 401.000-405.990 MHz in 10 kHz steps). A strong
+        # nearby signal's skirt/sidelobe can produce a detectable local
+        # maximum a few kHz off the true channel, which then gets identified
+        # as a spurious "sonde" on a frequency that no real transmitter uses.
+        # Real sondes drift up to ~3 kHz off their nominal channel; anything
+        # drifting further is almost certainly not a genuine channel signal.
+        self.check_frequency_raster = bool(det_cfg.get('check_frequency_raster', True))
+        self.raster_tolerance_hz = float(det_cfg.get('raster_tolerance_hz', 3_000))
+
+        # DC-spur guard: RTL-SDR tuners produce a persistent DC/1-f spur at or
+        # near the tuned center frequency. Field-observed: RTL00004 showed a
+        # permanent spike exactly at its 403.200 MHz center; RTL00003
+        # repeatedly "detected" a phantom signal at 404.5813 MHz (18.7 kHz
+        # below its 404.600 center), dft_detect found nothing, and the
+        # bandwidth fallback started a 300 s phantom DFM decode every scan
+        # cycle. auto_rx likewise excludes the DC region from peak-picking.
+        # NOTE: this makes channels within ±dc_notch_hz of a device's
+        # center_freq invisible TO THAT DEVICE — pick center frequencies
+        # offset from active sonde channels (e.g. 404.605 instead of 404.600).
+        self.dc_notch_hz = float(det_cfg.get('dc_notch_hz', 25_000))
         
     def initialize(self) -> bool:
         """Initialize RTL-SDR device"""
@@ -158,63 +219,214 @@ class SpectrumAnalyzer:
             self.sdr = None
             self.logger.info("RTL-SDR closed")
     
-    def capture_spectrum(self, num_samples: int = None) -> Tuple[np.ndarray, np.ndarray]:
+    def capture_spectrum(
+        self,
+        dwell_time: float = None,
+        abort_check: Optional[Callable[[], bool]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Capture and analyze spectrum
+        Capture and analyze spectrum, integrated over `dwell_time` seconds
+        (default: self.scan_check_time, e.g. 20s) rather than a single short
+        FFT snapshot.
+
+        CRITICAL: a 20s-dwell capture is now a long blocking call (previously
+        a single snapshot took milliseconds). DeviceWorker's scan cycle only
+        checks its manual-decode-pending flag before/after this call, so
+        without a way to bail out mid-capture, a manual/priority decode
+        request arriving during a scan could be stuck waiting up to the full
+        dwell time — exactly the class of race this project has repeatedly
+        had to fix elsewhere. `abort_check`, if given, is polled once per
+        chunk; on a True result we stop early and return whatever was
+        integrated so far (still a valid, if shorter, average) rather than
+        block for the remainder of dwell_time.
+
+        Averaging ~20s of spectrum before peak-picking gives a much cleaner
+        peak list than a single-snapshot approach — weak/drifting candidates
+        that don't clear the noise floor in one 2048-point FFT often do once
+        variance is averaged down over many independent periodograms.
+
+        Implementation note: rather than one giant read_samples() call sized
+        for the full dwell time (e.g. 20s @ 2.4 MSPS would be ~48M complex
+        samples — several hundred MB, too much for a Raspberry Pi, especially
+        with multiple devices scanning at once), this reads a sequence of
+        smaller chunks, computes a Welch PSD per chunk, and averages the
+        *linear* power spectra (never average in dB — that's not
+        mathematically the same and biases the result high) before the final
+        dB conversion. This gives the same statistical benefit as one long
+        capture while keeping peak memory bounded to a single chunk.
+
         Returns (frequencies, power_db)
         """
         if not self.sdr:
             raise RuntimeError("SDR not initialized")
-        
-        if num_samples is None:
-            num_samples = self.fft_size * 16
-        
-        # Read samples
-        samples = self.sdr.read_samples(num_samples)
-        
-        # Compute power spectral density
-        freqs, psd = scipy_signal.welch(
-            samples,
-            fs=self.sample_rate,
-            nperseg=self.fft_size,
-            scaling='density',
-            return_onesided=False
-        )
-        
+
+        if dwell_time is None:
+            dwell_time = self.scan_check_time
+
+        # CRITICAL: chunk size must be a safe single USB bulk-transfer size,
+        # NOT "however many samples make up 1 second at this sample rate".
+        # That earlier approach requested 2.4M samples (4.8 MB) per
+        # read_samples() call at a typical 2.4 MSPS device config, which
+        # intermittently failed with LIBUSB_ERROR_NO_MEM ("Insufficient
+        # memory") — especially with several RTL-SDR dongles sharing the
+        # same USB controller's usbfs transfer-memory budget. 16*16384 =
+        # 262144 samples is librtlsdr's own rtl_sdr.c reference tool's
+        # default bulk-transfer chunk size, a value known to be safe.
+        chunk_samples = self.READ_CHUNK_SAMPLES
+        chunk_duration_s = chunk_samples / self.sample_rate
+        num_chunks = max(1, round(dwell_time / chunk_duration_s))
+
+        # CRITICAL: running welch() on every single ~0.109s USB-safe chunk
+        # (num_chunks ≈ 183 for a 20s dwell at 2.4 MSPS) means ~183 * ~255
+        # internal FFTs per device per cycle — ~47,000 FFTs, ×4 devices
+        # scanning concurrently ≈ 188,000 FFTs every 20s. That sustained CPU
+        # load was observed in the field to inflate the *actual* wall-clock
+        # duration of a single "20s" capture to 80-100s+ under 4-device
+        # contention (get_spectrum() stayed empty that whole time), and is a
+        # strong suspect for intermittent decode failures elsewhere on the
+        # same host: 3 sibling devices burning CPU on redundant FFTs can
+        # starve the rtl_fm→decoder pipe of scheduling long enough to break
+        # bit sync without the decoder process erroring out.
+        # Fix: batch several USB-safe read chunks into one ~1s buffer before
+        # each welch() call — same read_samples() transfer size (still USB-
+        # safe), same total samples averaged, ~9x fewer welch()/FFT calls.
+        chunks_per_batch = max(1, round(1.0 / chunk_duration_s))
+
+        freqs = None
+        psd_accum = None
+        batches_done = 0
+        chunks_done = 0
+        aborted = False
+        capture_start = time.time()
+        while chunks_done < num_chunks and not aborted:
+            # Hard wall-clock cap: under 4-device CPU/USB contention a nominal
+            # dwell can stretch to minutes and hang the worker in a libusb read.
+            # Bail with whatever we've averaged so far — a shorter average is a
+            # valid spectrum, and returning promptly is what keeps the device
+            # closeable (no SIGBUS) and the first scan actually completing.
+            if time.time() - capture_start > self.scan_max_wall_s:
+                self.logger.debug(
+                    f"capture_spectrum: wall-clock cap ({self.scan_max_wall_s:.0f}s) hit "
+                    f"after {chunks_done}/{num_chunks} chunks — returning partial average"
+                )
+                break
+            batch = []
+            for _ in range(min(chunks_per_batch, num_chunks - chunks_done)):
+                # CRITICAL: check BEFORE calling read_samples(), not just
+                # after. Checking only after each read left a window at the
+                # start of every new batch — welch() on the previous batch
+                # takes a moment, and a concurrent manual/priority decode's
+                # _teardown_scan() (self.sdr.close(); self.sdr = None) can
+                # land in exactly that window, so the next read_samples()
+                # call dereferences a None self.sdr. Observed in the field:
+                # "AttributeError: 'NoneType' object has no attribute
+                # 'read_samples'", ~1s after the device had already closed.
+                if self.sdr is None or (abort_check is not None and abort_check()):
+                    aborted = True
+                    break
+                batch.append(self.sdr.read_samples(chunk_samples))
+                chunks_done += 1
+
+            if not batch:
+                break
+
+            batch_samples = np.concatenate(batch) if len(batch) > 1 else batch[0]
+
+            batch_freqs, batch_psd = scipy_signal.welch(
+                batch_samples,
+                fs=self.sample_rate,
+                nperseg=self.fft_size,
+                scaling='density',
+                return_onesided=False
+            )
+
+            if psd_accum is None:
+                freqs = batch_freqs
+                psd_accum = batch_psd
+            else:
+                psd_accum += batch_psd
+            batches_done += 1
+
+            if aborted:
+                self.logger.debug(
+                    f"capture_spectrum: abort_check triggered after {chunks_done}/{num_chunks} chunks "
+                    f"({batches_done} welch batches)"
+                )
+
+        if psd_accum is None:
+            # Aborted (self.sdr closed concurrently, or abort_check tripped)
+            # before even one batch could be read — nothing to return. The
+            # caller (_scan_cycle) already wraps capture_spectrum() in a
+            # try/except that logs and retries, so raise rather than crash
+            # on a None division below.
+            raise RuntimeError("capture_spectrum aborted before any data was collected")
+
+        psd_avg = psd_accum / batches_done
+
         # Convert to dB and shift to match frequency ordering
-        power_db = 10 * np.log10(psd)
-        
+        power_db = 10 * np.log10(psd_avg)
+
         # Shift FFT output (fftshift equivalent)
         power_db = np.fft.fftshift(power_db)
         freqs = np.fft.fftshift(freqs) + self.center_freq
         
         return freqs, power_db
     
-    def detect_signals(self, freqs: np.ndarray, power_db: np.ndarray) -> List[DetectedSignal]:
+    def detect_signals(self, freqs: np.ndarray, power_db: np.ndarray,
+                       threshold_db: float = None) -> List[DetectedSignal]:
         """
-        Detect peaks in spectrum that could be radiosonde signals
+        Detect peaks in spectrum that could be radiosonde signals.
+
+        threshold_db overrides self.detection_threshold for this call — used to
+        run a second, lower-threshold pass for the frequency repository (list
+        weak candidates) without lowering the decode threshold.
+
+        Peak-picking approach follows radiosonde_auto_rx:
+          - Noise floor = median of the *whole* power spectrum (not a
+            low-percentile subset) — chosen there specifically for better
+            outlier rejection than a mean.
+          - Minimum peak-to-peak spacing (mpd) expressed in real Hz (channel
+            spacing) and converted to FFT bins from the actual frequency
+            resolution, instead of a fixed fraction of fft_size.
+          - Surviving peaks are quantized to the channel-spacing grid,
+            deduplicated (keep the strongest per bucket), sorted by strength,
+            and capped to max_peaks so a busy band can't flood the decode
+            pipeline with more candidates than can ever be serviced.
         """
-        # Estimate noise floor (median of lower 30% of values)
-        sorted_power = np.sort(power_db)
-        noise_floor = np.median(sorted_power[:len(sorted_power)//3])
-        
+        noise_floor = np.median(power_db)
+
         # Find peaks above threshold
-        threshold = noise_floor + self.detection_threshold
-        
+        thr_db = self.detection_threshold if threshold_db is None else threshold_db
+        threshold = noise_floor + thr_db
+
         self.logger.debug(f"Noise floor: {noise_floor:.1f} dB, Detection threshold: {threshold:.1f} dB")
-        
+
+        # Minimum distance between peaks, expressed in real Hz (channel
+        # spacing) and converted to FFT bins via the actual frequency step.
+        freq_step_hz = self.sample_rate / self.fft_size
+        min_distance_bins = max(1, int(round(self.channel_spacing_hz / freq_step_hz)))
+
         # Use scipy peak detection
         peaks, properties = scipy_signal.find_peaks(
             power_db,
             height=threshold,
-            distance=self.fft_size // 20,  # Minimum distance between peaks
+            distance=min_distance_bins,  # Minimum distance between peaks
             width=5  # Minimum width
         )
-        
+
         detected = []
         for peak_idx in peaks:
             freq = freqs[peak_idx]
             strength = power_db[peak_idx] - noise_floor
+
+            # Reject peaks at/near the tuner center frequency (DC/1-f spur —
+            # see dc_notch_hz note in __init__)
+            if self.dc_notch_hz > 0 and abs(freq - self.center_freq) < self.dc_notch_hz:
+                self.logger.debug(
+                    f"Rejected signal (DC spur region): {freq/1e6:.4f} MHz, "
+                    f"{abs(freq - self.center_freq)/1e3:.1f} kHz from center"
+                )
+                continue
             
             # Estimate bandwidth (3dB bandwidth)
             half_power = power_db[peak_idx] - 3
@@ -235,25 +447,64 @@ class SpectrumAnalyzer:
                     f"Rejected signal (blacklisted): {freq/1e6:.4f} MHz, SNR: {strength:.1f} dB, BW: {bandwidth/1e3:.1f} kHz"
                 )
                 continue
-            
+
             # Filter by radiosonde typical bandwidth (4-20 kHz)
-            if 2000 < bandwidth < 30000:
-                self.logger.info(
-                    f"Found signal: {freq/1e6:.4f} MHz, SNR: {strength:.1f} dB, BW: {bandwidth/1e3:.1f} kHz"
-                )
-                detected.append(DetectedSignal(
-                    frequency=freq,
-                    strength=strength,
-                    bandwidth=bandwidth,
-                    timestamp=time.time()
-                ))
-            else:
+            if not (2000 < bandwidth < 30000):
                 self.logger.debug(
                     f"Rejected signal (bandwidth): {freq/1e6:.4f} MHz, BW: {bandwidth/1e3:.1f} kHz"
                 )
-        
-        return detected
-    
+                continue
+
+            # Reject candidates that don't fall on the channel raster (see
+            # check_frequency_raster in __init__). A strong signal's own
+            # sidelobes can otherwise be mistaken for a second, off-channel
+            # sonde a few kHz away.
+            if self.check_frequency_raster and not self._is_on_raster(freq):
+                self.logger.debug(
+                    f"Rejected signal (off raster): {freq/1e6:.4f} MHz, SNR: {strength:.1f} dB, BW: {bandwidth/1e3:.1f} kHz"
+                )
+                continue
+
+            self.logger.info(
+                f"Found signal: {freq/1e6:.4f} MHz, SNR: {strength:.1f} dB, BW: {bandwidth/1e3:.1f} kHz"
+            )
+            detected.append(DetectedSignal(
+                frequency=freq,
+                strength=strength,
+                bandwidth=bandwidth,
+                timestamp=time.time(),
+                power_dbfs=float(power_db[peak_idx]),
+                noise_floor_dbfs=float(noise_floor)
+            ))
+
+        # Quantize to the real-world channel-spacing grid, deduplicate (keep
+        # the strongest candidate per bucket — two peaks that both land in
+        # the same 10 kHz channel after quantization are almost always the
+        # same physical signal, not two distinct sondes), sort by strength,
+        # and cap to max_peaks so a busy band can't overwhelm the decoders.
+        quantized: Dict[float, DetectedSignal] = {}
+        for sig in detected:
+            bucket = round(sig.frequency / self.channel_spacing_hz) * self.channel_spacing_hz
+            existing = quantized.get(bucket)
+            if existing is None or sig.strength > existing.strength:
+                quantized[bucket] = sig
+
+        capped = sorted(quantized.values(), key=lambda s: s.strength, reverse=True)[:self.max_peaks]
+
+        return capped
+
+    def _is_on_raster(self, freq_hz: float) -> bool:
+        """
+        True if freq_hz falls within raster_tolerance_hz of a channel_spacing_hz
+        grid point (e.g. a 10 kHz raster from 401.000-405.990 MHz). Handles
+        drift in either direction from the nearest grid point, not just the
+        one below it.
+        """
+        remainder = freq_hz % self.channel_spacing_hz
+        if remainder > self.channel_spacing_hz / 2:
+            remainder -= self.channel_spacing_hz
+        return abs(remainder) <= self.raster_tolerance_hz
+
     def filter_signals_in_ranges(self, signals: List[DetectedSignal]) -> List[DetectedSignal]:
         """Filter signals to only those in configured frequency ranges"""
         freq_ranges = self.config['detection']['freq_ranges']
