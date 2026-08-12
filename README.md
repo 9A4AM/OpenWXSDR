@@ -1,7 +1,10 @@
 # OpenWX <img src="https://cdn.jsdelivr.net/npm/bootstrap-icons/icons/radar.svg" width="24"> SDR - Streamlined Radiosonde Decoder
 
-A lightweight, efficient radiosonde decoder for Raspberry Pi, designed to work with RTL-SDR, Airspy and KA9Q radio receivers. 
+A lightweight, efficient radiosonde decoder for Raspberry Pi and X86_64 gateways, designed to work with RTL-SDR, Airspy and KA9Q radio receivers. 
 Using the excellent rs1729/RS decoders embedded into this framework.
+
+<img width="820" height="558" alt="grafik" src="https://github.com/user-attachments/assets/3a453239-0042-430c-a2f8-44a2a7420c71" />
+
 
 ## Current Version:** 1.0.61 (July 24, 2026):
 
@@ -41,6 +44,12 @@ We are working on RS92 data validation in the next step. Due to the rare availab
 #### ⚙️ Improved USB Device handling and optional USB reset if device failed during the day
 - Stucked devices will be handle by watchdog and restarted in configured
 
+#### 🔧 New configuration utility
+
+<img width="765" height="481" alt="Screenshot 2026-08-03 135902" src="https://github.com/user-attachments/assets/4e0be656-368a-4b75-a62e-72e3519a64a3" />
+
+For quickstart and easy setup from scratch the openwxsdr_config script is available now. It also contains a config backup and configuration check.
+
 #### 🖥️ Integrated gateway receiver and radiosonde statistics 
 
 <img width="1239" height="909" alt="grafik" src="https://github.com/user-attachments/assets/fcabd778-b537-44b6-b11a-f0c821970da1" />
@@ -64,47 +73,7 @@ In band sweep mode a single SDR checks the whole radiosonde spectrum and writes 
 
 
 
-# Version below are outdated since V1.0.60 - Please use versions below only standalone! #
-
-## Version:** 1.0.52 (July 10, 2026):
-
-Notice:</u> With update to version 1.0.52 we worked on several improvements of radiosonde telemetry upload to sondehub.org, but you need >= V1.0.60!
-
-✨ What's New in v1.0.52
-
-#### 🐛 Crash & Race-Condition Fixes
-
-#### ⚙️ Self-Healing & Device Status
-
-#### 🎯 Detection Accuracy
-
-#### 📡 SondeHub Upload Correctness (part 1 / 2 - uploaded is granted with >= V1.0.60)
-
-Following feedback from a SondeHub maintainer, both upload paths
-(`sondehub_queue.py` and `sondehub_output.py`) were brought in line with
-`radiosonde_auto_rx`'s own field policy:
-
-- **`subtype` is no longer blindly passed through for every sonde type.** M10/M20
-  (and any type auto_rx doesn't upload a subtype for) no longer send a meaningless
-  `subtype` field that could confuse trackers. RS41/RS92/DFM/LMS6/MRZ still report
-  their subtype as before.
-- **Sentinel "no data" values are now filtered out** instead of being uploaded as
-  real readings: temperature ≤ ‑273 °C, humidity/pressure < 0, velocity/heading
-  ≤ ‑9999, and negative battery voltage are all now dropped rather than sent as-is.
-- `dfmcode` is now only attached to DFM uploads (previously a global check).
-
-#### 🖥️ Web UI
-
-#### 🔧 Maintenance & Code Quality
-
-#### 🔒 Repository Updates & Changes
-
-## 
-
-
-## ⚠ <u>Important notice:</u> With update to version 1.0.50 several further adressed issues of radiosonde telemetry to sondehub.org has been fixed.
-We are looking forward that the ban / blocking of OpenWXSDR uploads will be suspended after review of the submitted telemetry data
-
+# Version below V1.0.60 are outdated - Please use versions below only standalone! #
 
 ## ✨ What's New in v1.0.50
 
@@ -160,7 +129,7 @@ We are looking forward that the ban / blocking of OpenWXSDR uploads will be susp
 
 - 🎯 **Automatic Signal Detection**: Scans spectrum and automatically detects radiosonde signals
 - 🔧 **Multiple Sonde Types**: Supports RS41, RS92, DFM, M10, M20, iMet, LMS6, MRZ
-- 📡 **Dual SDR Support**: Works with RTL-SDR, Airspy R2, Airspy Mini USB dongles
+- 📡 **Multi SDR Support**: Works with up to 4 RTL-SDR or Airspy R2, Airspy Mini USB dongles
 - 🎛️ **Virtual Receivers**: Configurable parallel decoding of multiple sondes with KA9Q radio
 - 🗺️ **Web Interface**: Clean Leaflet-based map showing real-time flight paths
 - 📤 **OpenWX Integration**: MQTT & UDP JSON output for seamless data upload
@@ -339,7 +308,7 @@ Many configuration settings are also available in the WebUI and can be changed d
 
 The local web UI is available at `http://yourdevice-ip:5000`
 
-<img width="1405" height="903" alt="Screenshot 2026-05-19 171001" src="https://github.com/user-attachments/assets/272c99c1-7b79-4a65-9f65-273289bae137" />
+<img width="1656" height="1119" alt="Screenshot 2026-08-05 203845" src="https://github.com/user-attachments/assets/4e1a2eb4-8f7b-482a-aad0-0082870409ce" />
 
 
 For each configured receiver the frequency spectrum is available:
@@ -385,7 +354,7 @@ If enabled in config.yaml your device will upload radiosonde telemetry and senso
 # SondeHub Upload
 # ============================================================
 sondehub:
-  enabled: false                                           # See notice at the beginning, please don't activate in V1.0.45
+  enabled: true                                            # Since V1.0.60 upload to sondehub.org is granted
   queue_mode: true                                         # false = direct upload mode, true = queued batch upload mode
   queue_batch_max: 50                                      # Max telemetry objects uploaded per queued request (10-fast 50-robust)
   queue_max_size: 1000                                     # Max queued  objects before oldest/new drops may occur (200-fast 1000-robust)
@@ -408,9 +377,10 @@ sondehub:
 
 
 
-Grafana dashboard from Sondehub will show your receiver in the statistics including RSSI/SNR:
 
-<img width="1630" height="1043" alt="Screenshot 2026-05-19 192420" src="https://github.com/user-attachments/assets/0cc6ad23-002a-4a99-8fbe-3bdd864ab81e" />
+# Grafana dashboard from Sondehub will show your receiver in the statistics:
+
+<img width="796" height="492" alt="Screenshot 2026-08-02 142152" src="https://github.com/user-attachments/assets/68ac0a4d-b4cd-4813-9b51-f28c71b1a5e8" />
 
 
 ## License
