@@ -10,10 +10,10 @@ Using the excellent rs1729/RS decoders embedded into this framework.
 - DFM06
 - DFM09
 - DFM17
-- M10 (confirmed, but still blocked)
+- M10
 - M20
 
-We have also uploaded M10 logfiles for a check by sondehub.org and waiting for permission. After this has been granted, the new release will be available soon.
+We are working on RS92 data validation in the next step. Due to the rare availability this may take some time. If you receive RS92 in your area please send us your logfiles.
 
 ✨ What's New in v1.0.61
 
