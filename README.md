@@ -41,8 +41,30 @@ We are working on RS92 data validation in the next step. Due to the rare availab
 #### ⚙️ Improved USB Device handling and optional USB reset if device failed during the day
 - Stucked devices will be handle by watchdog and restarted in configured
 
+#### 🖥️ Integrated gateway receiver and radiosonde statistics 
 
-# Please use versions below only standalone! #
+<img width="1239" height="909" alt="grafik" src="https://github.com/user-attachments/assets/fcabd778-b537-44b6-b11a-f0c821970da1" />
+
+The receiver statistics gives an comprehensive overview of your radiosonde detection and decoding performance
+
+
+<img width="697" height="305" alt="Screenshot 2026-07-16 215225" src="https://github.com/user-attachments/assets/3d524eb0-6e36-42fc-8646-f227312415da" />
+
+Received radiosonde frequencies are shown at a glance, you clearly see the most frequent radiosonde frequencies used in your area.
+
+
+<img width="1285" height="891" alt="grafik" src="https://github.com/user-attachments/assets/6424c78a-b972-4093-8025-33d48157d42f" />
+
+Telemetry and sensor data of each received radiosonde is available in the sonde statistics menu.
+
+
+<img width="789" height="483" alt="Screenshot 2026-08-01 080802" src="https://github.com/user-attachments/assets/9a621bd8-2ceb-4033-9f40-b1d63b5057fd" />
+
+In band sweep mode a single SDR checks the whole radiosonde spectrum and writes detected frequencies into Frequency Repository. Instand manual start of decoder is also available for detected new frequencies.
+
+
+
+# Version below are outdated since V1.0.60 - Please use versions below only standalone! #
 
 ## Version:** 1.0.52 (July 10, 2026):
 
