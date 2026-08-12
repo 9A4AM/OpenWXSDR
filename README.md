@@ -69,7 +69,7 @@ Telemetry and sensor data of each received radiosonde is available in the sonde 
 
 <img width="789" height="483" alt="Screenshot 2026-08-01 080802" src="https://github.com/user-attachments/assets/9a621bd8-2ceb-4033-9f40-b1d63b5057fd" />
 
-In band sweep mode a single SDR checks the whole radiosonde spectrum and writes detected frequencies into Frequency Repository. Instand manual start of decoder is also available for detected new frequencies.
+In band sweep mode a single SDR checks the whole radiosonde spectrum and writes detected frequencies into Frequency Repository. Instantly manual decoder start is available from the repo manager for detected new frequencies.
 
 
 
